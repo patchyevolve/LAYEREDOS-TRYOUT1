@@ -1,0 +1,5 @@
+build/
+*.log
+run.sh
+os/build/
+os/*.log
