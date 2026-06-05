@@ -389,6 +389,151 @@
           acceptable (UP, rare). If needed, use a reader-writer lock
           or RCU-style protection.
 
+  C16 ─ schedule() loses current_thread when next == current_thread [sched.c:161-191]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    pick_next() physically dequeues the selected thread from the
+          run queue before returning it. schedule() then checks
+          if (next == current_thread) and returns early — but NEVER
+          re-adds the thread back to the queue. current_thread is now
+          running but permanently missing from every scheduling
+          structure. Next time it yields or is preempted it will never
+          be selected again. The thread leaks into limbo.
+
+  FIX:    Re-add before early return:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ if (next == current_thread) {                               │
+          │     sched_add_thread(next);   // put it back                │
+          │     hal_restore_irq(flags);                                 │
+          │     return;                                                 │
+          │ }                                                           │
+          └──────────────────────────────────────────────────────────────┘
+
+  C17 ─ idle_thr gets permanently dequeued and lost [sched.c:138-158,161-191]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    idle_thr is added to run_queues[0] at init. When pick_next
+          finds no higher-priority thread, it dequeues idle_thr from
+          run_queues[0] and returns it. schedule() sees
+          next == idle_thr && current != idle_thr and returns early
+          WITHOUT re-adding idle_thr. After the first idle fallback,
+          idle_thr is gone from the queue forever. The idle thread still
+          runs (as current_thread) but once any real thread wakes up
+          and the idle thread tries to go back through schedule(), it
+          can never be selected again as a fallback.
+
+  FIX:    idle_thr should never be in the run queue. pick_next should
+          return it as a sentinel only via the prio < 0 path (queue
+          empty), never by dequeuing it:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ static thread_t* pick_next(void) {                          │
+          │     int prio = bitmap_find_highest();                       │
+          │     if (prio < 0) return idle_thr;                          │
+          │     run_queue_t* q = &run_queues[prio];                     │
+          │     if (!q->head) return idle_thr;                          │
+          │     thread_t* t = q->head;                                  │
+          │     if (t == idle_thr) return idle_thr;  // ← guard        │
+          │     /* dequeue t ... */                                      │
+          │ }                                                           │
+          └──────────────────────────────────────────────────────────────┘
+          Also: sched_init should NOT add idle_thr to run_queues[0].
+
+  C18 ─ init thread has NULL func — trampoline will crash if reached [sched.c:211-250]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    sched_init creates current_thread with thread_create(NULL,
+          NULL, ...). thread_create builds the stack frame with
+          thread_trampoline as return address and NULL as func (r15).
+          If execution ever reaches thread_trampoline for the init
+          thread — e.g. if kmain returns, or if thread_exit is called
+          on init — call *%r15 = call 0x0 → page fault at address 0.
+
+  FIX:    Add a null check in thread_trampoline:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ thread_trampoline:                                          │
+          │     testq %r15, %r15                                       │
+          │     jz .Lnull_func_panic                                    │
+          │     movq %r14, %rdi                                         │
+          │     call *%r15                                              │
+          │     movq %rax, %rdi                                         │
+          │     call thread_exit                                        │
+          │ .Lnull_func_panic:                                          │
+          │     movq $thread_null_msg, %rdi                             │
+          │     call kpanic                                             │
+          └──────────────────────────────────────────────────────────────┘
+
+  C19 ─ eventbus_publish ring buffer index overwrites valid events [eventbus.c:74-95]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    The slot index is (event_count + pending_count) % MAX.
+          event_count is the total events ever published, never reset.
+          After 64+ events, this formula overwrites valid=1 slots that
+          haven't been dispatched yet, silently dropping events. The
+          dispatch loop does a linear scan for the first valid=1 slot
+          rather than maintaining insertion order, so delivery is not
+          FIFO even when it works.
+
+  FIX:    Use a proper ring buffer with explicit head/tail indices:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ static int queue_head = 0;  // dequeue from here            │
+          │ static int queue_tail = 0;  // enqueue here                 │
+          │ // publish: slot = queue_tail;                              │
+          │ //           queue_tail = (queue_tail + 1) % MAX_PENDING    │
+          │ // dispatch: slot = queue_head;                             │
+          │ //           queue_head = (queue_head + 1) % MAX_PENDING    │
+          └──────────────────────────────────────────────────────────────┘
+
+  C20 ─ kprintf %u prints large uint64_t as negative [klib.c:80-87]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    %u handler calls kprint_int64((int64_t)v, ...). kprint_int64
+          treats its argument as signed. Any uint64_t value above
+          0x7FFFFFFFFFFFFFFF (~9.2×10¹⁸) gets reinterpreted as negative
+          and printed with a minus sign. meminfo and top show wrong
+          numbers for large memory sizes.
+
+  FIX:    Add a separate kprint_uint64 function for %u/%lu/%llu:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ static void kprint_uint64(uint64_t v, int pad) {            │
+          │     char buf[24]; int pos = 0;                              │
+          │     if (v == 0) { buf[pos++] = '0'; }                      │
+          │     while (v > 0) { buf[pos++] = hexdigits[v % 10]; v/=10;}│
+          │     while (pos < pad) buf[pos++] = '0';                    │
+          │     for (int i = pos-1; i >= 0; i--) kputchar(buf[i]);     │
+          │ }                                                           │
+          └──────────────────────────────────────────────────────────────┘
+
+  C21 ─ mutex_unlock has no ownership check — any thread can unlock [sync.c:70-79]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    mutex_unlock doesn't verify that current_thread->id ==
+          m->owner_tid. Any thread can call mutex_unlock on a mutex it
+          doesn't own, clearing locked=0 and waking all waiters while
+          the actual owner is still in its critical section. Mutual
+          exclusion completely breaks.
+
+  FIX:    Add ownership check:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ if (current_thread && m->owner_tid != current_thread->id)   │
+          │     return ERR_PERM;                                        │
+          └──────────────────────────────────────────────────────────────┘
+
+  C22 ─ sched_block must call sched_remove_thread (clarity & fix) [sched.c:306-317]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    sched_block sets state=THREAD_BLOCKED and links the thread
+          into the wait queue via t->next, but never calls
+          sched_remove_thread. Since the RUNNING thread is not in the
+          run queue (dequeued by pick_next), this doesn't cause
+          immediate corruption — but it's a landmine: any future code
+          path that calls sched_block on a READY thread (not currently
+          running) will leave it in both the run queue and the wait
+          queue simultaneously. When sched_wake re-adds it, it will be
+          in the run queue twice, corrupting the doubly-linked list.
+
+  FIX:    Always call sched_remove_thread(current_thread) at the top
+          of sched_block, guarded by state check:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ if (current_thread->state == THREAD_RUNNING ||              │
+          │     current_thread->state == THREAD_READY)                  │
+          │     sched_remove_thread(current_thread);                    │
+          └──────────────────────────────────────────────────────────────┘
+          NOTE: Duplicates C14 but with the READY-state guard. C14
+          covers the conceptual fix; C22 adds the precise guard.
+
 
 ================================================================================
    4. HIGH PRIORITY ISSUES
@@ -481,6 +626,104 @@
           it immediately. Then cli runs. This is correct but subtle.
   FIX:    Add a comment explaining the STI shadow.
 
+  H9 ─ thread_sleep formula is a no-op identity — hardcoded to timer freq [sched.c:276]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    wake_tick = hal_timer_get_ticks() + (ms * 1000 / 1000). The
+          *1000/1000 cancels to ms. Intended: ms * timer_hz / 1000.
+          At timer_hz=1000 this accidentally works. If timer_hz changes
+          (see Phase 2: HPET at different rates), sleep durations break.
+
+  FIX:    ms * hal_timer_get_hz() / 1000  (need to add hal_timer_get_hz)
+
+  H10 ─ sched_reap_zombies calls PMM without IRQ protection [sched.c:60-77]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    sched_reap_zombies called from idle thread calls pmm_free_pages
+          and pmm_free_page. Even after audit C1 fix (PMM internal cli),
+          the reaper must be called only when safe — or PMM's own locking
+          must cover it. Currently PMM has zero synchronization.
+
+  FIX:    Wrap the entire reaper body in hal_save_irq/hal_restore_irq,
+          or rely on PMM internal locking after C1 is fixed.
+
+  H11 ─ eventbus_dispatch TOCTOU on subscriber table between callbacks [eventbus.c:125-133]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    The dispatch loop releases the spinlock, calls a callback,
+          then re-acquires for the next subscriber. Between release and
+          re-acquire, another thread can call eventbus_unsubscribe,
+          shifting or invalidating subscribers. The loop index i now
+          points at a wrong or freed entry.
+
+  FIX:    Snapshot the matching subscriber list under lock before
+          calling any callbacks:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ // Build a local list of matching callbacks under lock:      │
+          │ spinlock_acquire(&eventbus_lock);                            │
+          │ event_t ev = pending_events[head].event;                     │
+          │ pending_events[head].valid = 0;                              │
+          // (advance head) ...
+          │ // — or use a fixed-size array of callbacks to fire:         │
+          │ struct { event_callback_t cb; void* ctx; } to_fire[32];      │
+          │ int n = 0;                                                   │
+          │ for (int i = 0; i < MAX_SUBSCRIBERS && n < 32; i++) {       │
+          │     if (subscribers[i].active && ...) {                      │
+          │         to_fire[n].cb = subscribers[i].callback;             │
+          │         to_fire[n].ctx = subscribers[i].context;             │
+          │         n++;                                                 │
+          │     }                                                        │
+          │ }                                                            │
+          │ spinlock_release(&eventbus_lock);                            │
+          │ for (int i = 0; i < n; i++) to_fire[i].cb(&ev, to_fire[i].ctx);│
+          └──────────────────────────────────────────────────────────────┘
+
+  H12 ─ kprintf called before hal_init — UART uninitialized on real HW [main.c:23-27]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    kmain calls kprintf (box art) before hal_init(). kputchar
+          busy-waits on UART LSR register. QEMU's 16550 emulation is
+          always ready. On real x86 hardware the UART is in an undefined
+          state until uart_init() programs it. Boot banner silently
+          drops characters or hangs.
+
+  FIX:    Move hal_init() call before any kprintf, or add a minimal
+          early_uart_init() as the very first boot step.
+
+  H13 ─ t->next pointer aliased between run queue and wait queue [sched.h:32]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    thread_t->next is used for THREE different list memberships:
+          run queue (doubly linked), wait queue (singly linked), and
+          sleeping thread list. No type safety prevents a thread from
+          being simultaneously linked into two of these. If sched_block
+          is ever called on a READY thread, t->next = wq->waiters
+          corrupts the run queue's link chain without any warning.
+
+  FIX:    Give thread_t separate pointer fields:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ struct thread* rq_next;   // run queue (doubly linked)      │
+          │ struct thread* rq_prev;   // run queue                      │
+          │ struct thread* wq_next;   // wait queue (singly linked)     │
+          └──────────────────────────────────────────────────────────────┘
+          This is a structural change that prevents an entire class of
+          future bugs.
+
+  H14 ─ cmd_fault OOM test permanently exhausts physical memory [shell.c:285-293]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    cmd_fault option 1 allocates pages in a loop until OOM, then
+          prints "Freed all pages" — but never frees them. After this
+          test, PMM is completely empty. Every subsequent allocation
+          fails. Only recovery is reboot. The message "Freed all pages"
+          is also factually wrong (misreads !page as "freed").
+
+  FIX:    Track allocated pages and free them:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ uint64_t pages[1024]; int np = 0;                           │
+          │ while (np < 1024) {                                         │
+          │     pages[np] = pmm_alloc_page();                           │
+          │     if (!pages[np]) break;                                   │
+          │     np++;                                                    │
+          │ }                                                           │
+          │ for (int i = 0; i < np; i++) pmm_free_page(pages[i]);      │
+          │ kprintf("Allocated and freed %d pages\n", np);              │
+          └──────────────────────────────────────────────────────────────┘
+
 
 ================================================================================
    5. MEDIUM ISSUES
@@ -528,9 +771,56 @@
           and increases latency for other threads.
 
   FIX:    Add a `wait_queue_t join_waiters` field to thread_t. In
-          thread_join, call sched_block(&t->join_waiters) instead of
-          busy-looping. In thread_exit, call sched_wake() on the
-          exiting thread's join_waiters queue before marking ZOMBIE.
+
+  M13 ─ schedule idle path: pick_next dequeues idle_thr then checks it [sched.c:138-175]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    When only idle_thr is in the run queue, pick_next finds
+          priority 0, dequeues idle_thr, returns it. schedule() then
+          checks next == idle_thr && current != idle_thr and returns
+          without re-adding. Root cause: pick_next should never dequeue
+          idle_thr (see C17).
+  FIX:    Covered by C17 fix (guard in pick_next, don't add idle_thr to
+          run queue at init).
+
+  M14 ─ sched_tick and sched_timer_tick are identical duplicates [sched.c:193-204, 367-377]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    Two functions with identical logic. Both increment
+          total_ticks. If both were ever active, time would double-count.
+          The dead code audit flagged sched_tick as unused but didn't
+          flag the semantic identity — sched_tick must be DELETED.
+
+  FIX:    Remove sched_tick function and its declaration from sched.h.
+
+  M15 ─ thread_create priority clamping is asymmetric [sched.c:241]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    tcb->priority = (priority > THREAD_MAX_PRIO) ? ... : priority;
+          Negative priorities pass through unclamped. sched_add_thread
+          checks t->priority < 0 and silently returns without adding.
+          The thread is created, added to global list, but never
+          scheduled — a permanent ghost thread.
+
+  FIX:    tcb->priority = (priority < 0 || priority > THREAD_MAX_PRIO)
+                           ? THREAD_DEF_PRIO : priority;
+
+  M16 ─ kprintf redundant if (*p == 'l') after while (*p == 'l') [klib.c:68-69]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    The while loop at line 68 already consumes all 'l' prefixes.
+          The next if (*p == 'l') at line 69 can never be true.
+          Unreachable dead code — maintenance hazard.
+
+  FIX:    Remove the redundant if (*p == 'l').
+
+  M17 ─ hal_get_mem_size and pmm_init both parse multiboot independently [hal.c:267-314, pmm.c:131-184]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    The multiboot memory map is parsed twice: once in
+          hal_get_mem_size (to find max address) and once in pmm_init
+          → parse_mb_mmap (to build free list). Two copies of the
+          struct definitions (multiboot_info_t, mmap_entry_t) that can
+          drift apart. Edge cases in parsing will diverge silently.
+
+  FIX:    Parse once in hal_init, store result in a shared structure
+          (e.g. boot_mem_map_t), pass it to pmm_init. Remove duplicate
+          struct definitions from pmm.c.
 
 
 ================================================================================
