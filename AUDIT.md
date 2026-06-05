@@ -107,7 +107,7 @@
    3. CRITICAL BUGS (must fix — in priority order)
 ================================================================================
 
-  TOTAL: 13 CRITICAL bugs found (7 from initial audit + 6 from deep audit)
+  TOTAL: 15 CRITICAL bugs found (7 initial + 6 deep + 2 from user review)
 
   C1 ─ PMM has NO synchronization at all [pmm.c:9,11,16,43-54,56-89,91-103]
   ──────────────────────────────────────────────────────────────────────
@@ -326,7 +326,68 @@
           │     if (flags & 0x200)                                      │
           │         asm volatile("sti" : : : "memory");                 │
           │ }                                                           │
+           └──────────────────────────────────────────────────────────────┘
+
+  C14 ─ sched_block doesn't remove thread from run queue [sched.c:306-317]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    sched_block sets state=THREAD_BLOCKED and adds thread to wait
+          queue, but does NOT call sched_remove_thread(). The thread
+          REMAINS in the run queue. pick_next() can select a BLOCKED
+          thread as the next to run → thread runs while blocked, wait
+          queue invariant broken, corrupted wakeup semantics.
+
+  FIX:    Call sched_remove_thread(current_thread) BEFORE adding to
+          wait queue:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ void sched_block(wait_queue_t* wq) {                         │
+          │     if (!wq || !current_thread) return;                      │
+          │     cpu_flags_t flags = hal_save_irq();                      │
+          │     current_thread->state = THREAD_BLOCKED;                  │
+          │     sched_remove_thread(current_thread);  // ← ADD THIS     │
+          │     current_thread->next = wq->waiters;                      │
+          │     wq->waiters = current_thread;                            │
+          │     wq->count++;                                             │
+          │     hal_restore_irq(flags);                                  │
+          │     schedule();                                              │
+          │ }                                                            │
           └──────────────────────────────────────────────────────────────┘
+          NOTE: sched_remove_thread must be called BEFORE the thread is
+          added to the wait queue (otherwise the run queue's next/prev
+          pointers conflict with wait queue's next pointer — they share
+          the same field `thread_t->next`).
+
+  C15 ─ eventbus_dispatch calls callbacks while holding spinlock [eventbus.c:125-133]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    eventbus_dispatch locks eventbus_lock, finds a pending event,
+          then iterates subscribers calling their callbacks WHILE still
+          holding the lock. If any subscriber callback calls
+          eventbus_publish() (directly or indirectly), it tries to
+          acquire eventbus_lock → DEADLOCK (spinlock held by dispatcher
+          on the same CPU, which will never release).
+
+  FIX:    Copy the event out from the pending queue under lock, release
+          the lock, then call callbacks:
+          ┌──────────────────────────────────────────────────────────────┐
+          │ // In eventbus_dispatch:                                     │
+          │ spinlock_acquire(&eventbus_lock);                            │
+          │ // find pending event idx ...                                │
+          │ event_t ev = pending_events[idx].event;  // copy            │
+          │ pending_events[idx].valid = 0;                               │
+          │ pending_count--;                                             │
+          │ spinlock_release(&eventbus_lock);     // release BEFORE     │
+          │                                                             │
+          │ // Now call callbacks WITHOUT holding the lock:              │
+          │ for (int i = 0; i < MAX_SUBSCRIBERS; i++) {                 │
+          │     if (subscribers[i].active &&                             │
+          │         subscribers[i].type == ev.type) {                    │
+          │         subscribers[i].callback(&ev, subscribers[i].context);│
+          │     }                                                       │
+          │ }                                                           │
+          └──────────────────────────────────────────────────────────────┘
+          Note: the subscriber iteration is now RACY (no lock) — a
+          subscriber could be unsubscribed mid-iteration. For now,
+          acceptable (UP, rare). If needed, use a reader-writer lock
+          or RCU-style protection.
 
 
 ================================================================================
@@ -458,6 +519,18 @@
 
   M11 ─ No bounds check on command table additions [shell.c:303-328]
   FIX:    Use an enum with count, assert in init.
+
+  M12 ─ thread_join busy-waits burning a full time slice per check [sched.c:290-297]
+  ──────────────────────────────────────────────────────────────────────
+  BUG:    thread_join spins calling thread_yield() then checks state.
+          Each iteration costs one time slice (10ms) and a context
+          switch. For long-running threads, this wastes significant CPU
+          and increases latency for other threads.
+
+  FIX:    Add a `wait_queue_t join_waiters` field to thread_t. In
+          thread_join, call sched_block(&t->join_waiters) instead of
+          busy-looping. In thread_exit, call sched_wake() on the
+          exiting thread's join_waiters queue before marking ZOMBIE.
 
 
 ================================================================================
@@ -754,6 +827,8 @@
   [ ] Fix C11: hal_save_irq → add "memory" clobber
   [ ] Fix C12: timer_ticks overflow → use unsigned __int128 multiplication
   [ ] Fix C13: spinlock_acquire → disable interrupts (cli)
+  [ ] Fix C14: sched_block → call sched_remove_thread before adding to wq
+  [ ] Fix C15: eventbus_dispatch → copy event under lock, release, then call callbacks
   [ ] Fix H1: PIC mask → 0xFB (mask keyboard IRQ1)
   [ ] Fix H4: sched_foreach cli (covered by C5)
   [ ] Fix H6: pmm_free_page atomic (covered by C1)
@@ -782,6 +857,7 @@
 
   PHASE 3 — Heavy-Task Optimizations
   ───────────────────────────────────────────────────────────────────────
+  [ ] Fix M12: thread_join → use wait queue instead of busy-loop
   [ ] Multi-level feedback queue (MLFQ) scheduling
   [ ] Deadlock detection in mutex/semaphore operations
   [ ] Memory compaction: defragment physical pages during idle
