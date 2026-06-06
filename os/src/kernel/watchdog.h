@@ -25,6 +25,7 @@ err_t watchdog_init(void);
 void watchdog_register_layer(int id, const char* name,
                              watchdog_health_t (*check)(char*, size_t));
 void watchdog_run(void);
+void watchdog_flush(void);
 void watchdog_timer_handler(int_frame_t* frame, void* data);
 
 #endif

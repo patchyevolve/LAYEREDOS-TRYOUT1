@@ -44,6 +44,53 @@ stack_top:
 .type start, @function
 .code32
 start:
+    /* Initialize UART first! */
+    movw $0x3F8 + 1, %dx       /* IER: disable interrupts */
+    xorb %al, %al
+    outb %al, %dx
+
+    movw $0x3F8 + 3, %dx       /* LCR: enable DLAB */
+    movb $0x80, %al
+    outb %al, %dx
+
+    movw $0x3F8 + 0, %dx       /* DLL: divisor 1 */
+    movb $0x01, %al
+    outb %al, %dx
+    movw $0x3F8 + 1, %dx       /* DLM: 0 */
+    xorb %al, %al
+    outb %al, %dx
+
+    movw $0x3F8 + 3, %dx       /* LCR: 8 bits, no parity, 1 stop bit */
+    movb $0x03, %al
+    outb %al, %dx
+
+    movw $0x3F8 + 2, %dx       /* FCR: disable FIFO */
+    movb $0x00, %al
+    outb %al, %dx
+
+    movw $0x3F8 + 4, %dx       /* MCR: DTR/RTS */
+    movb $0x03, %al
+    outb %al, %dx
+
+    /* Now output "BOOTING" to serial */
+    movw $0x3F8, %dx
+    movb $'B', %al
+    call uart_putb
+    movb $'O', %al
+    call uart_putb
+    movb $'O', %al
+    call uart_putb
+    movb $'T', %al
+    call uart_putb
+    movb $'I', %al
+    call uart_putb
+    movb $'N', %al
+    call uart_putb
+    movb $'G', %al
+    call uart_putb
+    movb $'\n', %al
+    call uart_putb
+
     movl %eax, magic_saved - KERNEL_VMA_BASE
     movl %ebx, mb_info_saved - KERNEL_VMA_BASE
     cli
@@ -77,13 +124,11 @@ start:
     cld
     rep stosb
 
-    movl $(PDPT_ADDR | 0x03), (PML4_ADDR)
-    movl $(PDPT_ADDR | 0x03), (PML4_ADDR + 511*8)
+    movl $(PDPT_ADDR | 0x03), (PML4_ADDR)        /* lower half identity map */
+    movl $(PDPT_ADDR | 0x03), (PML4_ADDR + 511*8) /* higher half for kernel */
 
-    movl $(PD_ADDR | 0x03), (PDPT_ADDR)
-    movl $(PD_ADDR | 0x03), (PDPT_ADDR + 8)
-    movl $(PD_ADDR | 0x03), (PDPT_ADDR + 511*8)
-    movl $(PD_ADDR | 0x03), (PDPT_ADDR + 510*8)
+    movl $(PD_ADDR | 0x03), (PDPT_ADDR)            /* identity: 0-1GB → PD */
+    movl $(PD_ADDR | 0x03), (PDPT_ADDR + 511*8)    /* higher half: last 1GB of VA → PD */
 
     movl $PD_ADDR, %edi
     movl $0x00000083, %eax
@@ -134,6 +179,21 @@ start:
     cli
     hlt
     jmp 2b
+
+.code32
+uart_putb:
+    push %edx
+    push %ax
+    movw $0x3F8 + 5, %dx  /* UART_LSR */
+1:
+    inb %dx, %al
+    testb $0x20, %al        /* Check TX Empty */
+    jz 1b
+    pop %ax
+    movw $0x3F8, %dx
+    outb %al, %dx
+    pop %edx
+    ret
 
 .no_cpuid:
     movw $0x3F8, %dx

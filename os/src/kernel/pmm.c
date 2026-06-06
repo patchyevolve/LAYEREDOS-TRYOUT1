@@ -1,6 +1,9 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "hal.h"
+#include "eventbus.h"
+#include "sched.h"
+#include "process.h"
 
 typedef struct free_page {
     struct free_page* next;
@@ -13,7 +16,7 @@ static uint64_t total_memory = 0;
 
 static uint64_t bitmap_base = 0;
 static uint64_t bitmap_pages = 0;
-static uint8_t* used_bitmap;
+static uint8_t* used_bitmap; /* Uses PHYS_TO_VIRT address for per-PML4 safety */
 
 static void bitmap_set(uint64_t page_idx) {
     used_bitmap[page_idx / 8] |= (1 << (page_idx % 8));
@@ -40,20 +43,34 @@ void pmm_mark_region_used(uint64_t start, uint64_t end) {
     }
 }
 
+static void pmm_oom_kill(void) {
+    kprintf("[OOM] Out of memory! Killing current process...\n");
+    eventbus_publish(EV_OOM_KILL, 0, 0, 0, 0);
+    if (current_thread && current_thread->proc) {
+        process_exit(current_thread->proc, -12);
+        thread_exit(-12);
+    }
+}
+
 uint64_t pmm_alloc_page(void) {
-    if (!free_list) return 0;
+    cpu_flags_t flags = hal_save_irq();
+    if (!free_list) { hal_restore_irq(flags); pmm_oom_kill(); return 0; }
 
     free_page_t* page = free_list;
     free_list = page->next;
     free_page_count--;
 
-    uint64_t addr = (uint64_t)page;
-    bitmap_set(addr / PAGE_SIZE);
-    kmemset((void*)addr, 0, PAGE_SIZE);
-    return addr;
+    uint64_t phys = VIRT_TO_PHYS(page);
+    bitmap_set(phys / PAGE_SIZE);
+    hal_restore_irq(flags);
+    kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+    return phys;
 }
 
 uint64_t pmm_alloc_pages(uint32_t count) {
+    if (count == 0) return 0;
+
+    cpu_flags_t flags = hal_save_irq();
     uint64_t first = 0;
     uint32_t found = 0;
 
@@ -66,40 +83,48 @@ uint64_t pmm_alloc_pages(uint32_t count) {
         }
     }
 
-    if (found < count) return 0;
+    if (found < count) { hal_restore_irq(flags); return 0; }
 
     for (uint32_t j = 0; j < count; j++) {
-        uint64_t addr = (first + j) * PAGE_SIZE;
         bitmap_set(first + j);
         free_page_count--;
-
-        free_page_t** pp = &free_list;
-        while (*pp) {
-            if ((uint64_t)*pp == addr) {
-                *pp = (*pp)->next;
-                break;
-            }
-            pp = &(*pp)->next;
-        }
-
-        kmemset((void*)addr, 0, PAGE_SIZE);
     }
+
+    /* Single O(N) pass to remove allocated pages from free list */
+    free_page_t** pp = &free_list;
+    while (*pp) {
+        free_page_t* cur = *pp;
+        uint64_t pa = VIRT_TO_PHYS(cur);
+        uint64_t idx = pa / PAGE_SIZE;
+        if (idx >= first && idx < first + count) {
+            *pp = cur->next;
+        } else {
+            pp = &cur->next;
+        }
+    }
+
+    hal_restore_irq(flags);
+
+    for (uint32_t j = 0; j < count; j++)
+        kmemset((void*)PHYS_TO_VIRT((first + j) * PAGE_SIZE), 0, PAGE_SIZE);
 
     return first * PAGE_SIZE;
 }
 
 void pmm_free_page(uint64_t phys_addr) {
     if (phys_addr == 0 || (phys_addr & 0xFFF)) return;
+    cpu_flags_t flags = hal_save_irq();
     uint64_t idx = phys_addr / PAGE_SIZE;
-    if (idx >= total_page_count) return;
-    if (!bitmap_test(idx)) return;
+    if (idx >= total_page_count) { hal_restore_irq(flags); return; }
+    if (!bitmap_test(idx)) { kpanic("Double free detected: page %lx already free", phys_addr); }
 
     bitmap_clear(idx);
     free_page_count++;
 
-    free_page_t* page = (free_page_t*)phys_addr;
+    free_page_t* page = (free_page_t*)PHYS_TO_VIRT(phys_addr);
     page->next = free_list;
     free_list = page;
+    hal_restore_irq(flags);
 }
 
 void pmm_free_pages(uint64_t phys_addr, uint32_t count) {
@@ -108,78 +133,36 @@ void pmm_free_pages(uint64_t phys_addr, uint32_t count) {
     }
 }
 
-void pmm_debug_dump(void) {
-    kprintf("[PMM] Total: %lu pages (%lu MB), Free: %lu pages (%lu MB)\n",
-            total_page_count, total_page_count * 4 / 1024,
-            free_page_count, free_page_count * 4 / 1024);
-}
-
 static void add_region_to_free_list(uint64_t start, uint64_t end) {
     uint64_t s = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint64_t e = end & ~(PAGE_SIZE - 1);
+    uint64_t count = 0;
 
-    for (uint64_t addr = s; addr < e; addr += PAGE_SIZE) {
-        uint64_t idx = addr / PAGE_SIZE;
+    for (uint64_t phys = s; phys < e; phys += PAGE_SIZE) {
+        uint64_t idx = phys / PAGE_SIZE;
         if (idx < total_page_count && !bitmap_test(idx)) {
-            free_page_t* fp = (free_page_t*)addr;
+            free_page_t* fp = (free_page_t*)PHYS_TO_VIRT(phys);
             fp->next = free_list;
             free_list = fp;
+            count++;
         }
     }
+    (void)count;
 }
 
 static void parse_mb_mmap(uint64_t mb_info) {
-    typedef struct {
-        uint32_t size;
-        uint64_t base_addr;
-        uint64_t length;
-        uint32_t type;
-    } __attribute__((packed)) mmap_entry_t;
-
-    typedef struct {
-        uint32_t flags;
-        uint32_t mem_lower;
-        uint32_t mem_upper;
-        uint32_t boot_device;
-        uint32_t cmdline;
-        uint32_t mods_count;
-        uint32_t mods_addr;
-        uint32_t syms[4];
-        uint32_t mmap_length;
-        uint32_t mmap_addr;
-        uint32_t drives_length;
-        uint32_t drives_addr;
-    } __attribute__((packed)) multiboot_info_t;
-
-    if (mb_info == 0) {
-        kprintf("[PMM] No memory map (PVH boot)\n");
+    (void)mb_info;
+    hal_mmap_entry_t entries[MAX_MMAP_ENTRIES];
+    int n = hal_get_mmap_entries(entries, MAX_MMAP_ENTRIES);
+    if (n == 0) {
+        /* No memory map, using contiguous range */
         add_region_to_free_list(1 * 1024 * 1024, total_memory);
         return;
     }
-
-    multiboot_info_t* mbi = (multiboot_info_t*)(uint64_t)mb_info;
-
-    if (!(mbi->flags & (1 << 6))) {
-        kprintf("[PMM] No memory map from bootloader\n");
-        add_region_to_free_list(1 * 1024 * 1024, total_memory);
-        return;
-    }
-
-    mmap_entry_t* entry = (mmap_entry_t*)(uint64_t)mbi->mmap_addr;
-    uint32_t remaining = mbi->mmap_length;
-
-    while (remaining > 0) {
-        uint32_t entry_size = entry->size + 4;
-        uint64_t start = entry->base_addr;
-        uint64_t end = entry->base_addr + entry->length;
-
-        if (entry->type == 1) {
-            add_region_to_free_list(start, end);
+    for (int i = 0; i < n; i++) {
+        if (entries[i].type == 1) {
+            add_region_to_free_list(entries[i].start, entries[i].end);
         }
-
-        entry = (mmap_entry_t*)((uint64_t)entry + entry_size);
-        if (entry_size < 4) break;
-        remaining -= (remaining >= entry_size) ? entry_size : remaining;
     }
 }
 
@@ -194,8 +177,8 @@ err_t pmm_init(uint64_t mem_size_phys, uint64_t mb_info_phys) {
     bitmap_pages = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
     bitmap_base = 0x10000;
 
-    kmemset((void*)bitmap_base, 0xFF, bitmap_pages * PAGE_SIZE);
-    used_bitmap = (uint8_t*)(uint64_t)bitmap_base;
+    kmemset((void*)PHYS_TO_VIRT(bitmap_base), 0xFF, bitmap_pages * PAGE_SIZE);
+    used_bitmap = (uint8_t*)(PHYS_TO_VIRT(bitmap_base));
 
     for (uint64_t i = 0; i < total_page_count; i++) {
         bitmap_clear(i);

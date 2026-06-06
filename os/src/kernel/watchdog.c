@@ -78,6 +78,29 @@ void watchdog_register_layer(int id, const char* name,
     num_layers++;
 }
 
+#define WATCHDOG_BUF_SIZE 512
+static char watchdog_buf[WATCHDOG_BUF_SIZE];
+static volatile int watchdog_buf_pos = 0;
+
+static void watchdog_buf_write(const char* s) {
+    cpu_flags_t flags = hal_save_irq();
+    int pos = watchdog_buf_pos;
+    while (*s && pos < WATCHDOG_BUF_SIZE - 1)
+        watchdog_buf[pos++] = *s++;
+    watchdog_buf[pos] = '\0';
+    watchdog_buf_pos = pos;
+    hal_restore_irq(flags);
+}
+
+void watchdog_flush(void) {
+    cpu_flags_t flags = hal_save_irq();
+    int pos = watchdog_buf_pos;
+    if (pos == 0) { hal_restore_irq(flags); return; }
+    watchdog_buf_pos = 0;
+    hal_restore_irq(flags);
+    kputs(watchdog_buf);
+}
+
 void watchdog_run(void) {
     if (!watchdog_running) return;
 
@@ -94,18 +117,30 @@ void watchdog_run(void) {
             eventbus_publish(EV_WATCHDOG, (uint64_t)layers[i].layer_id,
                            (uint64_t)health, (uint64_t)layers[i].total_failures, 0);
 
-            kprintf("[WATCHDOG] Layer %d (%s) FAILED: %s (fail #%d)\n",
-                    layers[i].layer_id, layers[i].name, reason,
-                    layers[i].total_failures);
+            char tmp[128];
+            kstrncpy(tmp, reason, sizeof(tmp) - 1);
+            watchdog_buf_write("[WATCHDOG] Layer ");
+            watchdog_buf_write(layers[i].name);
+            watchdog_buf_write(" FAILED: ");
+            watchdog_buf_write(tmp);
+            watchdog_buf_write("\n");
 
             if (layers[i].consecutive_failures >= WATCHDOG_MAX_FAILURES) {
-                kprintf("[WATCHDOG] Escalating: Layer %d (%s) exceeded max failures\n",
-                        layers[i].layer_id, layers[i].name);
+                watchdog_buf_write("[WATCHDOG] Escalating: Layer ");
+                watchdog_buf_write(layers[i].name);
+                watchdog_buf_write(" exceeded max failures. PANIC!\n");
+                watchdog_flush();
+                kpanic("Watchdog layer failure");
             }
         } else if (health == WATCHDOG_DEGRADED) {
             layers[i].consecutive_failures = 0;
-            kprintf("[WATCHDOG] Layer %d (%s) DEGRADED: %s\n",
-                    layers[i].layer_id, layers[i].name, reason);
+            char tmp[128];
+            kstrncpy(tmp, reason, sizeof(tmp) - 1);
+            watchdog_buf_write("[WATCHDOG] Layer ");
+            watchdog_buf_write(layers[i].name);
+            watchdog_buf_write(" DEGRADED: ");
+            watchdog_buf_write(tmp);
+            watchdog_buf_write("\n");
         } else {
             layers[i].consecutive_failures = 0;
         }

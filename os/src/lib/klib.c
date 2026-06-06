@@ -2,8 +2,16 @@
 
 #define UART_LSR 0x3FD
 #define UART_THR 0x3F8
+#define VGA_ADDR   0xB8000
+#define VGA_COLS   80
+#define VGA_ROWS   25
 
 static char hexdigits[] = "0123456789ABCDEF";
+#define INT64_MIN (-9223372036854775807LL - 1LL)
+
+static volatile uint16_t* const vga_buf = (volatile uint16_t*)(KERNEL_VMA_BASE + VGA_ADDR);
+static int vga_row = 0;
+static int vga_col = 0;
 
 static inline void outb(uint16_t port, uint8_t val) {
     asm volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -14,6 +22,22 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
+static void vga_scroll(void) {
+    for (int i = 0; i < (VGA_ROWS - 1) * VGA_COLS; i++)
+        vga_buf[i] = vga_buf[i + VGA_COLS];
+    for (int i = (VGA_ROWS - 1) * VGA_COLS; i < VGA_ROWS * VGA_COLS; i++)
+        vga_buf[i] = (uint16_t)' ' | (0x07 << 8);
+    vga_row = VGA_ROWS - 1;
+}
+
+static void vga_update_cursor(void) {
+    uint16_t pos = vga_row * VGA_COLS + vga_col;
+    outb(0x3D4, 14);
+    outb(0x3D5, (uint8_t)(pos >> 8));
+    outb(0x3D4, 15);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+}
+
 void kputchar(char c) {
     if (c == '\n') {
         while (!(inb(UART_LSR) & 0x20));
@@ -21,6 +45,17 @@ void kputchar(char c) {
     }
     while (!(inb(UART_LSR) & 0x20));
     outb(UART_THR, c);
+
+    if (c == '\n') { vga_col = 0; vga_row++; }
+    else if (c == '\r') { vga_col = 0; }
+    else if (c == '\b' || c == 127) { if (vga_col > 0) vga_col--; }
+    else if (c >= ' ') {
+        vga_buf[vga_row * VGA_COLS + vga_col] = (uint16_t)c | (0x07 << 8);
+        vga_col++;
+    }
+    if (vga_col >= VGA_COLS) { vga_col = 0; vga_row++; }
+    if (vga_row >= VGA_ROWS) vga_scroll();
+    vga_update_cursor();
 }
 
 void kputs(const char* s) {
@@ -31,7 +66,13 @@ static void kprint_int64(int64_t v, int base, int pad) {
     char buf[24];
     int neg = 0;
     int pos = 0;
-    if (base == 10 && v < 0) { neg = 1; v = -v; }
+    if (base == 10 && v < 0) {
+        if (v == INT64_MIN) {
+            kputs("-9223372036854775808");
+            return;
+        }
+        neg = 1; v = -v;
+    }
     uint64_t uv = (uint64_t)v;
     if (uv == 0) { buf[pos++] = '0'; }
     while (uv > 0) {
@@ -43,6 +84,18 @@ static void kprint_int64(int64_t v, int base, int pad) {
     for (int i = pos - 1; i >= 0; i--) kputchar(buf[i]);
 }
 
+static void kprint_uint64(uint64_t v, int pad) {
+    char buf[24];
+    int pos = 0;
+    if (v == 0) { buf[pos++] = '0'; }
+    while (v > 0) {
+        buf[pos++] = '0' + (v % 10);
+        v /= 10;
+    }
+    while (pos < pad) buf[pos++] = '0';
+    for (int i = pos - 1; i >= 0; i--) kputchar(buf[i]);
+}
+
 void kputhex(uint64_t v) {
     kputs("0x");
     for (int i = 60; i >= 0; i -= 4) {
@@ -50,8 +103,92 @@ void kputhex(uint64_t v) {
     }
 }
 
+static void kputhex_trim(uint64_t v) {
+    kputs("0x");
+    int shift = 60;
+    while (shift > 0 && !((v >> shift) & 0xF)) shift -= 4;
+    for (int i = shift; i >= 0; i -= 4)
+        kputchar(hexdigits[(v >> i) & 0xF]);
+}
+
 void kputdec(uint64_t v, int pad) {
     kprint_int64((int64_t)v, 10, pad);
+}
+
+int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
+    if (!buf || size == 0) return 0;
+    int written = 0;
+    for (const char* p = fmt; *p; p++) {
+        if (written >= (int)size - 1) break;
+        if (*p != '%') { buf[written++] = *p; continue; }
+        p++;
+        if (*p == '-') p++;
+        int pad = 0;
+        while (*p >= '0' && *p <= '9') { pad = pad * 10 + (*p - '0'); p++; }
+        int lc = 0;
+        while (*p == 'l') { lc++; p++; }
+        char tmp[32];
+        int ti = 0;
+        if (*p == '%') { buf[written++] = '%'; continue; }
+        switch (*p) {
+            case 'd': {
+                int64_t v;
+                if (lc >= 2) v = __builtin_va_arg(ap, long long);
+                else if (lc == 1) v = __builtin_va_arg(ap, long);
+                else v = __builtin_va_arg(ap, int);
+                int neg = 0;
+                if (v < 0) { neg = 1; v = -v; }
+                uint64_t uv = (uint64_t)v;
+                do { tmp[ti++] = '0' + (uv % 10); uv /= 10; } while (uv > 0);
+                while (ti < pad) tmp[ti++] = '0';
+                if (neg) tmp[ti++] = '-';
+                for (int i = ti - 1; i >= 0 && written < (int)size - 1; i--)
+                    buf[written++] = tmp[i];
+                break;
+            }
+            case 'u': {
+                uint64_t v;
+                if (lc >= 2) v = __builtin_va_arg(ap, unsigned long long);
+                else if (lc == 1) v = __builtin_va_arg(ap, unsigned long);
+                else v = __builtin_va_arg(ap, unsigned int);
+                do { tmp[ti++] = '0' + (v % 10); v /= 10; } while (v > 0);
+                while (ti < pad) tmp[ti++] = '0';
+                for (int i = ti - 1; i >= 0 && written < (int)size - 1; i--)
+                    buf[written++] = tmp[i];
+                break;
+            }
+            case 'x': {
+                uint64_t v;
+                if (lc >= 2) v = __builtin_va_arg(ap, unsigned long long);
+                else if (lc == 1) v = __builtin_va_arg(ap, unsigned long);
+                else v = __builtin_va_arg(ap, unsigned int);
+                buf[written++] = '0'; if (written < (int)size - 1) buf[written++] = 'x';
+                for (int i = 60; i >= 0 && written < (int)size - 1; i -= 4) {
+                    int nib = (v >> i) & 0xF;
+                    if (nib || i == 0) 
+                        buf[written++] = hexdigits[nib];
+                }
+                break;
+            }
+            case 's': {
+                const char* s = __builtin_va_arg(ap, const char*);
+                if (!s) s = "(null)";
+                while (*s && written < (int)size - 1) buf[written++] = *s++;
+                break;
+            }
+            case 'c': {
+                int c = __builtin_va_arg(ap, int);
+                buf[written++] = (char)c;
+                break;
+            }
+            default:
+                buf[written++] = '%';
+                if (*p && written < (int)size - 1) buf[written++] = *p;
+                break;
+        }
+    }
+    buf[written] = '\0';
+    return written;
 }
 
 void kprintf(const char* fmt, ...) {
@@ -66,7 +203,6 @@ void kprintf(const char* fmt, ...) {
         }
         int lc = 0;
         while (*p == 'l') { lc++; p++; }
-        if (*p == 'l') { lc++; p++; }
         if (*p == '%') { kputchar('%'); continue; }
         switch (*p) {
             case 'd': {
@@ -82,7 +218,7 @@ void kprintf(const char* fmt, ...) {
                 if (lc >= 2) v = __builtin_va_arg(ap, unsigned long long);
                 else if (lc == 1) v = __builtin_va_arg(ap, unsigned long);
                 else v = __builtin_va_arg(ap, unsigned int);
-                kprint_int64((int64_t)v, 10, pad);
+                kprint_uint64(v, pad);
                 break;
             }
             case 'x': {
@@ -90,11 +226,7 @@ void kprintf(const char* fmt, ...) {
                 if (lc >= 2) v = __builtin_va_arg(ap, unsigned long long);
                 else if (lc == 1) v = __builtin_va_arg(ap, unsigned long);
                 else v = __builtin_va_arg(ap, unsigned int);
-                kprintf("0x");
-                int shift = 60;
-                while (shift > 0 && !((v >> shift) & 0xF)) shift -= 4;
-                for (int i = shift; i >= 0; i -= 4)
-                    kputchar(hexdigits[(v >> i) & 0xF]);
+                kputhex_trim(v);
                 break;
             }
             case 'p': {
@@ -121,13 +253,18 @@ void kprintf(const char* fmt, ...) {
     __builtin_va_end(ap);
 }
 
-void kassert_fail(const char* expr, const char* file, int line, const char* func) {
-    kprintf("\n*** ASSERTION FAILED ***\n");
-    kprintf("  Expression: %s\n", expr);
-    kprintf("  File:       %s\n", file);
-    kprintf("  Line:       %d\n", line);
-    kprintf("  Function:   %s\n", func);
-    kpanic("Assertion failed");
+static void kdump_stack(void) {
+    kprintf("\n====== STACK TRACE ======\n");
+    uint64_t* rbp;
+    __asm__ volatile ("mov %%rbp, %0" : "=r"(rbp));
+    int depth = 0;
+    while (rbp && depth < 32) {
+        uint64_t rip = rbp[1];
+        kprintf("  [%d] %p\n", depth, (void*)rip);
+        rbp = (uint64_t*)rbp[0];
+        depth++;
+    }
+    kprintf("=========================\n");
 }
 
 void kpanic(const char* msg, ...) {
@@ -145,15 +282,10 @@ void kpanic(const char* msg, ...) {
             default: kputchar(*p); break;
         }
     }
-    kprintf("\n==========================\n");
     __builtin_va_end(ap);
+    kdump_stack();
+    kprintf("\n==========================\n");
     for (;;) { asm volatile("cli; hlt"); }
-}
-
-size_t kstrlen(const char* s) {
-    size_t n = 0;
-    while (*s) { n++; s++; }
-    return n;
 }
 
 int kstrcmp(const char* a, const char* b) {
@@ -162,16 +294,45 @@ int kstrcmp(const char* a, const char* b) {
 }
 
 int kstrncmp(const char* a, const char* b, size_t n) {
-    while (n > 0 && *a && *a == *b) { a++; b++; n--; }
-    if (n == 0) return 0;
-    return (unsigned char)*a - (unsigned char)*b;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
+        if (a[i] == '\0') return 0;
+    }
+    return 0;
 }
 
-char* kstrcpy(char* d, const char* s) {
-    char* r = d;
-    while (*s) { *d++ = *s++; }
-    *d = 0;
-    return r;
+char* kstrncat(char* d, const char* s, size_t n) {
+    char* ret = d;
+    while (*d) d++;
+    while (n-- > 0 && *s) { *d++ = *s++; }
+    *d = '\0';
+    return ret;
+}
+
+const char* kstrstr(const char* haystack, const char* needle) {
+    if (!*needle) return haystack;
+    for (; *haystack; haystack++) {
+        const char* h = haystack;
+        const char* n = needle;
+        while (*n && *h == *n) { h++; n++; }
+        if (!*n) return haystack;
+    }
+    return NULL;
+}
+
+int kmemcmp(const void* a, const void* b, size_t n) {
+    const unsigned char* pa = (const unsigned char*)a;
+    const unsigned char* pb = (const unsigned char*)b;
+    for (size_t i = 0; i < n; i++) {
+        if (pa[i] != pb[i]) return (int)pa[i] - (int)pb[i];
+    }
+    return 0;
+}
+
+size_t kstrlen(const char* s) {
+    size_t n = 0;
+    while (*s++) n++;
+    return n;
 }
 
 char* kstrncpy(char* d, const char* s, size_t n) {
@@ -194,12 +355,4 @@ void* kmemcpy(void* d, const void* s, size_t n) {
     return d;
 }
 
-int kmemcmp(const void* a, const void* b, size_t n) {
-    const unsigned char* pa = (const unsigned char*)a;
-    const unsigned char* pb = (const unsigned char*)b;
-    while (n--) {
-        if (*pa != *pb) return *pa - *pb;
-        pa++; pb++;
-    }
-    return 0;
-}
+

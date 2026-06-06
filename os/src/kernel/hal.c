@@ -1,5 +1,9 @@
 #include "kernel.h"
 #include "hal.h"
+#include "sched.h"
+#include "syscall.h"
+#include "process.h"
+
 
 #define UART_BASE 0x3F8
 #define UART_RBR  (UART_BASE + 0)
@@ -8,6 +12,7 @@
 #define UART_FCR  (UART_BASE + 2)
 #define UART_LCR  (UART_BASE + 3)
 #define UART_LSR  (UART_BASE + 5)
+#define UART_IRQ  4
 
 #define PIT_CMD  0x43
 #define PIT_DATA 0x40
@@ -19,6 +24,7 @@
 
 #define IDT_ENTRIES 256
 #define GDT_ENTRIES 7
+#define UART_RX_BUF_SIZE 256
 
 typedef struct {
     uint16_t size;
@@ -51,6 +57,7 @@ typedef struct {
 static tss64_t tss __attribute__((aligned(16)));
 
 static uint8_t ist_stack0[8192] __attribute__((aligned(16)));
+static uint8_t user_stack0[16384] __attribute__((aligned(16)));
 
 typedef struct {
     irq_handler_t handler;
@@ -60,24 +67,35 @@ typedef struct {
 static irq_reg_t irq_handlers[48];
 static volatile uint64_t timer_ticks = 0;
 static volatile uint32_t timer_hz = 1000;
+int hal_smap_enabled(void) {
+    static int available = 0;
+    static int checked = 0;
+    if (!checked) {
+        checked = 1;
+        uint32_t eax, ebx, ecx, edx;
+        asm volatile("cpuid"
+            : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+            : "a"(7), "c"(0));
+        available = (ebx & (1 << 20)) ? 1 : 0;
+    }
+    return available;
+}
 
-static inline void outb(uint16_t port, uint8_t val) {
-    asm volatile("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    asm volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-static inline void outw(uint16_t port, uint16_t val) {
-    asm volatile("outw %0, %1" : : "a"(val), "Nd"(port));
-}
-static inline uint16_t inw(uint16_t port) {
-    uint16_t ret;
-    asm volatile("inw %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+static volatile char uart_rx_buf[UART_RX_BUF_SIZE];
+static volatile int uart_rx_head = 0;
+static volatile int uart_rx_tail = 0;
+static wait_queue_t uart_rx_waitq;
+static int uart_rx_irq_active = 0;
+
 static inline void io_wait(void) { outb(0x80, 0); }
+
+int hal_cpu_has_mwait(void) {
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(1), "c"(0));
+    return (ecx >> 3) & 1;
+}
 
 static inline uint64_t read_cr2(void) {
     uint64_t v;
@@ -95,13 +113,13 @@ void hal_cli(void) { asm volatile("cli"); }
 
 cpu_flags_t hal_save_irq(void) {
     cpu_flags_t flags;
-    asm volatile("pushfq; popq %0" : "=r"(flags));
-    asm volatile("cli");
+    asm volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
     return flags;
 }
 
 void hal_restore_irq(cpu_flags_t flags) {
-    if (flags & 0x200) asm volatile("sti");
+    if (flags & 0x200)
+        asm volatile("sti" : : : "memory");
 }
 
 static void gdt_set_entry(int i, uint32_t base, uint32_t limit,
@@ -154,12 +172,6 @@ static void idt_set_gate(uint8_t vec, uint64_t handler, uint8_t dpl) {
     e->reserved    = 0;
 }
 
-err_t hal_idt_set_gate(int vec, void* handler, uint8_t dpl) {
-    if (vec < 0 || vec >= (int)IDT_ENTRIES) return ERR_INVAL;
-    idt_set_gate(vec, (uint64_t)handler, dpl);
-    return ERR_OK;
-}
-
 static void idt_init(void) {
     idtr.size = sizeof(idt) - 1;
     idtr.offset = (uint64_t)idt;
@@ -173,8 +185,26 @@ static void idt_init(void) {
     asm volatile("lidt %0" : : "m"(idtr));
 
     kmemset(&tss, 0, sizeof(tss));
+    tss.rsp[0] = (uint64_t)user_stack0 + sizeof(user_stack0);
     tss.ist[0] = (uint64_t)ist_stack0 + sizeof(ist_stack0);
     tss.ist[1] = (uint64_t)ist_stack0 + sizeof(ist_stack0);
+}
+
+void hal_set_kernel_stack(uint64_t rsp0) {
+    tss.rsp[0] = rsp0;
+}
+
+uint64_t hal_get_kernel_stack(void) {
+    return tss.rsp[0];
+}
+
+void hal_enable_irqs(void) {
+    // Unmask timer IRQ0 and UART IRQ4
+    uint16_t mask = inb(PIC1_DATA) | (inb(PIC2_DATA) << 8);
+    mask &= ~(1 << 0); // Timer IRQ0
+    mask &= ~(1 << UART_IRQ); // UART IRQ4
+    outb(PIC1_DATA, mask & 0xFF);
+    outb(PIC2_DATA, (mask >> 8) & 0xFF);
 }
 
 static void pic_remap(void) {
@@ -186,7 +216,7 @@ static void pic_remap(void) {
     outb(PIC2_DATA, 0x02); io_wait();
     outb(PIC1_DATA, 0x01); io_wait();
     outb(PIC2_DATA, 0x01); io_wait();
-    outb(PIC1_DATA, 0xFD); io_wait();
+    outb(PIC1_DATA, 0xFB); io_wait();
     outb(PIC2_DATA, 0xFF); io_wait();
 }
 
@@ -199,25 +229,8 @@ err_t hal_irq_register(uint8_t irq, irq_handler_t handler, void* data) {
     if (irq >= 48) return ERR_INVAL;
     irq_handlers[irq].handler = handler;
     irq_handlers[irq].data = data;
-    if (irq < 16) {
-        uint16_t mask = inb(PIC1_DATA) | (inb(PIC2_DATA) << 8);
-        mask &= ~(1 << irq);
-        outb(PIC1_DATA, mask & 0xFF);
-        outb(PIC2_DATA, (mask >> 8) & 0xFF);
-    }
-    return ERR_OK;
-}
-
-err_t hal_irq_unregister(uint8_t irq) {
-    if (irq >= 48) return ERR_INVAL;
-    irq_handlers[irq].handler = NULL;
-    irq_handlers[irq].data = NULL;
-    if (irq < 16) {
-        uint16_t mask = inb(PIC1_DATA) | (inb(PIC2_DATA) << 8);
-        mask |= (1 << irq);
-        outb(PIC1_DATA, mask & 0xFF);
-        outb(PIC2_DATA, (mask >> 8) & 0xFF);
-    }
+    __sync_synchronize();
+    // Don't unmask automatically; unmask via hal_enable_irqs()
     return ERR_OK;
 }
 
@@ -233,24 +246,54 @@ err_t hal_timer_init(uint32_t hz) {
 uint64_t hal_timer_get_ticks(void) { return timer_ticks; }
 
 uint64_t hal_timer_get_ns(void) {
-    return (timer_ticks * 1000000000ULL) / timer_hz;
+    unsigned __int128 ns = (unsigned __int128)timer_ticks * 1000000000ULL;
+    return (uint64_t)(ns / timer_hz);
 }
 
-void hal_uart_putchar(char c) {
-    while (!(inb(UART_LSR) & 0x20));
-    outb(UART_THR, c);
-    if (c == '\n') {
-        while (!(inb(UART_LSR) & 0x20));
-        outb(UART_THR, '\r');
+uint32_t hal_timer_get_hz(void) { return timer_hz; }
+
+static void uart_rx_isr(int_frame_t* frame, void* data) {
+    (void)frame; (void)data;
+    while (inb(UART_LSR) & 1) {
+        char c = inb(UART_RBR);
+        int next = (uart_rx_head + 1) % UART_RX_BUF_SIZE;
+        if (next != uart_rx_tail) {
+            uart_rx_buf[uart_rx_head] = c;
+            uart_rx_head = next;
+        }
     }
+    sched_wake(&uart_rx_waitq);
+    need_reschedule = 1;
+}
+
+err_t hal_uart_rx_init(void) {
+    uart_rx_waitq.waiters = NULL;
+    uart_rx_waitq.count = 0;
+    err_t e = hal_irq_register(UART_IRQ, uart_rx_isr, NULL);
+    if (e) return e;
+    outb(UART_IER, 0x01);
+    uart_rx_irq_active = 1;
+    return ERR_OK;
 }
 
 char hal_uart_getchar(void) {
-    while (!(inb(UART_LSR) & 1));
-    return inb(UART_RBR);
+    if (!uart_rx_irq_active) {
+        while (!(inb(UART_LSR) & 1));
+        return inb(UART_RBR);
+    }
+    cpu_flags_t flags = hal_save_irq();
+    while (uart_rx_head == uart_rx_tail) {
+        sched_block(&uart_rx_waitq);
+    }
+    char c = uart_rx_buf[uart_rx_tail];
+    uart_rx_tail = (uart_rx_tail + 1) % UART_RX_BUF_SIZE;
+    hal_restore_irq(flags);
+    return c;
 }
 
 int hal_uart_data_available(void) {
+    if (uart_rx_irq_active)
+        return (uart_rx_head != uart_rx_tail) ? 1 : 0;
     return (inb(UART_LSR) & 1) ? 1 : 0;
 }
 
@@ -261,30 +304,20 @@ static void uart_init(void) {
     outb(UART_IER, 0x00);
     outb(UART_LCR, 0x03);
     outb(UART_FCR, 0x07);
-    outb(UART_IER, 0x01);
+    outb(UART_IER, 0x00);
+}
+
+static hal_mmap_entry_t mmap_entries[MAX_MMAP_ENTRIES];
+static int mmap_entry_count = 0;
+
+int hal_get_mmap_entries(hal_mmap_entry_t* out, int max) {
+    int n = mmap_entry_count < max ? mmap_entry_count : max;
+    for (int i = 0; i < n; i++) out[i] = mmap_entries[i];
+    return mmap_entry_count;
 }
 
 uint64_t hal_get_mem_size(uint64_t mb_info) {
-    typedef struct {
-        uint32_t size;
-        uint64_t base_addr;
-        uint64_t length;
-        uint32_t type;
-    } __attribute__((packed)) mmap_entry_t;
-    typedef struct {
-        uint32_t flags;
-        uint32_t mem_lower;
-        uint32_t mem_upper;
-        uint32_t boot_device;
-        uint32_t cmdline;
-        uint32_t mods_count;
-        uint32_t mods_addr;
-        uint32_t syms[4];
-        uint32_t mmap_length;
-        uint32_t mmap_addr;
-        uint32_t drives_length;
-        uint32_t drives_addr;
-    } __attribute__((packed)) multiboot_info_t;
+    mmap_entry_count = 0;
 
     if (mb_info == 0) {
         return 512 * 1024 * 1024;
@@ -296,14 +329,19 @@ uint64_t hal_get_mem_size(uint64_t mb_info) {
     if (mbi->flags & (1 << 6)) {
         mmap_entry_t* entry = (mmap_entry_t*)(uint64_t)mbi->mmap_addr;
         uint32_t remaining = mbi->mmap_length;
-        while (remaining > 0) {
+        while (remaining > 0 && mmap_entry_count < MAX_MMAP_ENTRIES) {
+            mmap_entries[mmap_entry_count].start = entry->base_addr;
+            mmap_entries[mmap_entry_count].end = entry->base_addr + entry->length;
+            mmap_entries[mmap_entry_count].type = entry->type;
+            mmap_entry_count++;
+
             if (entry->type == 1) {
                 uint64_t end = entry->base_addr + entry->length;
                 if (end > max_addr) max_addr = end;
             }
             uint32_t entry_size = entry->size + 4;
             entry = (mmap_entry_t*)((uint64_t)entry + entry_size);
-            remaining -= entry_size;
+            remaining -= (remaining >= entry_size) ? entry_size : remaining;
         }
     } else if (mbi->flags & (1 << 0)) {
         max_addr = (uint64_t)mbi->mem_upper * 1024;
@@ -329,28 +367,45 @@ void interrupt_handler(int_frame_t* frame) {
         return;
     }
 
-    if (vec == 128) return;
+    if (vec == 128) {
+        syscall_handler(frame);
+        return;
+    }
 
     if (vec == 14) {
         uint64_t cr2 = read_cr2();
-        kprintf("PAGE FAULT at 0x%lx, rip=0x%lx, error=%lu\n",
-                cr2, frame->rip, frame->error_code);
-        kpanic("Page fault");
+        uint64_t fault_rip = frame->rip;
+        uint64_t err = frame->error_code;
+        if ((frame->cs & 3) == 3) {
+            kprintf("PAGE FAULT pid=%lu rip=%lx addr=%lx error=%lu -- killing process\n",
+                    current_thread && current_thread->proc ? current_thread->proc->pid : 0,
+                    fault_rip, cr2, err);
+            if (current_thread && current_thread->proc) {
+                process_exit(current_thread->proc, -11);
+                thread_exit(-11);
+            }
+            for (;;) { asm volatile("cli; hlt"); }
+        } else {
+            kprintf("PAGE FAULT at %lx, rip=%lx, error=%lu (KERNEL)\n",
+                    cr2, fault_rip, err);
+            kpanic("Page fault (kernel mode)");
+        }
     }
 
     if (vec == 13) {
-        kprintf("GP FAULT rip=0x%lx error=%lu\n", frame->rip, frame->error_code);
+        kprintf("GP FAULT rip=%lx error=%lu\n", frame->rip, frame->error_code);
         kpanic("General protection fault");
     }
 
     if (vec == 8) {
-        kprintf("DOUBLE FAULT rip=0x%lx\n", frame->rip);
+        kprintf("DOUBLE FAULT rip=%lx\n", frame->rip);
         for (;;) { asm volatile("cli; hlt"); }
     }
 
-    kprintf("UNHANDLED INTERRUPT vec=%lu rip=0x%lx\n", (uint64_t)vec, frame->rip);
+    kprintf("UNHANDLED INTERRUPT vec=%lu rip=%lx\n", (uint64_t)vec, frame->rip);
     kpanic("Unhandled interrupt");
 }
+
 
 void hal_poweroff(void) {
     kputs("System poweroff.\n");
@@ -377,6 +432,22 @@ err_t hal_init(uint64_t mb_info_phys) {
     pic_remap();
     uart_init();
     hal_timer_init(1000);
+
+    // Enable SMEP and SMAP if supported
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(7), "c"(0));
+
+    uint64_t cr4;
+    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    if (ebx & (1 << 7)) { // SMEP is bit 7 of EBX when CPUID=7, ECX=0
+        cr4 |= (1UL << 20);
+    }
+    if (hal_smap_enabled()) {
+        cr4 |= (1UL << 21);
+    }
+    asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
 
     kputs("[HAL] Layer 1 initialized: GDT, IDT, PIC, UART, Timer\n");
     return ERR_OK;

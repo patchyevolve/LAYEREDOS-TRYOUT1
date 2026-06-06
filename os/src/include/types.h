@@ -9,13 +9,10 @@ typedef signed char        int8_t;
 typedef signed short       int16_t;
 typedef signed int         int32_t;
 typedef signed long long   int64_t;
-typedef uint32_t           size_t;
-typedef int32_t            ssize_t;
+typedef uint64_t           size_t;
+typedef int64_t            ssize_t;
 typedef uint64_t           uintptr_t;
 typedef int64_t            intptr_t;
-#define bool  _Bool
-#define true  1
-#define false 0
 #define NULL  ((void*)0)
 
 #define offsetof(T, M) __builtin_offsetof(T, M)
@@ -62,5 +59,28 @@ typedef enum { ERR_OK = 0,
 #define TIME_SLICE_MS      10
 
 typedef uint64_t cpu_flags_t;
+
+// Embedded intrusive doubly-linked list
+typedef struct list_head {
+    struct list_head* next;
+    struct list_head* prev;
+} list_head_t;
+
+static inline void list_init(list_head_t* head) {
+    head->next = head->prev = head;
+}
+
+static inline void list_add_tail(list_head_t* head, list_head_t* node) {
+    node->prev = head->prev;
+    node->next = head;
+    head->prev->next = node;
+    head->prev = node;
+}
+
+static inline void list_del(list_head_t* node) {
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+    node->next = node->prev = node;
+}
 
 #endif

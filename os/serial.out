@@ -1,0 +1,30 @@
+BOOTING
+[HAL] Layer 1 initialized: GDT, IDT, PIC, UART, Timer
+[BOOT] Step 1/6: Layer 1 (HAL) - GDT, IDT, UART, Timer, PIC
+[BOOT] Detected memory: 512 MB
+[BOOT] Step 2/6: Layer 4 (PMM) - Physical Memory Manager
+[PMM] Total memory: 512 MB (131072 pages)
+[PMM] No memory map, using contiguous range
+[PMM] Free: 131028 pages (511 MB)
+[BOOT] Step 3/6: Layer 4 (VMM) - Virtual Memory Manager
+[VMM] Layer 4 initialized: kernel PML4 at 0x7000
+[VMM] Kernel occupies 0x100000 - 0x222000
+[BOOT] Step 4/6: Kernel Heap - Slab Allocator
+[BOOT] Step 5/6: Syscall Interface
+[SYSCALL] int 0x80 handler registered, 3 syscalls
+[BOOT] Step 6/6: Layer 2 (SCHED) - Scheduler & Threading
+[SCHED] Set TSS RSP0 to 0x0xF000
+[SCHED] Layer 2 initialized: 256 priority levels
+[BOOT] Step 7/6: Cross-Cutting - EventBus & Watchdog
+[WATCHDOG] Cross-cutting initialized: monitoring 3 layers
+[BOOT] Step 8/6: Layer N-1 (SHELL) - User Interface
+[SHELL] Layer N-1 initialized
+[BOOT] Boot Complete - All Layers Initialized. Starting shell...
+
+╔══════════════════════════════════════╗
+║  OPERtur/TRY1 OS v0.1.0              ║
+║  Layered x86-64 Kernel               ║
+║  Type 'help' for commands             ║
+╚══════════════════════════════════════╝
+
+OS> 

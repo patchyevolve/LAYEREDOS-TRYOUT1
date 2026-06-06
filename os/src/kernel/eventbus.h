@@ -32,9 +32,11 @@ typedef void (*event_callback_t)(event_t* event, void* context);
 err_t eventbus_init(void);
 err_t eventbus_publish(event_type_t type, uint64_t a1, uint64_t a2,
                        uint64_t a3, uint64_t a4);
-err_t eventbus_subscribe(event_type_t type, event_callback_t cb, void* context);
-err_t eventbus_unsubscribe(event_type_t type, event_callback_t cb);
 void  eventbus_dispatch(void);
 uint64_t eventbus_count(void);
+err_t eventbus_subscribe(event_type_t type, event_callback_t callback,
+                         void* context);
+err_t eventbus_unsubscribe(event_type_t type, event_callback_t callback,
+                           void* context);
 
 #endif

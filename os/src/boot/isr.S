@@ -74,6 +74,7 @@ ISR_NOERR 128
 .extern interrupt_handler
 .extern need_reschedule
 .extern schedule
+.extern boot_complete
 .type isr_common_handler, @function
 isr_common_handler:
     pushq %r15
@@ -96,9 +97,15 @@ isr_common_handler:
     cld
     call interrupt_handler
 
-    cmpl $0, need_reschedule(%rip)
-    je 1f
+    movl boot_complete(%rip), %eax
+    testl %eax, %eax
+    jz 1f
+    movl need_reschedule(%rip), %eax
+    testl %eax, %eax
+    jz 1f
+    movl $0, need_reschedule(%rip)
     call schedule
+
 1:
 
     popq %rax
