@@ -1,12 +1,12 @@
 #include "kernel.h"
 #include "sfs.h"
 #include "block.h"
+#include "journal.h"
+#include "fsck.h"
 #include "pmm.h"
 #include "kmalloc.h"
 #include "hal.h"
-
-#define SFS_INODES_PER_BLOCK (SFS_BLOCK_SIZE / sizeof(sfs_inode_t))
-#define SFS_DIRENTS_PER_BLOCK (SFS_BLOCK_SIZE / sizeof(sfs_dirent_t))
+#include "sync.h"
 
 static int sfs_blocks_for_inodes(uint32_t count) {
     return (count + SFS_INODES_PER_BLOCK - 1) / SFS_INODES_PER_BLOCK;
@@ -16,38 +16,110 @@ static int sfs_blocks_for_bmap(uint32_t bits) {
     return (bits + SFS_BLOCK_SIZE * 8 - 1) / (SFS_BLOCK_SIZE * 8);
 }
 
+static uint32_t sfs_sb_checksum(const sfs_superblock_t* sb) {
+    uint32_t c = 0;
+    const uint32_t* p = (const uint32_t*)sb;
+    for (uint32_t i = 0; i < sizeof(sfs_superblock_t) / sizeof(uint32_t); i++)
+        c ^= p[i];
+    return c;
+}
+
+static int sfs_sb_verify(const sfs_superblock_t* sb) {
+    if (sb->magic != SFS_MAGIC) return 0;
+    uint32_t stored = sb->checksum;
+    ((sfs_superblock_t*)sb)->checksum = 0;
+    int ok = (sfs_sb_checksum(sb) == stored);
+    ((sfs_superblock_t*)sb)->checksum = stored;
+    return ok;
+}
+
+static void sfs_sb_finalize(sfs_superblock_t* sb) {
+    sb->checksum = 0;
+    sb->checksum = sfs_sb_checksum(sb);
+}
+
 static err_t sfs_read_block(sfs_fs_t* fs, uint32_t block, void* buf) {
     return block_read(fs->bdev, block, 1, buf);
 }
 
-static err_t sfs_write_block(sfs_fs_t* fs, uint32_t block, const void* buf) {
+/* Journal-aware metadata write — logs then caches the write */
+static err_t sfs_write_meta(sfs_fs_t* fs, uint32_t block, const void* buf) {
+    if (fs->journal_active) {
+        err_t e = journal_log(fs->bdev, fs->journal_start,
+                              (uint32_t)fs->journal_seq, block, buf);
+        if (e == ERR_NOSPACE) {
+            journal_commit(fs->bdev, fs->journal_start,
+                           (uint32_t)fs->journal_seq);
+            journal_checkpoint(fs->bdev, fs->journal_start);
+            uint32_t new_seq;
+            journal_start_txn(fs->bdev, fs->journal_start, &new_seq);
+            fs->journal_seq = (int)new_seq;
+            e = journal_log(fs->bdev, fs->journal_start,
+                            (uint32_t)fs->journal_seq, block, buf);
+        }
+        if (e) return e;
+    }
     return block_write(fs->bdev, block, 1, buf);
 }
 
+/* Transaction boundaries for FS operations */
+static err_t sfs_begin_op(sfs_fs_t* fs) {
+    if (!fs->journal_active) return ERR_OK;
+    if (fs->journal_nest > 0) {
+        fs->journal_nest++;
+        return ERR_OK;
+    }
+    err_t e = journal_start_txn(fs->bdev, fs->journal_start,
+                                (uint32_t*)&fs->journal_seq);
+    if (e) return e;
+    fs->journal_nest = 1;
+    return ERR_OK;
+}
+
+static err_t sfs_end_op(sfs_fs_t* fs) {
+    if (!fs->journal_active) return ERR_OK;
+    if (fs->journal_nest > 1) {
+        fs->journal_nest--;
+        return ERR_OK;
+    }
+    fs->journal_nest = 0;
+    err_t e = journal_commit(fs->bdev, fs->journal_start,
+                             (uint32_t)fs->journal_seq);
+    if (e) return e;
+    return journal_checkpoint(fs->bdev, fs->journal_start);
+}
+
 static int sfs_bmap_alloc(sfs_fs_t* fs, uint32_t bmap_start, uint32_t total) {
+    mutex_lock(&fs->bmap_lock, (uint64_t)-1);
     uint8_t buf[SFS_BLOCK_SIZE];
     uint32_t bmap_blocks = sfs_blocks_for_bmap(total);
     for (uint32_t b = 0; b < bmap_blocks; b++) {
-        if (sfs_read_block(fs, bmap_start + b, buf) != ERR_OK)
+        if (sfs_read_block(fs, bmap_start + b, buf) != ERR_OK) {
+            mutex_unlock(&fs->bmap_lock);
             return -1;
+        }
         for (uint32_t i = 0; i < SFS_BLOCK_SIZE * 8; i++) {
             if (!(buf[i / 8] & (1 << (i % 8)))) {
                 buf[i / 8] |= (1 << (i % 8));
-                sfs_write_block(fs, bmap_start + b, buf);
+                sfs_write_meta(fs, bmap_start + b, buf);
+                mutex_unlock(&fs->bmap_lock);
                 return (int)(b * SFS_BLOCK_SIZE * 8 + i);
             }
         }
     }
+    mutex_unlock(&fs->bmap_lock);
     return -1;
 }
 
 static void sfs_bmap_free(sfs_fs_t* fs, uint32_t bmap_start, uint32_t idx) {
+    mutex_lock(&fs->bmap_lock, (uint64_t)-1);
     uint32_t block = idx / (SFS_BLOCK_SIZE * 8);
     uint32_t bit = idx % (SFS_BLOCK_SIZE * 8);
     uint8_t buf[SFS_BLOCK_SIZE];
-    if (sfs_read_block(fs, bmap_start + block, buf) != ERR_OK) return;
+    if (sfs_read_block(fs, bmap_start + block, buf) != ERR_OK) { mutex_unlock(&fs->bmap_lock); return; }
     buf[bit / 8] &= ~(1 << (bit % 8));
-    sfs_write_block(fs, bmap_start + block, buf);
+    sfs_write_meta(fs, bmap_start + block, buf);
+    mutex_unlock(&fs->bmap_lock);
 }
 
 static int sfs_alloc_inode(sfs_fs_t* fs) {
@@ -60,7 +132,7 @@ static int sfs_alloc_inode(sfs_fs_t* fs) {
     uint8_t buf[SFS_BLOCK_SIZE];
     sfs_read_block(fs, block, buf);
     kmemcpy(buf + off * sizeof(sfs_inode_t), &inode, sizeof(sfs_inode_t));
-    sfs_write_block(fs, block, buf);
+    sfs_write_meta(fs, block, buf);
     return idx;
 }
 
@@ -73,13 +145,43 @@ static int sfs_alloc_block(sfs_fs_t* fs) {
     uint32_t total_data = fs->sb.total_blocks - fs->sb.data_start;
     int idx = sfs_bmap_alloc(fs, fs->sb.block_bmap_start, total_data);
     if (idx < 0) return -1;
+    if (fs->block_owner && idx < (int)fs->block_owner_count && fs->block_owner[idx]) {
+        kprintf("[SFS] FATAL: block idx %d already claimed (double allocation detected!)\n", idx);
+    }
+    if (fs->block_owner) fs->block_owner[idx] = 1;
     return (int)(fs->sb.data_start + idx);
 }
 
 static void sfs_free_block(sfs_fs_t* fs, uint32_t block) {
     if (block < fs->sb.data_start) return;
     uint32_t idx = block - fs->sb.data_start;
+    if (fs->block_owner && idx < fs->block_owner_count) {
+        if (!fs->block_owner[idx])
+            kprintf("[SFS] WARN: free unclaimed block %u (idx %u)\n", block, idx);
+        fs->block_owner[idx] = 0;
+    }
     sfs_bmap_free(fs, fs->sb.block_bmap_start, idx);
+}
+
+static void sfs_init_block_owner(sfs_fs_t* fs) {
+    uint32_t tdb = fs->sb.total_blocks - fs->sb.data_start;
+    if (fs->block_owner) kfree(fs->block_owner);
+    fs->block_owner_count = tdb;
+    fs->block_owner = (uint8_t*)kmalloc(tdb);
+    if (!fs->block_owner) { fs->block_owner_count = 0; return; }
+    kmemset(fs->block_owner, 0, tdb);
+
+    uint32_t bmap_blocks = (tdb + SFS_BLOCK_SIZE * 8 - 1) / (SFS_BLOCK_SIZE * 8);
+    for (uint32_t b = 0; b < bmap_blocks; b++) {
+        uint8_t buf[SFS_BLOCK_SIZE];
+        if (block_read(fs->bdev, fs->sb.block_bmap_start + b, 1, buf) != ERR_OK) break;
+        for (uint32_t i = 0; i < SFS_BLOCK_SIZE * 8; i++) {
+            uint32_t entry = b * SFS_BLOCK_SIZE * 8 + i;
+            if (entry >= tdb) break;
+            if (buf[i / 8] & (1 << (i % 8)))
+                fs->block_owner[entry] = 1;
+        }
+    }
 }
 
 err_t sfs_read_inode(sfs_fs_t* fs, int inum, sfs_inode_t* inode) {
@@ -99,20 +201,16 @@ err_t sfs_write_inode(sfs_fs_t* fs, int inum, const sfs_inode_t* inode) {
     err_t e = sfs_read_block(fs, block, buf);
     if (e) return e;
     kmemcpy(buf + off * sizeof(sfs_inode_t), inode, sizeof(sfs_inode_t));
-    return sfs_write_block(fs, block, buf);
+    return sfs_write_meta(fs, block, buf);
 }
 
-static err_t sfs_read_data(sfs_fs_t* fs, uint32_t block, void* buf) {
+err_t sfs_read_data(sfs_fs_t* fs, uint32_t block, void* buf) {
     return sfs_read_block(fs, block, buf);
 }
 
-static err_t sfs_write_data(sfs_fs_t* fs, uint32_t block, const void* buf) {
-    return sfs_write_block(fs, block, buf);
-}
+/* SFS_INDIRECT_PTRS etc. defined in sfs.h */
 
-#define SFS_INDIRECT_PTRS (SFS_BLOCK_SIZE / 4)
-
-static int sfs_inode_get_block(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t file_block, int create) {
+int sfs_inode_get_block(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t file_block, int create) {
     if (file_block < SFS_DIRECT_BLOCKS) {
         if (inode->direct[file_block] == 0) {
             if (!create) return -1;
@@ -123,34 +221,88 @@ static int sfs_inode_get_block(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t file_b
         return (int)inode->direct[file_block];
     }
 
-    /* Indirect blocks */
-    uint32_t indirect_idx = file_block - SFS_DIRECT_BLOCKS;
-    if (indirect_idx >= SFS_INDIRECT_PTRS) return -1;
+    /* Singly-indirect blocks (file_block 12-139) */
+    if (file_block < SFS_DINDIRECT_START) {
+        uint32_t indirect_idx = file_block - SFS_DIRECT_BLOCKS;
+        if (indirect_idx >= SFS_INDIRECT_PTRS) return -1;
 
-    if (inode->indirect == 0) {
-        if (!create) return -1;
-        int ib = sfs_alloc_block(fs);
-        if (ib < 0) return -1;
-        inode->indirect = (uint32_t)ib;
+        if (inode->indirect == 0) {
+            if (!create) return -1;
+            int ib = sfs_alloc_block(fs);
+            if (ib < 0) return -1;
+            inode->indirect = (uint32_t)ib;
+            uint8_t z[SFS_BLOCK_SIZE];
+            kmemset(z, 0, SFS_BLOCK_SIZE);
+            sfs_write_meta(fs, inode->indirect, z);
+        }
+
+        uint8_t ibuf[SFS_BLOCK_SIZE];
+        {
+            err_t e = sfs_read_data(fs, inode->indirect, ibuf);
+            if (e && !create) return -1;
+        }
+
+        uint32_t* ptrs = (uint32_t*)ibuf;
+        if (ptrs[indirect_idx] == 0) {
+            if (!create) return -1;
+            int b = sfs_alloc_block(fs);
+            if (b < 0) return -1;
+            ptrs[indirect_idx] = (uint32_t)b;
+            sfs_write_meta(fs, inode->indirect, ibuf);
+        }
+        return (int)ptrs[indirect_idx];
     }
 
-    uint8_t ibuf[SFS_BLOCK_SIZE];
-    if (create)
-        kmemset(ibuf, 0, SFS_BLOCK_SIZE);
-    if (inode->indirect != 0) {
-        err_t e = sfs_read_data(fs, inode->indirect, ibuf);
+    /* Doubly-indirect blocks (file_block 140-16523) */
+    uint32_t dindirect_idx = file_block - SFS_DINDIRECT_START;
+    if (dindirect_idx >= SFS_DINDIRECT_PTRS) return -1;
+
+    if (inode->double_indirect == 0) {
+        if (!create) return -1;
+        int diblk = sfs_alloc_block(fs);
+        if (diblk < 0) return -1;
+        inode->double_indirect = (uint32_t)diblk;
+        uint8_t z[SFS_BLOCK_SIZE];
+        kmemset(z, 0, SFS_BLOCK_SIZE);
+        sfs_write_meta(fs, inode->double_indirect, z);
+    }
+
+    uint8_t dibuf[SFS_BLOCK_SIZE];
+    {
+        err_t e = sfs_read_data(fs, inode->double_indirect, dibuf);
         if (e && !create) return -1;
     }
 
-    uint32_t* ptrs = (uint32_t*)ibuf;
-    if (ptrs[indirect_idx] == 0) {
+    uint32_t* dptrs = (uint32_t*)dibuf;
+    uint32_t di_major = dindirect_idx / SFS_INDIRECT_PTRS;
+    uint32_t di_minor = dindirect_idx % SFS_INDIRECT_PTRS;
+
+    if (dptrs[di_major] == 0) {
+        if (!create) return -1;
+        int ib = sfs_alloc_block(fs);
+        if (ib < 0) return -1;
+        dptrs[di_major] = (uint32_t)ib;
+        sfs_write_meta(fs, inode->double_indirect, dibuf);
+        uint8_t z[SFS_BLOCK_SIZE];
+        kmemset(z, 0, SFS_BLOCK_SIZE);
+        sfs_write_meta(fs, dptrs[di_major], z);
+    }
+
+    uint8_t ibuf2[SFS_BLOCK_SIZE];
+    {
+        err_t e = sfs_read_data(fs, dptrs[di_major], ibuf2);
+        if (e && !create) return -1;
+    }
+
+    uint32_t* iptrs = (uint32_t*)ibuf2;
+    if (iptrs[di_minor] == 0) {
         if (!create) return -1;
         int b = sfs_alloc_block(fs);
         if (b < 0) return -1;
-        ptrs[indirect_idx] = (uint32_t)b;
-        sfs_write_data(fs, inode->indirect, ibuf);
+        iptrs[di_minor] = (uint32_t)b;
+        sfs_write_meta(fs, dptrs[di_major], ibuf2);
     }
-    return (int)ptrs[indirect_idx];
+    return (int)iptrs[di_minor];
 }
 
 static err_t sfs_readlink(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_block, uint32_t file_off, void* buf, uint32_t count) {
@@ -170,7 +322,7 @@ static err_t sfs_writelink(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_blo
         if (e) kmemset(tmp, 0, SFS_BLOCK_SIZE);
     }
     kmemcpy(tmp + file_off, buf, count);
-    return sfs_write_data(fs, target_block, tmp);
+    return sfs_write_meta(fs, target_block, tmp);
 }
 
 /* VFS operations - forward declarations */
@@ -214,11 +366,17 @@ static int64_t sfs_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_
         if (chunk > count - done) chunk = (uint32_t)(count - done);
 
         int phys = sfs_inode_get_block(f->fs, &f->inode, file_block, 0);
-        if (phys < 0) break;
-
-        if (sfs_readlink(f->fs, &f->inode, (uint32_t)phys, block_off, (uint8_t*)buf + done, chunk))
-            break;
+        if (phys < 0) {
+            kmemset((uint8_t*)buf + done, 0, chunk);
+        } else {
+            if (sfs_readlink(f->fs, &f->inode, (uint32_t)phys, block_off, (uint8_t*)buf + done, chunk))
+                break;
+        }
         done += chunk;
+    }
+    if (done > 0) {
+        f->inode.atime = (uint32_t)hal_timer_get_ticks();
+        sfs_write_inode(f->fs, f->inum, &f->inode);
     }
     return (int64_t)done;
 }
@@ -227,6 +385,7 @@ static int64_t sfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, 
     sfs_file_t* f = (sfs_file_t*)node->private_data;
     if (!f) return -1;
 
+    sfs_begin_op(f->fs);
     uint64_t done = 0;
     while (done < count) {
         uint32_t file_block = (uint32_t)((offset + done) / SFS_BLOCK_SIZE);
@@ -243,11 +402,16 @@ static int64_t sfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, 
             f->inode.mtime = (uint32_t)hal_timer_get_ticks();
             sfs_write_inode(f->fs, f->inum, &f->inode);
             node->size = f->inode.size;
+            sfs_end_op(f->fs);
             return (int64_t)done;
         }
 
-        if (sfs_writelink(f->fs, &f->inode, (uint32_t)phys, block_off, (const uint8_t*)buf + done, chunk))
+        if (sfs_writelink(f->fs, &f->inode, (uint32_t)phys, block_off, (const uint8_t*)buf + done, chunk)) {
+            f->inode.mtime = (uint32_t)hal_timer_get_ticks();
+            sfs_write_inode(f->fs, f->inum, &f->inode);
+            sfs_end_op(f->fs);
             return (int64_t)done;
+        }
         done += chunk;
     }
 
@@ -258,6 +422,7 @@ static int64_t sfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, 
     f->inode.mtime = (uint32_t)hal_timer_get_ticks();
     sfs_write_inode(f->fs, f->inum, &f->inode);
     node->size = f->inode.size;
+    sfs_end_op(f->fs);
     return (int64_t)done;
 }
 
@@ -322,52 +487,143 @@ static int sfs_vfs_stat(vfs_node_t* node, vfs_stat_t* st) {
     return 0;
 }
 
+static void sfs_free_indirect_chain(sfs_fs_t* fs, uint32_t indirect_block) {
+    if (!indirect_block) return;
+    uint8_t ibuf[SFS_BLOCK_SIZE];
+    if (sfs_read_data(fs, indirect_block, ibuf) != ERR_OK) return;
+    uint32_t* ptrs = (uint32_t*)ibuf;
+    for (uint32_t i = 0; i < SFS_INDIRECT_PTRS; i++) {
+        if (ptrs[i]) sfs_free_block(fs, ptrs[i]);
+    }
+    sfs_free_block(fs, indirect_block);
+}
+
 static int sfs_vfs_truncate(vfs_node_t* node, uint64_t size) {
     if (!node || !node->private_data) return -1;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
     if (size >= f->inode.size) return 0;
 
+    sfs_begin_op(f->fs);
     uint32_t new_blocks = (uint32_t)((size + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE);
     uint32_t old_blocks = (uint32_t)((f->inode.size + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE);
 
+    /* Free direct blocks */
     for (uint32_t b = new_blocks; b < old_blocks && b < SFS_DIRECT_BLOCKS; b++) {
         if (f->inode.direct[b]) {
             sfs_free_block(f->fs, f->inode.direct[b]);
             f->inode.direct[b] = 0;
         }
     }
-    if (f->inode.indirect) {
-        uint32_t indirect_start = SFS_DIRECT_BLOCKS;
-        uint32_t freed_indirect = 0;
+
+    /* Free singly-indirect blocks (file_block 12-139) */
+    if (f->inode.indirect && new_blocks <= SFS_INDIRECT_START) {
+        sfs_free_indirect_chain(f->fs, f->inode.indirect);
+        f->inode.indirect = 0;
+    } else if (f->inode.indirect) {
         uint32_t kept = 0;
+        uint32_t freed = 0;
         uint8_t ibuf[SFS_BLOCK_SIZE];
         sfs_read_data(f->fs, f->inode.indirect, ibuf);
         uint32_t* ptrs = (uint32_t*)ibuf;
         for (uint32_t i = 0; i < SFS_INDIRECT_PTRS; i++) {
-            uint32_t blk = indirect_start + i;
+            uint32_t blk = SFS_INDIRECT_START + i;
             if (ptrs[i]) {
                 if (blk < new_blocks) {
                     kept++;
                 } else {
                     sfs_free_block(f->fs, ptrs[i]);
                     ptrs[i] = 0;
-                    freed_indirect++;
+                    freed++;
                 }
             }
         }
-        if (freed_indirect > 0) {
+        if (freed > 0) {
             if (kept == 0) {
                 sfs_free_block(f->fs, f->inode.indirect);
                 f->inode.indirect = 0;
             } else {
-                sfs_write_data(f->fs, f->inode.indirect, ibuf);
+                sfs_write_meta(f->fs, f->inode.indirect, ibuf);
             }
         }
     }
+
+    /* Free doubly-indirect blocks (file_block 140-16523) */
+    if (f->inode.double_indirect && new_blocks <= SFS_DINDIRECT_START) {
+        uint8_t dibuf[SFS_BLOCK_SIZE];
+        if (sfs_read_data(f->fs, f->inode.double_indirect, dibuf) == ERR_OK) {
+            uint32_t* dptrs = (uint32_t*)dibuf;
+            for (uint32_t i = 0; i < SFS_INDIRECT_PTRS; i++) {
+                if (dptrs[i]) {
+                    sfs_free_indirect_chain(f->fs, dptrs[i]);
+                }
+            }
+        }
+        sfs_free_block(f->fs, f->inode.double_indirect);
+        f->inode.double_indirect = 0;
+    } else if (f->inode.double_indirect) {
+        uint8_t dibuf[SFS_BLOCK_SIZE];
+        if (sfs_read_data(f->fs, f->inode.double_indirect, dibuf) != ERR_OK) goto done;
+        uint32_t* dptrs = (uint32_t*)dibuf;
+        uint32_t dind_changed = 0;
+        for (uint32_t i = 0; i < SFS_INDIRECT_PTRS; i++) {
+            if (!dptrs[i]) continue;
+            uint32_t di_block_start = SFS_DINDIRECT_START + i * SFS_INDIRECT_PTRS;
+            uint32_t di_block_end = di_block_start + SFS_INDIRECT_PTRS;
+            if (new_blocks >= di_block_end) {
+                continue;
+            }
+            if (new_blocks <= di_block_start) {
+                sfs_free_indirect_chain(f->fs, dptrs[i]);
+                dptrs[i] = 0;
+                dind_changed = 1;
+            } else {
+                uint32_t local_start = new_blocks - di_block_start;
+                uint32_t kept_local = 0;
+                uint8_t ibuf[SFS_BLOCK_SIZE];
+                if (sfs_read_data(f->fs, dptrs[i], ibuf) != ERR_OK) continue;
+                uint32_t* iptrs = (uint32_t*)ibuf;
+                uint32_t local_freed = 0;
+                for (uint32_t j = local_start; j < SFS_INDIRECT_PTRS; j++) {
+                    if (iptrs[j]) {
+                        sfs_free_block(f->fs, iptrs[j]);
+                        iptrs[j] = 0;
+                        local_freed++;
+                    }
+                }
+                if (local_freed > 0) {
+                    for (uint32_t j = 0; j < local_start; j++) {
+                        if (iptrs[j]) kept_local++;
+                    }
+                    if (kept_local == 0) {
+                        sfs_free_block(f->fs, dptrs[i]);
+                        dptrs[i] = 0;
+                    } else {
+                        sfs_write_meta(f->fs, dptrs[i], ibuf);
+                    }
+                    dind_changed = 1;
+                }
+            }
+        }
+        if (dind_changed) {
+            int all_zero = 1;
+            for (uint32_t i = 0; i < SFS_INDIRECT_PTRS; i++) {
+                if (dptrs[i]) { all_zero = 0; break; }
+            }
+            if (all_zero) {
+                sfs_free_block(f->fs, f->inode.double_indirect);
+                f->inode.double_indirect = 0;
+            } else {
+                sfs_write_meta(f->fs, f->inode.double_indirect, dibuf);
+            }
+        }
+    }
+
+done:
     f->inode.size = (uint32_t)size;
     f->inode.mtime = (uint32_t)hal_timer_get_ticks();
     sfs_write_inode(f->fs, f->inum, &f->inode);
     node->size = f->inode.size;
+    sfs_end_op(f->fs);
     return 0;
 }
 
@@ -513,7 +769,7 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
                     buf + src_off * sizeof(sfs_dirent_t),
                     sizeof(sfs_dirent_t));
             kmemset(buf + src_off * sizeof(sfs_dirent_t), 0, sizeof(sfs_dirent_t));
-            sfs_write_data(fs, (uint32_t)phys, buf);
+            sfs_write_meta(fs, (uint32_t)phys, buf);
         } else {
             uint8_t dbuf[SFS_BLOCK_SIZE];
             int dphys = sfs_inode_get_block(fs, &dir_inode, dst_block, 0);
@@ -521,9 +777,9 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
             if (sfs_read_data(fs, (uint32_t)dphys, dbuf)) break;
             sfs_dirent_t* dde = (sfs_dirent_t*)dbuf + dst_off;
             kmemcpy(dde, sde, sizeof(sfs_dirent_t));
-            if (sfs_write_data(fs, (uint32_t)dphys, dbuf)) break;
+            if (sfs_write_meta(fs, (uint32_t)dphys, dbuf)) break;
             kmemset(buf + src_off * sizeof(sfs_dirent_t), 0, sizeof(sfs_dirent_t));
-            sfs_write_data(fs, (uint32_t)phys, buf);
+            sfs_write_meta(fs, (uint32_t)phys, buf);
         }
     }
 
@@ -544,6 +800,7 @@ static int sfs_vfs_create(vfs_node_t* dir, const char* name, int is_dir) {
     }
 
     if (sfs_lookup(f->fs, f->inum, name) >= 0) return -1;
+    sfs_begin_op(f->fs);
 
     int inum = sfs_alloc_inode(f->fs);
     if (inum < 0) return -1;
@@ -562,9 +819,11 @@ static int sfs_vfs_create(vfs_node_t* dir, const char* name, int is_dir) {
 
     if (sfs_add_dirent(f->fs, f->inum, name, inum) != ERR_OK) {
         sfs_free_inode(f->fs, inum);
+        sfs_end_op(f->fs);
         return -1;
     }
 
+    sfs_end_op(f->fs);
     return inum;
 }
 
@@ -575,16 +834,18 @@ static int sfs_vfs_unlink(vfs_node_t* dir, const char* name) {
 
     int inum = sfs_lookup(f->fs, f->inum, name);
     if (inum < 0) return -1;
+    sfs_begin_op(f->fs);
 
     sfs_inode_t inode;
     sfs_read_inode(f->fs, inum, &inode);
 
     err_t e = sfs_remove_dirent(f->fs, f->inum, name);
-    if (e) return -1;
+    if (e) { sfs_end_op(f->fs); return -1; }
 
     if (inode.nlink > 1) {
         inode.nlink--;
         sfs_write_inode(f->fs, inum, &inode);
+        sfs_end_op(f->fs);
         return 0;
     }
 
@@ -594,18 +855,44 @@ static int sfs_vfs_unlink(vfs_node_t* dir, const char* name) {
             sfs_free_block(f->fs, inode.direct[i]);
     }
     if (inode.indirect) {
-        uint8_t ibuf[SFS_BLOCK_SIZE];
-        if (sfs_read_data(f->fs, inode.indirect, ibuf) == ERR_OK) {
-            uint32_t* ptrs = (uint32_t*)ibuf;
+        sfs_free_indirect_chain(f->fs, inode.indirect);
+    }
+    if (inode.double_indirect) {
+        uint8_t dibuf[SFS_BLOCK_SIZE];
+        if (sfs_read_data(f->fs, inode.double_indirect, dibuf) == ERR_OK) {
+            uint32_t* dptrs = (uint32_t*)dibuf;
             for (uint32_t i = 0; i < SFS_INDIRECT_PTRS; i++) {
-                if (ptrs[i]) sfs_free_block(f->fs, ptrs[i]);
+                if (dptrs[i]) sfs_free_indirect_chain(f->fs, dptrs[i]);
             }
         }
-        sfs_free_block(f->fs, inode.indirect);
+        sfs_free_block(f->fs, inode.double_indirect);
     }
 
     sfs_free_inode(f->fs, inum);
+    sfs_end_op(f->fs);
     return 0;
+}
+
+/* Remove a dirent by inum; returns 0 if found and removed, -1 if not found */
+static int sfs_remove_dirent_by_inum(sfs_fs_t* fs, int dir_inum, int target_inum) {
+    sfs_inode_t dir_inode;
+    if (sfs_read_inode(fs, dir_inum, &dir_inode) != ERR_OK) return -1;
+    uint32_t max_entries = dir_inode.size / sizeof(sfs_dirent_t);
+    for (uint32_t i = 0; i < max_entries; i++) {
+        uint32_t file_block = i / SFS_DIRENTS_PER_BLOCK;
+        uint32_t entry_off = i % SFS_DIRENTS_PER_BLOCK;
+        int phys = sfs_inode_get_block(fs, &dir_inode, file_block, 0);
+        if (phys < 0) return -1;
+        uint8_t tmp[SFS_BLOCK_SIZE];
+        if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return -1;
+        sfs_dirent_t* de = (sfs_dirent_t*)tmp + entry_off;
+        if (de->inode == (uint32_t)target_inum) {
+            de->inode = 0;
+            sfs_write_meta(fs, (uint32_t)phys, tmp);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static int sfs_vfs_rename(vfs_node_t* old_dir, const char* old_name,
@@ -618,12 +905,28 @@ static int sfs_vfs_rename(vfs_node_t* old_dir, const char* old_name,
     int inum = sfs_lookup(old_f->fs, old_f->inum, old_name);
     if (inum < 0) return -1;
 
-    /* Fail if target already exists */
-    if (sfs_lookup(new_f->fs, new_f->inum, new_name) >= 0) return -1;
+    sfs_begin_op(old_f->fs);
 
-    if (sfs_add_dirent(new_f->fs, new_f->inum, new_name, inum) != ERR_OK)
+    /* If target exists, atomically replace it */
+    int target_inum = sfs_lookup(new_f->fs, new_f->inum, new_name);
+    if (target_inum >= 0) {
+        if (target_inum == inum) {
+            sfs_end_op(old_f->fs);
+            return 0;
+        }
+        if (sfs_remove_dirent_by_inum(old_f->fs, old_f->inum, target_inum) == 0) {
+            sfs_free_inode(old_f->fs, target_inum);
+        }
+    }
+
+    if (sfs_add_dirent(new_f->fs, new_f->inum, new_name, inum) != ERR_OK) {
+        sfs_end_op(old_f->fs);
         return -1;
-    sfs_remove_dirent(old_f->fs, old_f->inum, old_name);
+    }
+    /* Remove old entry only if old and new dirs are different */
+    if (old_f->inum != new_f->inum || kstrcmp(old_name, new_name) != 0)
+        sfs_remove_dirent(old_f->fs, old_f->inum, old_name);
+    sfs_end_op(old_f->fs);
     return 0;
 }
 
@@ -634,8 +937,10 @@ static int sfs_vfs_symlink(vfs_node_t* dir, const char* name, const char* target
 
     if (sfs_lookup(dir_f->fs, dir_f->inum, name) >= 0) return -1;
 
+    sfs_begin_op(dir_f->fs);
+
     int inum = sfs_alloc_inode(dir_f->fs);
-    if (inum < 0) return -1;
+    if (inum < 0) { sfs_end_op(dir_f->fs); return -1; }
 
     sfs_inode_t inode;
     kmemset(&inode, 0, sizeof(inode));
@@ -661,6 +966,7 @@ static int sfs_vfs_symlink(vfs_node_t* dir, const char* name, const char* target
     int64_t written = sfs_vfs_write(&tmp_node, target, kstrlen(target), 0);
     if (written < 0) {
         sfs_free_inode(dir_f->fs, inum);
+        sfs_end_op(dir_f->fs);
         return -1;
     }
     inode = tmp_f.inode;
@@ -669,9 +975,11 @@ static int sfs_vfs_symlink(vfs_node_t* dir, const char* name, const char* target
 
     if (sfs_add_dirent(dir_f->fs, dir_f->inum, name, inum) != ERR_OK) {
         sfs_free_inode(dir_f->fs, inum);
+        sfs_end_op(dir_f->fs);
         return -1;
     }
 
+    sfs_end_op(dir_f->fs);
     return 0;
 }
 
@@ -704,19 +1012,26 @@ static int sfs_vfs_link(vfs_node_t* dir, const char* name, vfs_node_t* target) {
 
     if (sfs_lookup(dir_f->fs, dir_f->inum, name) >= 0) return -1;
 
+    sfs_begin_op(dir_f->fs);
+
     int inum = tgt_f->inum;
-    if (sfs_add_dirent(dir_f->fs, dir_f->inum, name, inum) != ERR_OK)
+    if (sfs_add_dirent(dir_f->fs, dir_f->inum, name, inum) != ERR_OK) {
+        sfs_end_op(dir_f->fs);
         return -1;
+    }
 
     sfs_inode_t inode;
     sfs_read_inode(tgt_f->fs, inum, &inode);
     inode.nlink++;
     sfs_write_inode(tgt_f->fs, inum, &inode);
+    sfs_end_op(dir_f->fs);
     return 0;
 }
 
 err_t sfs_format(block_dev_t* bdev) {
-    uint64_t total_blocks = bdev->block_count;
+    /* Reserve journal blocks at the end of the device */
+    uint32_t journal_start = (uint32_t)bdev->block_count - JOURNAL_BLOCKS;
+    uint64_t total_blocks = journal_start;
     if (total_blocks < 16) return ERR_NOSPACE;
 
     sfs_superblock_t sb;
@@ -729,7 +1044,11 @@ err_t sfs_format(block_dev_t* bdev) {
     sb.inode_table_start = sb.block_bmap_start + sfs_blocks_for_bmap((uint32_t)total_blocks);
     uint32_t inode_table_blocks = (uint32_t)sfs_blocks_for_inodes(SFS_MAX_INODES);
     sb.data_start = sb.inode_table_start + inode_table_blocks;
+
+    /* Initialise journal */
+    journal_init(bdev, journal_start);
     sb.root_inode = 0;
+    sfs_sb_finalize(&sb);
 
     uint8_t zero[SFS_BLOCK_SIZE];
     kmemset(zero, 0, SFS_BLOCK_SIZE);
@@ -758,6 +1077,7 @@ err_t sfs_format(block_dev_t* bdev) {
     kmemcpy(inode_buf, &root_inode, sizeof(sfs_inode_t));
     block_write(bdev, inode_block, 1, inode_buf);
 
+    block_sync_dev(bdev);
     return ERR_OK;
 }
 
@@ -767,12 +1087,31 @@ err_t sfs_mount(block_dev_t* bdev) {
     kmemset(fs, 0, sizeof(sfs_fs_t));
 
     fs->bdev = bdev;
+    fs->journal_start = (uint32_t)bdev->block_count - JOURNAL_BLOCKS;
+    fs->journal_active = 1;
+    mutex_init(&fs->bmap_lock);
+
+    /* Recover journal before reading superblock */
+    int journal_dirty = 0;
+    journal_recover(bdev, fs->journal_start, &journal_dirty);
 
     err_t e = block_read(bdev, 0, 1, &fs->sb);
     if (e) { kfree(fs); return e; }
 
-    if (fs->sb.magic != SFS_MAGIC) {
-        kprintf("[SFS] Bad magic 0x%x, need to format\n", fs->sb.magic);
+    /* Initialise runtime block tracker from on-disk bitmap */
+    sfs_init_block_owner(fs);
+
+    /* If journal was dirty, auto-run fsck to catch any lingering inconsistencies */
+    if (journal_dirty) {
+        kprintf("[SFS] Journal was dirty, running fsck -r...\n");
+        sfs_fsck(bdev, 1);
+        block_read(bdev, 0, 1, &fs->sb);
+        sfs_init_block_owner(fs);
+    }
+
+    if (fs->sb.magic != SFS_MAGIC || !sfs_sb_verify(&fs->sb)) {
+        kprintf("[SFS] Bad magic 0x%x or bad checksum, need to format\n", fs->sb.magic);
+        if (fs->block_owner) kfree(fs->block_owner);
         kfree(fs);
         return ERR_INVAL;
     }

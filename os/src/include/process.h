@@ -3,6 +3,9 @@
 #include "kernel.h"
 #include "sched.h"
 #include "signal.h"
+#include "sync.h"
+
+struct int_frame;
 
 #define MAX_PROCESSES 256
 #define PROCESS_NAME_MAX 64
@@ -17,12 +20,14 @@ typedef uint64_t pid_t;
 typedef struct process_t {
     pid_t pid;
     pid_t ppid;
+    pid_t pgid;
     char name[PROCESS_NAME_MAX];
 
     // Memory management
     uint64_t cr3; // Page table base
     uint64_t entry_point;
     uint64_t user_stack_top;
+    uint64_t mmap_brk;  // next mmap hint (grows upward from 0x40000000)
     uint64_t user_code_start;
     uint64_t user_code_size;
 
@@ -41,9 +46,10 @@ typedef struct process_t {
     uint64_t blocked_signals;
     sigaction_t signal_actions[NSIG];
     uint32_t flags;
+    spinlock_t signal_lock;
 
-    // Capabilities (placeholder)
-    uint64_t caps;
+    // Working directory
+    char cwd[256];
 
     // File descriptors (placeholder)
     void* fds[MAX_FDS];
@@ -57,6 +63,8 @@ process_t* process_find(pid_t pid);
 pid_t process_get_current_pid(void);
 void signal_send(pid_t pid, int sig);
 void signal_process(process_t* proc);
+void signal_send_pgid(pid_t pgid, int sig);
+void signal_deliver_custom(process_t* proc, struct int_frame* frame);
 
 /* waitpid options */
 #define WNOHANG   1

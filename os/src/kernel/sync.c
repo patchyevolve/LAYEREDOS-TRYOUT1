@@ -8,21 +8,22 @@ void spinlock_init(spinlock_t* lock, const char* name) {
     lock->holder = 0;
 }
 
-void spinlock_acquire(spinlock_t* lock) {
-    lock->saved_flags = hal_save_irq();
+void spinlock_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
+    cpu_flags_t flags = hal_save_irq();
     while (__sync_lock_test_and_set(&lock->lock, 1)) {
         while (lock->lock)
             asm volatile("pause");
     }
     lock->holder = current_thread ? current_thread->id : 0;
     __sync_synchronize();
+    *out_flags = flags;
 }
 
-void spinlock_release(spinlock_t* lock) {
+void spinlock_release(spinlock_t* lock, cpu_flags_t flags) {
     __sync_synchronize();
     lock->holder = 0;
     __sync_lock_release(&lock->lock);
-    hal_restore_irq(lock->saved_flags);
+    hal_restore_irq(flags);
 }
 
 void mutex_init(mutex_t* m) {
@@ -36,15 +37,15 @@ void mutex_init(mutex_t* m) {
 err_t mutex_lock(mutex_t* m, uint64_t timeout_ms) {
     if (!m) return ERR_INVAL;
 
-    uint64_t start_ticks = hal_timer_get_ticks();
-    uint64_t timeout_ticks = (timeout_ms == (uint64_t)-1) ? (uint64_t)-1 :
-                            (timeout_ms * hal_timer_get_hz() + 999) / 1000;
+    uint64_t start_ns = hal_timer_get_ns();
+    uint64_t timeout_ns = (timeout_ms == (uint64_t)-1) ? (uint64_t)-1 :
+                          timeout_ms * 1000000ULL;
 
     for (;;) {
         if (__sync_bool_compare_and_swap(&m->locked, 0, 1)) {
             m->owner_tid = current_thread ? current_thread->id : 0;
             if (current_thread) {
-                m->orig_priority = current_thread->priority;
+                m->orig_priority = current_thread->base_priority;
             }
             return ERR_OK;
         }
@@ -60,9 +61,9 @@ err_t mutex_lock(mutex_t* m, uint64_t timeout_ms) {
             }
         }
 
-        if (timeout_ticks != (uint64_t)-1) {
-            uint64_t elapsed = hal_timer_get_ticks() - start_ticks;
-            if (elapsed >= timeout_ticks) {
+        if (timeout_ns != (uint64_t)-1) {
+            uint64_t elapsed = hal_timer_get_ns() - start_ns;
+            if (elapsed >= timeout_ns) {
                 return ERR_TIMEOUT;
             }
         }

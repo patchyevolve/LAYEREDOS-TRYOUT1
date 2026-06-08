@@ -9,10 +9,12 @@ void _exit(int code) {
 int putchar(int c) {
     char ch = (char)c;
     long ret = syscall3(SYS_WRITE, 1, (long)&ch, 1);
-    return (int)ret;
+    if (ret < 0) return EOF;
+    return (unsigned char)ch;
 }
 
 int puts(const char* s) {
+    if (!s) s = "(null)";
     long n = 0;
     while (s[n]) n++;
     syscall3(SYS_WRITE, 1, (long)s, n);

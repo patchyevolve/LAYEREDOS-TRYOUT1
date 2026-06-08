@@ -14,17 +14,18 @@ static int pipe_close(vfs_node_t* node) {
     if (!node || !node->private_data) return 0;
     pipe_t* p = (pipe_t*)node->private_data;
     int is_read = (node->flags & 1);
-    spinlock_acquire(&p->lock);
+    cpu_flags_t _sflags; spinlock_acquire(&p->lock, &_sflags);
     if (is_read)
         p->read_closed = 1;
     else
         p->write_closed = 1;
     int both_closed = p->read_closed && p->write_closed;
-    spinlock_release(&p->lock);
+    spinlock_release(&p->lock, _sflags);
     if (both_closed) {
-        if (p->readers.waiters) sched_wake(&p->readers);
-        if (p->writers.waiters) sched_wake(&p->writers);
+        wait_queue_t r = p->readers, w = p->writers;
         kfree(p);
+        if (r.waiters) sched_wake(&r);
+        if (w.waiters) sched_wake(&w);
     }
     return 0;
 }
@@ -35,7 +36,7 @@ static int64_t pipe_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t o
     if (!p) return -1;
     uint64_t done = 0;
     while (done < count) {
-        spinlock_acquire(&p->lock);
+        cpu_flags_t _sflags; spinlock_acquire(&p->lock, &_sflags);
         if (p->count > 0) {
             uint32_t chunk = count - done > p->count ? p->count : (uint32_t)(count - done);
             for (uint32_t i = 0; i < chunk; i++) {
@@ -44,10 +45,10 @@ static int64_t pipe_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t o
             }
             p->count -= chunk;
             if (p->writers.waiters) sched_wake(&p->writers);
-            spinlock_release(&p->lock);
+            spinlock_release(&p->lock, _sflags);
         } else {
-            if (p->write_closed) { spinlock_release(&p->lock); break; }
-            spinlock_release(&p->lock);
+            if (p->write_closed) { spinlock_release(&p->lock, _sflags); break; }
+            spinlock_release(&p->lock, _sflags);
             sched_block(&p->readers);
         }
     }
@@ -60,8 +61,8 @@ static int64_t pipe_write(vfs_node_t* node, const void* buf, uint64_t count, uin
     if (!p) return -1;
     uint64_t done = 0;
     while (done < count) {
-        spinlock_acquire(&p->lock);
-        if (p->read_closed) { spinlock_release(&p->lock); return -1; }
+        cpu_flags_t _sflags; spinlock_acquire(&p->lock, &_sflags);
+        if (p->read_closed) { spinlock_release(&p->lock, _sflags); return -1; }
         if (p->count < PIPE_BUF_SIZE) {
             uint32_t space = PIPE_BUF_SIZE - p->count;
             uint32_t chunk = count - done > space ? space : (uint32_t)(count - done);
@@ -71,9 +72,9 @@ static int64_t pipe_write(vfs_node_t* node, const void* buf, uint64_t count, uin
             }
             p->count += chunk;
             if (p->readers.waiters) sched_wake(&p->readers);
-            spinlock_release(&p->lock);
+            spinlock_release(&p->lock, _sflags);
         } else {
-            spinlock_release(&p->lock);
+            spinlock_release(&p->lock, _sflags);
             sched_block(&p->writers);
         }
     }

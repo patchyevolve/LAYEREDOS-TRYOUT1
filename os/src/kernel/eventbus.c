@@ -40,7 +40,7 @@ err_t eventbus_publish(event_type_t type, uint64_t a1, uint64_t a2,
                        uint64_t a3, uint64_t a4) {
     if (!bus_initialized || type >= EV_MAX) return ERR_INVAL;
 
-    spinlock_acquire(&eventbus_lock);
+    cpu_flags_t _sflags; spinlock_acquire(&eventbus_lock, &_sflags);
 
     if (pending_count < MAX_PENDING_EVENTS) {
         int idx = queue_tail;
@@ -56,7 +56,7 @@ err_t eventbus_publish(event_type_t type, uint64_t a1, uint64_t a2,
     }
 
     event_count++;
-    spinlock_release(&eventbus_lock);
+    spinlock_release(&eventbus_lock, _sflags);
     return ERR_OK;
 }
 
@@ -70,21 +70,22 @@ static void fire_callbacks(const event_t* ev) {
 void eventbus_dispatch(void) {
     if (!bus_initialized) return;
 
-    spinlock_acquire(&eventbus_lock);
+    cpu_flags_t _sflags;
+    spinlock_acquire(&eventbus_lock, &_sflags);
     int to_process = pending_count;
-    spinlock_release(&eventbus_lock);
+    spinlock_release(&eventbus_lock, _sflags);
 
     while (to_process > 0) {
-        spinlock_acquire(&eventbus_lock);
+        spinlock_acquire(&eventbus_lock, &_sflags);
 
         if (pending_count == 0) {
-            spinlock_release(&eventbus_lock);
+            spinlock_release(&eventbus_lock, _sflags);
             break;
         }
 
         int idx = queue_head;
         if (!pending_events[idx].valid) {
-            spinlock_release(&eventbus_lock);
+            spinlock_release(&eventbus_lock, _sflags);
             break;
         }
 
@@ -92,7 +93,7 @@ void eventbus_dispatch(void) {
         pending_events[idx].valid = 0;
         queue_head = (queue_head + 1) % MAX_PENDING_EVENTS;
         pending_count--;
-        spinlock_release(&eventbus_lock);
+        spinlock_release(&eventbus_lock, _sflags);
 
         fire_callbacks(&ev);
 
@@ -106,7 +107,7 @@ err_t eventbus_subscribe(event_type_t type, event_callback_t callback,
                          void* context) {
     if (!bus_initialized || type >= EV_MAX || !callback) return ERR_INVAL;
 
-    spinlock_acquire(&eventbus_lock);
+    cpu_flags_t _sflags; spinlock_acquire(&eventbus_lock, &_sflags);
 
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (!subscribers[i].active) {
@@ -114,12 +115,12 @@ err_t eventbus_subscribe(event_type_t type, event_callback_t callback,
             subscribers[i].callback = callback;
             subscribers[i].context = context;
             subscribers[i].active = 1;
-            spinlock_release(&eventbus_lock);
+            spinlock_release(&eventbus_lock, _sflags);
             return ERR_OK;
         }
     }
 
-    spinlock_release(&eventbus_lock);
+    spinlock_release(&eventbus_lock, _sflags);
     return ERR_NOMEM;
 }
 
@@ -127,7 +128,7 @@ err_t eventbus_unsubscribe(event_type_t type, event_callback_t callback,
                            void* context) {
     if (!bus_initialized || type >= EV_MAX || !callback) return ERR_INVAL;
 
-    spinlock_acquire(&eventbus_lock);
+    cpu_flags_t _sflags; spinlock_acquire(&eventbus_lock, &_sflags);
 
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (subscribers[i].active &&
@@ -137,11 +138,11 @@ err_t eventbus_unsubscribe(event_type_t type, event_callback_t callback,
             subscribers[i].active = 0;
             subscribers[i].callback = NULL;
             subscribers[i].context = NULL;
-            spinlock_release(&eventbus_lock);
+            spinlock_release(&eventbus_lock, _sflags);
             return ERR_OK;
         }
     }
 
-    spinlock_release(&eventbus_lock);
+    spinlock_release(&eventbus_lock, _sflags);
     return ERR_NOENT;
 }

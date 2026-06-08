@@ -19,10 +19,15 @@
 #include "block.h"
 #include "tmpfs.h"
 #include "devfs.h"
+#include "tty.h"
 #include "elf.h"
+#include "work.h"
+#include "hpet.h"
+#include "apic.h"
+#include "swap.h"
 
 static uint64_t mb_info_phys = 0;
-#define BOOT_TOTAL_STEPS 6
+#define BOOT_TOTAL_STEPS 15
 static int boot_step = 0;
 volatile int boot_complete = 0;
 
@@ -54,6 +59,25 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     boot_report("Kernel Heap - Slab Allocator");
     kmalloc_init();
 
+    boot_report("HPET Timer");
+    if (hpet_init() == ERR_OK) {
+        hpet_timer_init();
+    } else {
+        kprintf("[HPET] Not available, using PIT only\n");
+    }
+
+    boot_report("Swap - Page Backing Store");
+    swap_init();
+
+    boot_report("APIC Interrupt Controller");
+    if (apic_init() == ERR_OK) {
+        apic_enable();
+        apic_timer_init(1000);
+        apic_disable_pic();
+    } else {
+        kprintf("[APIC] Not available, using legacy PIC\n");
+    }
+
     boot_report("Syscall Interface");
     syscall_init();
 
@@ -63,11 +87,15 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     boot_report("Layer 3 (PROCESS) - Process Manager");
     process_init();
 
+    boot_report("Work Queue & Deferred Tasks");
+    work_init();
+
     boot_report("I/O Subsystem - Keyboard, ATA, PCI, VFS, Ramdisk");
     keyboard_init();
     ata_init();
     pci_init();
     vfs_init();
+    tty_init();
     ramdisk_init();
 
     ramdisk_add_file("version.txt", "OPERtur/TRY1 OS v0.2.0\nLayered x86-64 Kernel\n", 48);
@@ -86,9 +114,34 @@ void kmain(uint64_t magic, uint64_t mb_info) {
                          - (uint64_t)_binary_build_cat_program_elf_start;
     ramdisk_add_file("cat.elf", _binary_build_cat_program_elf_start, cat_elf_size);
 
+        extern char _binary_build_hello_c_elf_start[];
+        extern char _binary_build_hello_c_elf_end[];
+        size_t hello_c_elf_size = (uint64_t)_binary_build_hello_c_elf_end
+                             - (uint64_t)_binary_build_hello_c_elf_start;
+        ramdisk_add_file("hello-c.elf", _binary_build_hello_c_elf_start, hello_c_elf_size);
+
+        extern char _binary_build_ld_so_start[];
+        extern char _binary_build_ld_so_end[];
+        size_t ld_so_size = (uint64_t)_binary_build_ld_so_end
+                          - (uint64_t)_binary_build_ld_so_start;
+        ramdisk_add_file("ld.so", _binary_build_ld_so_start, ld_so_size);
+
+        extern char _binary_build_libdyn_so_start[];
+        extern char _binary_build_libdyn_so_end[];
+        size_t libdyn_so_size = (uint64_t)_binary_build_libdyn_so_end
+                              - (uint64_t)_binary_build_libdyn_so_start;
+        ramdisk_add_file("libdyn.so", _binary_build_libdyn_so_start, libdyn_so_size);
+
+        extern char _binary_build_hello_dyn_elf_start[];
+        extern char _binary_build_hello_dyn_elf_end[];
+        size_t hello_dyn_elf_size = (uint64_t)_binary_build_hello_dyn_elf_end
+                                  - (uint64_t)_binary_build_hello_dyn_elf_start;
+        ramdisk_add_file("hello-dyn.elf", _binary_build_hello_dyn_elf_start, hello_dyn_elf_size);
+
     /* Initialize block device layer and writable SFS filesystem */
     boot_report("Block Device Layer & SFS Filesystem");
     ramdisk_blk_init();
+    ata_blk_init();
     sfs_format(block_find("ramdisk"));
     sfs_mount(block_find("ramdisk"));
 
@@ -116,6 +169,57 @@ void kmain(uint64_t magic, uint64_t mb_info) {
             vfs_close(fd);
         }
 
+        extern char _binary_build_hello_c_elf_start[];
+        extern char _binary_build_hello_c_elf_end[];
+        size_t hello_c_sz = (uint64_t)_binary_build_hello_c_elf_end
+                          - (uint64_t)_binary_build_hello_c_elf_start;
+        vfs_create("/hello-c.elf", 0);
+        fd = vfs_open("/hello-c.elf", O_WRONLY);
+        if (fd >= 0) {
+            vfs_write(fd, _binary_build_hello_c_elf_start, hello_c_sz);
+            vfs_close(fd);
+        }
+
+        /* Copy dynamic linker + shared library + dynamic test to SFS */
+        {
+            extern char _binary_build_ld_so_start[];
+            extern char _binary_build_ld_so_end[];
+            size_t ld_sz = (uint64_t)_binary_build_ld_so_end
+                         - (uint64_t)_binary_build_ld_so_start;
+            vfs_create("/ld.so", 0);
+            fd = vfs_open("/ld.so", O_WRONLY);
+            if (fd >= 0) {
+                vfs_write(fd, _binary_build_ld_so_start, ld_sz);
+                vfs_close(fd);
+            }
+        }
+
+        {
+            extern char _binary_build_libdyn_so_start[];
+            extern char _binary_build_libdyn_so_end[];
+            size_t so_sz = (uint64_t)_binary_build_libdyn_so_end
+                         - (uint64_t)_binary_build_libdyn_so_start;
+            vfs_create("/libdyn.so", 0);
+            fd = vfs_open("/libdyn.so", O_WRONLY);
+            if (fd >= 0) {
+                vfs_write(fd, _binary_build_libdyn_so_start, so_sz);
+                vfs_close(fd);
+            }
+        }
+
+        {
+            extern char _binary_build_hello_dyn_elf_start[];
+            extern char _binary_build_hello_dyn_elf_end[];
+            size_t elf_sz = (uint64_t)_binary_build_hello_dyn_elf_end
+                          - (uint64_t)_binary_build_hello_dyn_elf_start;
+            vfs_create("/hello-dyn.elf", 0);
+            fd = vfs_open("/hello-dyn.elf", O_WRONLY);
+            if (fd >= 0) {
+                vfs_write(fd, _binary_build_hello_dyn_elf_start, elf_sz);
+                vfs_close(fd);
+            }
+        }
+
         vfs_create("/version.txt", 0);
         fd = vfs_open("/version.txt", O_WRONLY);
         if (fd >= 0) {
@@ -130,6 +234,22 @@ void kmain(uint64_t magic, uint64_t mb_info) {
             vfs_close(fd);
         }
         kprintf("[BOOT] Copied boot files to SFS\n");
+    }
+
+    /* Create /etc directory */
+    vfs_mkdir("/etc");
+
+    /* Create /etc/rc startup script */
+    {
+        const char* rc_content =
+            "echo Loading services...\n"
+            "echo Service launcher initialized\n";
+        vfs_create("/etc/rc", 0);
+        int rc_fd = vfs_open("/etc/rc", O_WRONLY);
+        if (rc_fd >= 0) {
+            vfs_write(rc_fd, rc_content, kstrlen(rc_content));
+            vfs_close(rc_fd);
+        }
     }
 
     /* Mount tmpfs at /tmp */

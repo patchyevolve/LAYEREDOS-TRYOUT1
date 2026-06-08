@@ -1,6 +1,8 @@
 #include "kernel.h"
 #include "ata.h"
 #include "hal.h"
+#include "block.h"
+#include "sched.h"
 
 #define ATA_PRIMARY_IO    0x1F0
 #define ATA_PRIMARY_CTRL  0x3F6
@@ -31,6 +33,8 @@
 #define ATA_STATUS_RDY    0x40
 #define ATA_STATUS_BSY    0x80
 
+#define ATA_IRQ_TIMEOUT_MS 5000
+
 static ata_drive_t drives[4];
 
 static int ata_wait_bsy(uint16_t base, int timeout) {
@@ -41,15 +45,53 @@ static int ata_wait_bsy(uint16_t base, int timeout) {
     return -1;
 }
 
-static int ata_wait_drq(uint16_t base, int timeout) {
-    for (int i = 0; i < timeout; i++) {
-        uint8_t status = inb(base + ATA_REG_STATUS);
-        if (status & ATA_STATUS_ERR) return -1;
-        if (status & ATA_STATUS_DRQ) return 0;
-    }
-    return -1;
+/* IRQ handler for ATA primary/secondary interrupts */
+static void ata_irq_handler(int_frame_t* frame, void* data) {
+    (void)frame;
+    uint8_t drive_idx = (uint8_t)(uintptr_t)data;
+    if (drive_idx >= 4) return;
+
+    drives[drive_idx].irq_status = inb(drives[drive_idx].base + ATA_REG_STATUS);
+    drives[drive_idx].irq_received = 1;
+    sched_wake(&drives[drive_idx].wq);
 }
 
+/* Block on the drive's wait queue until IRQ fires or BSY clears */
+static int ata_irq_wait(ata_drive_t* drive, int timeout_ms) {
+    uint64_t deadline = 0;
+    if (timeout_ms > 0) {
+        deadline = hal_timer_get_ticks() +
+                   (uint64_t)timeout_ms * hal_timer_get_hz() / 1000;
+    }
+
+    drive->irq_received = 0;
+
+    cpu_flags_t flags = hal_save_irq();
+    outb(drive->ctrl, 0x00); /* enable ATA interrupts (clear nIEN) */
+
+    while (!drive->irq_received) {
+        uint8_t status = inb(drive->base + ATA_REG_STATUS);
+        if (!(status & ATA_STATUS_BSY)) {
+            drive->irq_status = status;
+            drive->irq_received = 1;
+            break;
+        }
+
+        sched_block(&drive->wq);
+
+        if (timeout_ms > 0 && hal_timer_get_ticks() > deadline) {
+            hal_restore_irq(flags);
+            return -1;
+        }
+    }
+
+    hal_restore_irq(flags);
+    if (drive->irq_status & ATA_STATUS_ERR)
+        return -1;
+    return 0;
+}
+
+/* Polling-based IDENTIFY for use during init before IRQs are unmasked */
 static void ata_identify_drive(ata_drive_t* d, uint16_t base, uint8_t drive) {
     outb(base + ATA_REG_DRIVE, drive ? 0xB0 : 0xA0);
     outb(base + ATA_REG_SECCOUNT, 0);
@@ -114,6 +156,19 @@ err_t ata_init(void) {
     drives[3].ctrl = ATA_SECONDARY_CTRL;
     drives[3].irq  = ATA_SECONDARY_IRQ;
 
+    for (int i = 0; i < 4; i++) {
+        drives[i].wq.waiters = NULL;
+        drives[i].wq.count = 0;
+        drives[i].irq_received = 0;
+        drives[i].irq_status = 0;
+    }
+
+    /* Register IRQ handlers */
+    hal_irq_register(ATA_PRIMARY_IRQ, ata_irq_handler, (void*)(uintptr_t)0);
+    hal_irq_register(ATA_PRIMARY_IRQ, ata_irq_handler, (void*)(uintptr_t)1);
+    hal_irq_register(ATA_SECONDARY_IRQ, ata_irq_handler, (void*)(uintptr_t)2);
+    hal_irq_register(ATA_SECONDARY_IRQ, ata_irq_handler, (void*)(uintptr_t)3);
+
     ata_identify_drive(&drives[0], ATA_PRIMARY_IO, 0);
     ata_identify_drive(&drives[1], ATA_PRIMARY_IO, 1);
     ata_identify_drive(&drives[2], ATA_SECONDARY_IO, 0);
@@ -130,35 +185,54 @@ err_t ata_init(void) {
     return ERR_OK;
 }
 
-static int ata_pio_transfer(uint16_t base, uint8_t drive, uint64_t lba,
-                            uint8_t count, void* buf, int write) {
-    if (ata_wait_bsy(base, 10000)) return -1;
+/* IRQ-driven PIO transfer */
+static int ata_pio_transfer_irq(uint16_t base, uint8_t drive, uint64_t lba,
+                                uint8_t count, void* buf, int write) {
+    uint8_t drive_idx;
+    for (drive_idx = 0; drive_idx < 4; drive_idx++) {
+        if (drives[drive_idx].base == base && (drive_idx & 1) == (drive & 1))
+            break;
+    }
+    if (drive_idx >= 4) return -1;
 
+    ata_drive_t* drv = &drives[drive_idx];
+
+    /* Select drive */
     outb(base + ATA_REG_DRIVE, drive ? 0xB0 : 0xA0);
+
+    /* Set sector count and LBA */
     outb(base + ATA_REG_SECCOUNT, count);
     outb(base + ATA_REG_LBA0, (uint8_t)(lba));
     outb(base + ATA_REG_LBA1, (uint8_t)(lba >> 8));
     outb(base + ATA_REG_LBA2, (uint8_t)(lba >> 16));
+
+    /* Send command */
     outb(base + ATA_REG_CMD, write ? ATA_CMD_WRITE_PIO : ATA_CMD_READ_PIO);
 
     uint16_t* word_buf = (uint16_t*)buf;
 
     for (int s = 0; s < count; s++) {
-        if (ata_wait_bsy(base, 10000)) return -1;
-        if (ata_wait_drq(base, 10000)) return -1;
-
         if (write) {
+            /* Wait for drive ready to accept data */
+            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) return -1;
+
+            /* Write sector data */
             for (int i = 0; i < 256; i++)
                 outw(base + ATA_REG_DATA, word_buf[s * 256 + i]);
         } else {
+            /* Wait for data ready */
+            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) return -1;
+
+            /* Read sector data */
             for (int i = 0; i < 256; i++)
                 word_buf[s * 256 + i] = inw(base + ATA_REG_DATA);
         }
     }
 
+    /* For writes, flush write cache */
     if (write) {
         outb(base + ATA_REG_CMD, ATA_CMD_FLUSH);
-        ata_wait_bsy(base, 10000);
+        if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) return -1;
     }
 
     return count * ATA_SECTOR_SIZE;
@@ -166,12 +240,12 @@ static int ata_pio_transfer(uint16_t base, uint8_t drive, uint64_t lba,
 
 int ata_read_sectors(uint8_t drive, uint64_t lba, uint8_t count, void* buf) {
     if (drive > 3 || !drives[drive].present) return -1;
-    return ata_pio_transfer(drives[drive].base, drive & 1, lba, count, buf, 0);
+    return ata_pio_transfer_irq(drives[drive].base, drive & 1, lba, count, buf, 0);
 }
 
 int ata_write_sectors(uint8_t drive, uint64_t lba, uint8_t count, const void* buf) {
     if (drive > 3 || !drives[drive].present) return -1;
-    return ata_pio_transfer(drives[drive].base, drive & 1, lba, count, (void*)buf, 1);
+    return ata_pio_transfer_irq(drives[drive].base, drive & 1, lba, count, (void*)buf, 1);
 }
 
 int ata_drive_present(uint8_t drive) {
@@ -184,4 +258,43 @@ uint64_t ata_drive_sectors(uint8_t drive) {
 
 const char* ata_drive_model(uint8_t drive) {
     return (drive < 4) ? drives[drive].model : NULL;
+}
+
+/* ---- Block device wrapper ---- */
+
+static err_t ata_blk_read(block_dev_t* dev, uint64_t lba, uint8_t count, void* buf) {
+    uint8_t drive_idx = (uint8_t)(uintptr_t)dev->private_data;
+    int ret = ata_read_sectors(drive_idx, lba, count, buf);
+    return (ret < 0) ? ERR_IO : ERR_OK;
+}
+
+static err_t ata_blk_write(block_dev_t* dev, uint64_t lba, uint8_t count, const void* buf) {
+    uint8_t drive_idx = (uint8_t)(uintptr_t)dev->private_data;
+    int ret = ata_write_sectors(drive_idx, lba, count, buf);
+    return (ret < 0) ? ERR_IO : ERR_OK;
+}
+
+err_t ata_blk_init(void) {
+    for (int i = 0; i < 4; i++) {
+        if (!drives[i].present) continue;
+
+        block_dev_t bd;
+        kstrncpy(bd.name, "ata", sizeof(bd.name) - 1);
+
+        char suffix[4] = { '0' + (char)i, '\0' };
+        kstrncat(bd.name, suffix, sizeof(bd.name) - kstrlen(bd.name) - 1);
+
+        bd.block_count = drives[i].sector_count;
+        bd.block_size = ATA_SECTOR_SIZE;
+        bd.read = ata_blk_read;
+        bd.write = ata_blk_write;
+        bd.private_data = (void*)(uintptr_t)i;
+
+        int idx = block_register(&bd);
+        if (idx >= 0) {
+            kprintf("[ATA_BLK] Registered drive %d as '%s' (%llu blocks)\n",
+                    i, bd.name, bd.block_count);
+        }
+    }
+    return ERR_OK;
 }

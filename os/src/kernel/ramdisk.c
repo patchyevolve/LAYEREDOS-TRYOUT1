@@ -75,7 +75,10 @@ err_t ramdisk_init(void) {
 }
 
 int ramdisk_add_file(const char* name, const void* data, uint64_t size) {
+    if (!name || !data) return -1;
     if (ramdisk.file_count >= RAMDISK_MAX_FILES)
+        return -1;
+    if (kstrlen(name) >= RAMDISK_NAME_MAX)
         return -1;
 
     ramdisk_file_t* f = &ramdisk.files[ramdisk.file_count];

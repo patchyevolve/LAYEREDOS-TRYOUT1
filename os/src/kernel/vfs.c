@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "vfs.h"
+#include "hal.h"
 
 vfs_fd_t  fd_table[VFS_MAX_FDS];
 static vfs_node_t root_node;
@@ -42,9 +43,6 @@ err_t vfs_init(void) {
     for (int i = 0; i < VFS_MAX_FDS; i++)
         fd_table[i].used = 0;
 
-    for (int i = 0; i < 3; i++)
-        fd_table[i].used = 1;
-
     kprintf("[VFS] Virtual filesystem initialized\n");
     return ERR_OK;
 }
@@ -83,6 +81,9 @@ err_t vfs_mount(const char* path, vfs_fs_t* fs) {
 
 static vfs_node_t* vfs_find_flags(const char* path, int follow) {
     if (!path) return NULL;
+
+    /* Buffer for symlink path reconstruction (kept at function scope) */
+    char pathbuf[512];
 
     /* Follow symlinks up to VFS_MAX_SYMLINKS deep */
     int depth = 0;
@@ -157,21 +158,20 @@ static vfs_node_t* vfs_find_flags(const char* path, int follow) {
                         char link_target[256];
                         if (found->fs && found->fs->ops && found->fs->ops->readlink &&
                             found->fs->ops->readlink(found, link_target, sizeof(link_target)) == 0) {
-                            char newpath[512];
                             int k = 0;
                             if (link_target[0] == '/') {
                                 for (int i = 0; link_target[i] && k < 511; i++)
-                                    newpath[k++] = link_target[i];
+                                    pathbuf[k++] = link_target[i];
                             } else {
                                 for (int i = 0; link_target[i] && k < 511; i++)
-                                    newpath[k++] = link_target[i];
+                                    pathbuf[k++] = link_target[i];
                             }
-                            if (k > 0 && newpath[k-1] != '/')
-                                newpath[k++] = '/';
+                            if (k > 0 && pathbuf[k-1] != '/')
+                                pathbuf[k++] = '/';
                             while (*p && k < 511)
-                                newpath[k++] = *p++;
-                            newpath[k] = '\0';
-                            path = newpath;
+                                pathbuf[k++] = *p++;
+                            pathbuf[k] = '\0';
+                            path = pathbuf;
                             depth++;
                             found_symlink = 1;
                             break;
@@ -191,7 +191,8 @@ static vfs_node_t* vfs_find_flags(const char* path, int follow) {
                 char link_target[256];
                 if (cur->fs && cur->fs->ops && cur->fs->ops->readlink &&
                     cur->fs->ops->readlink(cur, link_target, sizeof(link_target)) == 0) {
-                    path = link_target;
+                    kstrncpy(pathbuf, link_target, 511);
+                    path = pathbuf;
                     depth++;
                     continue;
                 }
@@ -235,7 +236,8 @@ static vfs_node_t* vfs_find_flags(const char* path, int follow) {
                 char link_target[256];
                 if (child->fs && child->fs->ops && child->fs->ops->readlink &&
                     child->fs->ops->readlink(child, link_target, sizeof(link_target)) == 0) {
-                    path = link_target;
+                    kstrncpy(pathbuf, link_target, 511);
+                    path = pathbuf;
                     depth++;
                     found_symlink = 1;
                     break;
@@ -254,7 +256,8 @@ static vfs_node_t* vfs_find_flags(const char* path, int follow) {
             char link_target[256];
             if (cur->fs && cur->fs->ops && cur->fs->ops->readlink &&
                 cur->fs->ops->readlink(cur, link_target, sizeof(link_target)) == 0) {
-                path = link_target;
+                kstrncpy(pathbuf, link_target, 511);
+                path = pathbuf;
                 depth++;
                 continue;
             }
@@ -314,7 +317,7 @@ int vfs_open(const char* path, int flags) {
         node->fs->ops->open(node);
 
     fd_table[fd].node   = node;
-    fd_table[fd].offset = (flags & O_APPEND) ? node->size : 0;
+    fd_table[fd].offset = 0;
     fd_table[fd].flags  = flags;
     fd_table[fd].used   = 1;
     return fd;
@@ -355,7 +358,11 @@ int64_t vfs_write(int fd, const void* buf, uint64_t count) {
     vfs_node_t* node = f->node;
 
     if (node->fs && node->fs->ops && node->fs->ops->write) {
-        if (f->flags & O_APPEND) f->offset = node->size;
+        if (f->flags & O_APPEND) {
+            cpu_flags_t _flags = hal_save_irq();
+            f->offset = node->size;
+            hal_restore_irq(_flags);
+        }
         int64_t ret = node->fs->ops->write(node, buf, count, f->offset);
         if (ret > 0) f->offset += ret;
         return ret;
@@ -409,6 +416,7 @@ int vfs_create(const char* path, int is_dir) {
     }
 
     if (!parent) return -1;
+    if (kstrlen(name) >= VFS_MAX_NAME) return -1;
     if (parent->fs && parent->fs->ops && parent->fs->ops->create)
         return parent->fs->ops->create(parent, name, is_dir);
     return -1;

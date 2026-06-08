@@ -5,9 +5,9 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 ## Core boot and hardware
 - ✅ Stable boot path and higher-half mapping
 - ✅ GDT, IDT, TSS, and interrupt stubs
-- 🟡 PIC/APIC interrupt routing (PIC only, no APIC)
+- ✅ PIC/APIC interrupt routing (xAPIC enabled, LINT0=ExtINT for PIC passthrough, APIC timer active)
 - ✅ UART/serial console
-- 🟡 PIT or HPET timer (PIT only, no HPET)
+- ✅ PIT and HPET timer (HPET 100 MHz detected, nanosecond precision timekeeping, APIC timer for scheduling)
 - ✅ Basic CPU feature detection (SMAP, MWAIT via CPUID)
 - ✅ Panic path with useful debug output (stack trace, register dump)
 - ✅ Watchdog / health checking
@@ -20,7 +20,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Demand-safe user/kernel address split (top-half kernel, bottom-half user)
 - ✅ Copy-from-user and copy-to-user helpers (SMAP-aware, range-checked)
 - ✅ OOM handling (EV_OOM_KILL event, kills current process)
-- ❌ Swap support
+- ✅ Swap support (RAM-backed swap store, slot bitmap, PTE encoding, swap-in on page fault)
 - ✅ Double-free / corruption detection (in kfree and pmm_free_page)
 - ✅ Better allocation fast paths (O(1) alloc_page, O(N) alloc_pages)
 - ✅ Per-page permission flags: user, kernel, read, write, execute (PAGE_USER, PAGE_WRITE, PAGE_NX)
@@ -39,27 +39,31 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ fork, exec, exit, wait (syscall implementations)
 - ✅ Per-process kernel stack handling (separate kernel stack per thread)
 - ✅ Per-process address spaces (separate PML4 per process)
-- ❌ Basic signal/event delivery
+- ✅ Signal delivery with sigreturn (sigframe_t on user stack, trampoline at SIGNAL_TRAMPOLINE_ADDR, SYS_SIGRETURN restores context)
 - ✅ Thread/process cleanup and reaping (zombie reaper, process exit frees user pages)
+- ✅ Work queues (work_queue_t with spinlock-protected list, system_wq for kernel-wide scheduling)
+- ✅ Deferred tasks (deferred_task_t one-shot timer API, polls on system work queue)
+- ✅ Kernel worker threads (kworker processes system work queue at THREAD_DEF_PRIO)
 
 ## Syscall and userspace
-- ✅ Syscall gateway (int 0x80, 27 syscalls)
+- ✅ Syscall gateway (int 0x80, 34 syscalls: SYS_MMAP/SYS_MUNMAP/SYS_MPROTECT added)
 - ✅ Syscall argument validation (user-range + mapped + SMAP checks)
 - ❌ Userspace ABI stability (no formal ABI)
-- ❌ Userspace C library (two tiny embedded programs, no libc)
-- ✅ ELF loading (ELF64, PT_LOAD segments, NX support)
-- ❌ Dynamic loader support
+- 🟡 Userspace C library (two tiny embedded programs, getcwd/chdir/dup2 wrappers needed)
+- ✅ ELF loading (ELF64, PT_LOAD segments, PT_INTERP, NX support)
+- ✅ Dynamic linker/loader (ld.so: ET_DYN PIE loaded by kernel via PT_INTERP, ELF parsing, symbol resolution, RELA/PLT relocations, shared library loading via mmap, aux-vector setup, init/fini arrays)
 - ✅ Standard file descriptor table (32 FD slots, pre-allocated 0/1/2)
 - 🟡 Standard input/output/error wiring (fd 0/1/2 reserved, sys_read/sys_write for UART)
 - ✅ Minimal init process (pid 1, runs shell)
-- ❌ Basic service launcher
+- ✅ Basic service launcher (/etc/rc startup script sourced by shell at boot)
 
 ## Storage and filesystem
 - ✅ PCI bus enumeration (config space, bus scanning, bridge recursion)
 - ✅ ATA/AHCI/NVMe driver (ATA PIO, identify, read/write sectors, LBA48)
-- ❌ IRQ-based block I/O (ATA uses PIO polling)
+- ✅ IRQ-based block I/O — ATA PIO uses `sched_block`/`sched_wake` on per-drive wait queues; IRQ handlers for IRQs 14/15; timeout watchdog
 - ✅ Block device abstraction layer (register, find, read, write)
-- ❌ Sector cache or buffering (direct writes to ramdisk)
+- ✅ Sector cache — LRU write-back cache (64 entries, dirty tracking, eviction flushes to device)
+- ✅ Journaling/WAL — circular buffer of DATA+COMMIT entries (63 slots); recover replays committed transactions; checkpoint on commit; mid-txn commit-and-restart on full journal
 - ✅ Writable filesystem (SFS: superblock, bitmaps, inodes, data blocks)
 - ✅ VFS core (node tree, path walking, fd operations)
 - ✅ Directory creation (vfs_mkdir → sfs_vfs_create with DIR type)
@@ -77,12 +81,12 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Multi-mount VFS (mount table, prefix matching, per-FS path dispatch)
 - ✅ tmpfs (RAM-backed filesystem mounted at /tmp, all VFS ops)
 - ✅ devfs (device filesystem mounted at /dev: null, zero, random, full)
-- ❌ Journaling or WAL
+- ✅ Journaling/WAL — crash recovery via write-ahead log (DATA+COMMIT entries, recover replays committed transactions)
 - ✅ File permissions and ownership (mode enforced on open-for-write, default 0644, chmod shell command)
 - ✅ File locking (advisory, lock/unlock shell commands, SFS inode flag)
 
 ## Terminal and shell
-- ❌ Real TTY/terminal layer (shell writes directly to UART/VGA)
+- 🟡 Real TTY/terminal layer (kernel/tty.c + kernel/tty.h: line discipline, canonical/raw mode, echo, signal generation. Ctrl-C SIGINT, Ctrl-Z SIGTSTP, Ctrl-\ SIGQUIT, Ctrl-D EOF. ISR feeds TTY raw buffer; ISR-level signal detection delivers signals to fg pgid immediately via work queue. Process groups with `pgid` field. Shell `cmd_run`/`cmd_fg` set `fg_pgid`. /dev/ttyS0 in devfs. No termios ioctl, no PTY, no SIGTTIN/SIGTTOU.)
 - ✅ Line editing (readline-style: arrows, home/end, backspace/del, Ctrl-U/K/W/A/E/C)
 - ✅ Command history (64-entry circular, up/down arrows)
 - ✅ Tab completion (commands + aliases + VFS paths)
@@ -111,6 +115,8 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ❌ Sockets API
 - ❌ TLS support
 - ❌ Network namespaces or isolation
+- ❌ DHCP client
+- ❌ NTP client
 
 ## Security and isolation
 - ❌ Capability system
@@ -122,24 +128,27 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Read-only kernel text (cleared PAGE_WRITE on .text and .rodata after boot)
 - ✅ NX / non-executable memory (NX bit on user stack/data segments)
 - ✅ Basic signals (SIGTERM/SIGKILL/SIGSTOP/SIGCONT/SIGTSTP, sys_kill/sys_sigaction, default actions)
-- ❌ ASLR
+- 🟡 ASLR (PIE binaries load at random base using RDTSC; fixed-address EXEC binaries deterministic)
 - ❌ Secure boot chain
 - ❌ Signed binaries
 - ❌ Syscall filtering or policy hooks
 - ❌ Privilege separation for services
 - ❌ Secure IPC
+- ❌ Secure random subsystem
+- ❌ Hashing framework (no kernel crypto hash primitives)
+- ❌ Kernel crypto primitives
 
 ## Filesystem and data integrity
-- ❌ Better inode model (minimal: type, size, direct/indirect blocks)
+- ✅ Better inode model (direct + singly-indirect + doubly-indirect; max ~8 MB)
 - ✅ Metadata timestamps (atime/mtime/ctime in inode and stat output)
 - ✅ Hard links (ln command, ref-counted inodes, nlink field)
 - ✅ Symbolic links
-- ❌ Sparse files
+- ✅ Sparse files (reads zero-fill holes; writes skip unallocated blocks)
 - ✅ Append mode (O_APPEND support, shell >> redirection, write-through cache still safe on append)
 - ✅ Rename support (atomic rename via vfs_rename/sfs_vfs_rename, mv uses it with cp+unlink fallback)
-- ❌ Atomic file update semantics
-- ❌ Crash recovery (no journaling, no fsck)
-- ❌ Snapshot/rollback
+- ✅ Atomic file update semantics (rename overwrites target atomically)
+- ✅ Crash recovery (journaling/WAL + fsck with repair)
+- ✅ Snapshot/rollback (point-in-time full-device snapshots with rollback via snap take/rollback commands)
 - ❌ Backup/restore support
 
 ## GUI-capable foundation
@@ -181,3 +190,23 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ❌ Regression tests (no automated regression suite)
 - ❌ Benchmarking tools
 - ✅ Code style consistency (uniform style across kernel)
+- ❌ NUMA awareness (single NUMA domain assumed throughout)
+- ❌ NUMA-aware scheduler (no topology-aware thread placement)
+- ❌ NUMA-aware memory allocation (no per-node allocator)
+
+## Service layer and IPC
+- ❌ Shared memory between processes (no MAP_SHARED)
+- ❌ Message queues (no POSIX or custom message queue)
+- ❌ Event queues (no epoll/kqueue-style multiplexing)
+- ❌ Kernel event bus exposed to userspace
+- ❌ Service launcher (no supervised start/stop)
+- ❌ Service manager (no liveness tracking or restart policy)
+- ❌ Dependency-ordered service startup
+- ❌ Process event notifications (start/exit/state change)
+- ❌ Filesystem event notifications (no inotify equivalent)
+- ❌ Device hotplug events to userspace
+- ❌ procfs (no /proc filesystem)
+- ❌ sysfs (no /sys filesystem)
+- ❌ Process statistics export via virtual filesystem
+- ❌ Device statistics export via virtual filesystem
+- ❌ Runtime kernel statistics export via virtual filesystem

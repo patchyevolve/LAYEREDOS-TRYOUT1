@@ -139,6 +139,21 @@ fork_child_entry:
     addq $16, %rsp      /* skip vector and error_code */
     iretq
 
+.global signal_trampoline
+.type signal_trampoline, @function
+signal_trampoline:
+    /* This is invoked by the user signal handler's return.
+     * rsp points to a sigframe_t on the user stack.
+     * We call sigreturn syscall (syscall number 27) to restore
+     * the original context and return to the interrupted code.
+     */
+    movq %rsp, %rdi
+    movq $27, %rax
+    int $0x80
+    /* If sigreturn fails, just loop */
+1:  hlt
+    jmp 1b
+
 .section .rodata
 null_func_msg:
     .asciz "thread_trampoline: NULL function pointer"

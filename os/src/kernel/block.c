@@ -7,53 +7,71 @@
 static block_dev_t block_devs[MAX_BLOCK_DEVICES];
 static int block_dev_count = 0;
 
-/* Simple sector cache */
+/* Write-back sector cache with LRU eviction */
 typedef struct {
-    uint64_t    dev_hash;
-    uint64_t    lba;
-    uint8_t     data[BLOCK_SIZE];
-    int         valid;
-    int         dirty;
+    block_dev_t* dev;
+    uint64_t     lba;
+    uint8_t      data[BLOCK_SIZE];
+    int          valid;
+    int          dirty;
+    uint64_t     access_time;
 } cache_line_t;
 
 static cache_line_t block_cache[BLOCK_CACHE_SIZE];
 static uint64_t cache_hits = 0;
 static uint64_t cache_misses = 0;
+static uint64_t cache_writes = 0;
+static uint64_t cache_clock = 0;
 
-static uint64_t ptr_hash(void* p) {
-    return (uint64_t)(uintptr_t)p;
-}
-
+/* Find matching cache line (updates LRU time) */
 static cache_line_t* cache_lookup(block_dev_t* dev, uint64_t lba) {
-    uint64_t h = ptr_hash(dev);
     for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
-        uint64_t idx = (h ^ lba ^ (uint64_t)i) % BLOCK_CACHE_SIZE;
-        cache_line_t* cl = &block_cache[idx];
-        if (cl->valid && cl->dev_hash == h && cl->lba == lba)
+        cache_line_t* cl = &block_cache[i];
+        if (cl->valid && cl->dev == dev && cl->lba == lba) {
+            cl->access_time = ++cache_clock;
             return cl;
+        }
     }
     return NULL;
 }
 
+/* Evict the LRU entry (prefer non-dirty), write-back if dirty */
 static cache_line_t* cache_evict(block_dev_t* dev, uint64_t lba) {
-    uint64_t h = ptr_hash(dev);
-    uint64_t idx = (h ^ lba) % BLOCK_CACHE_SIZE;
-    cache_line_t* cl = &block_cache[idx];
-    if (cl->valid && cl->dirty) {
-        block_dev_t* old_dev = NULL;
-        for (int i = 0; i < block_dev_count; i++) {
-            if (ptr_hash(&block_devs[i]) == cl->dev_hash) {
-                old_dev = &block_devs[i];
-                break;
-            }
+    int best_valid = -1;
+    uint64_t oldest_valid = (uint64_t)-1;
+    int best_clean = -1;
+    uint64_t oldest_clean = (uint64_t)-1;
+
+    for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        cache_line_t* cl = &block_cache[i];
+        if (cl->valid && cl->access_time < oldest_valid) {
+            oldest_valid = cl->access_time;
+            best_valid = i;
         }
-        if (old_dev && old_dev->write)
-            old_dev->write(old_dev, cl->lba, 1, cl->data);
+        if (cl->valid && !cl->dirty && cl->access_time < oldest_clean) {
+            oldest_clean = cl->access_time;
+            best_clean = i;
+        }
     }
+
+    /* Prefer a clean entry; if all dirty, evict oldest */
+    int idx = (best_clean >= 0) ? best_clean : best_valid;
+    if (idx < 0) {
+        /* No valid entries — use slot 0 */
+        idx = 0;
+    }
+
+    cache_line_t* cl = &block_cache[idx];
+    if (cl->valid && cl->dirty && cl->dev && cl->dev->write) {
+        cl->dev->write(cl->dev, cl->lba, 1, cl->data);
+        cache_writes++;
+    }
+
     cl->valid = 1;
-    cl->dev_hash = h;
+    cl->dev = dev;
     cl->lba = lba;
     cl->dirty = 0;
+    cl->access_time = ++cache_clock;
     return cl;
 }
 
@@ -66,10 +84,10 @@ err_t block_read(block_dev_t* dev, uint64_t lba, uint8_t count, void* buf) {
             kmemcpy(p + (uint64_t)i * BLOCK_SIZE, cl->data, BLOCK_SIZE);
             cache_hits++;
         } else {
-            err_t e = dev->read(dev, lba + i, 1, p + (uint64_t)i * BLOCK_SIZE);
-            if (e) return e;
             cl = cache_evict(dev, lba + i);
-            kmemcpy(cl->data, p + (uint64_t)i * BLOCK_SIZE, BLOCK_SIZE);
+            err_t e = dev->read(dev, lba + i, 1, cl->data);
+            if (e) return e;
+            kmemcpy(p + (uint64_t)i * BLOCK_SIZE, cl->data, BLOCK_SIZE);
             cache_misses++;
         }
     }
@@ -80,12 +98,52 @@ err_t block_write(block_dev_t* dev, uint64_t lba, uint8_t count, const void* buf
     if (!dev || !dev->write) return ERR_INVAL;
     const uint8_t* p = (const uint8_t*)buf;
     for (uint8_t i = 0; i < count; i++) {
-        cache_line_t* cl = cache_evict(dev, lba + i);
+        cache_line_t* cl = cache_lookup(dev, lba + i);
+        if (!cl) {
+            cl = cache_evict(dev, lba + i);
+        }
         kmemcpy(cl->data, p + (uint64_t)i * BLOCK_SIZE, BLOCK_SIZE);
-        err_t e = dev->write(dev, lba + i, 1, cl->data);
-        if (e) return e;
+        cl->dirty = 1;
     }
     return ERR_OK;
+}
+
+err_t block_sync(void) {
+    for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        cache_line_t* cl = &block_cache[i];
+        if (cl->valid && cl->dirty && cl->dev && cl->dev->write) {
+            err_t e = cl->dev->write(cl->dev, cl->lba, 1, cl->data);
+            if (e) return e;
+            cl->dirty = 0;
+            cache_writes++;
+        }
+    }
+    return ERR_OK;
+}
+
+err_t block_sync_dev(block_dev_t* dev) {
+    for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        cache_line_t* cl = &block_cache[i];
+        if (cl->valid && cl->dirty && cl->dev == dev && cl->dev->write) {
+            err_t e = cl->dev->write(cl->dev, cl->lba, 1, cl->data);
+            if (e) return e;
+            cl->dirty = 0;
+            cache_writes++;
+        }
+    }
+    return ERR_OK;
+}
+
+void block_cache_stats(void) {
+    int valid = 0, dirty = 0;
+    for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        if (block_cache[i].valid) valid++;
+        if (block_cache[i].dirty) dirty++;
+    }
+    kprintf("[BLOCK] cache: %llu hits, %llu misses, %llu writes-back, "
+            "%d/%d valid, %d dirty\n",
+            cache_hits, cache_misses, cache_writes,
+            valid, BLOCK_CACHE_SIZE, dirty);
 }
 
 int block_register(block_dev_t* dev) {

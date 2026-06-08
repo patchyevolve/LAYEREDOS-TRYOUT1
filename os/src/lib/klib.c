@@ -112,7 +112,7 @@ static void kputhex_trim(uint64_t v) {
 }
 
 void kputdec(uint64_t v, int pad) {
-    kprint_int64((int64_t)v, 10, pad);
+    kprint_uint64(v, pad);
 }
 
 int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
@@ -122,13 +122,15 @@ int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
         if (written >= (int)size - 1) break;
         if (*p != '%') { buf[written++] = *p; continue; }
         p++;
-        if (*p == '-') p++;
+        int left = 0;
+        if (*p == '-') { left = 1; p++; }
         int pad = 0;
         while (*p >= '0' && *p <= '9') { pad = pad * 10 + (*p - '0'); p++; }
         int lc = 0;
         while (*p == 'l') { lc++; p++; }
-        char tmp[32];
+        char tmp[64];
         int ti = 0;
+        int len;
         if (*p == '%') { buf[written++] = '%'; continue; }
         switch (*p) {
             case 'd': {
@@ -136,14 +138,19 @@ int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
                 if (lc >= 2) v = __builtin_va_arg(ap, long long);
                 else if (lc == 1) v = __builtin_va_arg(ap, long);
                 else v = __builtin_va_arg(ap, int);
+                uint64_t uv;
                 int neg = 0;
-                if (v < 0) { neg = 1; v = -v; }
-                uint64_t uv = (uint64_t)v;
+                if (v < 0) {
+                    if ((uint64_t)v == 0x8000000000000000ULL) { uv = 0x8000000000000000ULL; neg = 1; }
+                    else { neg = 1; uv = (uint64_t)(-v); }
+                } else { uv = (uint64_t)v; }
                 do { tmp[ti++] = '0' + (uv % 10); uv /= 10; } while (uv > 0);
-                while (ti < pad) tmp[ti++] = '0';
                 if (neg) tmp[ti++] = '-';
-                for (int i = ti - 1; i >= 0 && written < (int)size - 1; i--)
+                len = ti;
+                for (int i = len - 1; i >= 0 && written < (int)size - 1; i--)
                     buf[written++] = tmp[i];
+                while (left && written < pad + len - (neg ? 1 : 0) && written < (int)size - 1)
+                    buf[written++] = ' ';
                 break;
             }
             case 'u': {
@@ -152,9 +159,11 @@ int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
                 else if (lc == 1) v = __builtin_va_arg(ap, unsigned long);
                 else v = __builtin_va_arg(ap, unsigned int);
                 do { tmp[ti++] = '0' + (v % 10); v /= 10; } while (v > 0);
-                while (ti < pad) tmp[ti++] = '0';
-                for (int i = ti - 1; i >= 0 && written < (int)size - 1; i--)
+                len = ti;
+                for (int i = len - 1; i >= 0 && written < (int)size - 1; i--)
                     buf[written++] = tmp[i];
+                while (left && written < pad + len && written < (int)size - 1)
+                    buf[written++] = ' ';
                 break;
             }
             case 'x': {
@@ -162,7 +171,8 @@ int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
                 if (lc >= 2) v = __builtin_va_arg(ap, unsigned long long);
                 else if (lc == 1) v = __builtin_va_arg(ap, unsigned long);
                 else v = __builtin_va_arg(ap, unsigned int);
-                buf[written++] = '0'; if (written < (int)size - 1) buf[written++] = 'x';
+                if (written < (int)size - 1) buf[written++] = '0';
+                if (written < (int)size - 1) buf[written++] = 'x';
                 for (int i = 60; i >= 0 && written < (int)size - 1; i -= 4) {
                     int nib = (v >> i) & 0xF;
                     if (nib || i == 0) 
@@ -173,7 +183,12 @@ int kvsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap) {
             case 's': {
                 const char* s = __builtin_va_arg(ap, const char*);
                 if (!s) s = "(null)";
+                len = 0;
+                while (s[len]) len++;
+                if (!left)
+                    while (len < pad && written < (int)size - 1) { buf[written++] = ' '; pad--; }
                 while (*s && written < (int)size - 1) buf[written++] = *s++;
+                while (left && pad > 0 && written < (int)size - 1) { buf[written++] = ' '; pad--; }
                 break;
             }
             case 'c': {
@@ -278,7 +293,7 @@ void kpanic(const char* msg, ...) {
         switch (*p) {
             case 's': kputs(__builtin_va_arg(ap, const char*)); break;
             case 'x': kputhex(__builtin_va_arg(ap, uint64_t)); break;
-            case 'd': kputdec(__builtin_va_arg(ap, uint64_t), 0); break;
+            case 'd': kprint_int64(__builtin_va_arg(ap, int64_t), 10, 0); break;
             default: kputchar(*p); break;
         }
     }

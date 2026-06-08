@@ -44,5 +44,6 @@ parent_done:
 msg: .ascii "Hello from user mode!\n"
 child_msg: .ascii "child\n"
 parent_msg: .ascii "parent\n"
+.section .bss
 child_stack: .skip 4096
 child_stack_top:

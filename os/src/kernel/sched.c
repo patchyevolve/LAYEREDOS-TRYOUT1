@@ -23,7 +23,9 @@ volatile int need_reschedule = 0;
 volatile uint64_t idle_wake_hint = 0;
 
 void all_threads_add(thread_t* t) {
+    if (!t) return;
     cpu_flags_t flags = hal_save_irq();
+    if (t->all_next || t->all_prev) { hal_restore_irq(flags); return; }
     t->all_next = NULL;
     t->all_prev = all_threads_tail;
     if (all_threads_tail)
@@ -53,7 +55,7 @@ static void all_threads_remove(thread_t* t) {
 
 void sched_foreach(void (*cb)(thread_t* t, void* ctx), void* ctx) {
     if (!cb) return;
-    cpu_flags_t flags = hal_save_irq();
+    cpu_flags_t flags = hal_save_irq(); /* callback runs with interrupts disabled */
     thread_t* t = all_threads_head;
     while (t) {
         thread_t* next = t->all_next;
@@ -170,7 +172,7 @@ static thread_t* pick_next(void) {
         q->tail = NULL;
     }
     q->count--;
-    if (q->count == 0) bitmap_clear_prio(prio);
+    if (!q->head) bitmap_clear_prio(prio);
     t->rq_next = NULL;
     t->rq_prev = NULL;
 
@@ -223,7 +225,9 @@ void schedule(void) {
 
 void thread_yield(void) {
     sched_yield_count++;
+    cpu_flags_t flags = hal_save_irq();
     current_thread->time_slice_remaining = 0;
+    hal_restore_irq(flags);
     schedule();
 }
 
@@ -425,6 +429,7 @@ void sched_timer_tick(void) {
         static uint64_t aging_counter = 0;
         if (++aging_counter >= AGING_INTERVAL) {
             aging_counter = 0;
+            cpu_flags_t irq_flags = hal_save_irq();
             thread_t* t = all_threads_head;
             while (t) {
                 thread_t* next = t->all_next;
@@ -439,6 +444,7 @@ void sched_timer_tick(void) {
                 }
                 t = next;
             }
+            hal_restore_irq(irq_flags);
         }
     }
 

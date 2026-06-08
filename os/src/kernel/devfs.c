@@ -2,12 +2,14 @@
 #include "devfs.h"
 #include "vfs.h"
 #include "kmalloc.h"
+#include "tty.h"
 
 enum dev_type {
     DEV_NULL,
     DEV_ZERO,
     DEV_RANDOM,
     DEV_FULL,
+    DEV_TTY,
 };
 
 typedef struct devfs_file {
@@ -15,18 +17,19 @@ typedef struct devfs_file {
     uint32_t size;
 } devfs_file_t;
 
-#define DEVFS_ENTRIES 4
+#define DEVFS_ENTRIES 5
 
 static devfs_file_t dev_null   = { DEV_NULL,   0 };
 static devfs_file_t dev_zero   = { DEV_ZERO,   0 };
 static devfs_file_t dev_random = { DEV_RANDOM, 0 };
 static devfs_file_t dev_full   = { DEV_FULL,   0 };
+static devfs_file_t dev_tty    = { DEV_TTY,   0 };
 
 static const char* dev_names[DEVFS_ENTRIES] = {
-    "null", "zero", "random", "full"
+    "null", "zero", "random", "full", "ttyS0"
 };
 static devfs_file_t* dev_files[DEVFS_ENTRIES] = {
-    &dev_null, &dev_zero, &dev_random, &dev_full
+    &dev_null, &dev_zero, &dev_random, &dev_full, &dev_tty
 };
 
 static int devfs_vfs_open(vfs_node_t* node) {
@@ -85,6 +88,7 @@ static int64_t devfs_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint6
         case DEV_ZERO:   return devfs_vfs_read_zero(f, buf, count, offset);
         case DEV_RANDOM: return devfs_vfs_read_random(f, buf, count, offset);
         case DEV_FULL:   return devfs_vfs_read_full(f, buf, count, offset);
+        case DEV_TTY:    return tty_vfs_read(&tty_console.node, buf, count, offset);
         default: return -1;
     }
 }
@@ -97,6 +101,7 @@ static int64_t devfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count
         case DEV_ZERO:   return devfs_vfs_write_null(f, buf, count, offset);
         case DEV_RANDOM: return devfs_vfs_write_null(f, buf, count, offset);
         case DEV_FULL:   return devfs_vfs_write_full(f, buf, count, offset);
+        case DEV_TTY:    return tty_vfs_write(&tty_console.node, buf, count, offset);
         default: return -1;
     }
 }

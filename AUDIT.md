@@ -1,1525 +1,569 @@
-╔══════════════════════════════════════════════════════════════╗
-║          OPERtur/TRY1 — Full Codebase Audit & Roadmap       ║
-║          Date: 2026-06-05   |   Commit: 4704ce3             ║
-╚══════════════════════════════════════════════════════════════╝
-
-================================================================================
-   TABLE OF CONTENTS
-================================================================================
-  1. Project Vision & Goals
-  2. Current Architecture Summary
-  3. CRITICAL Bugs (must fix before any other work)
-  4. HIGH Priority Issues
-  5. MEDIUM Issues
-  6. LOW / Cosmetic Issues
-  7. Race Condition Inventory (all shared data)
-  8. Integer Overflow & Undefined Behavior Analysis
-  9. Stack Depth Analysis (measured worst-case)
-  10. Dead Code & Redundancy Inventory
-  11. Layering (LLN) Violation Audit
-  12. Enhancement Roadmap — Phase 1-4
-  13. Anti-Lag & Heavy-Task Design Principles
-  14. Rust Port Strategy
-  15. Appendix: File-by-File Notes
-
-
-================================================================================
-   1. PROJECT VISION & GOALS
-================================================================================
-
-  PRIMARY GOAL:
-    Build a minimal, ultra-efficient x86-64 kernel that can handle
-    HEAVY-TASK workloads (many concurrent threads, high interrupt rates,
-    IO-intensive operations) with:
-      - Minimal memory overhead
-      - Anti-lag / deterministic scheduling guarantees
-      - Clean layered architecture (LLN)
-      - Graceful degradation under pressure
-
-  LONG-TERM VISION:
-    After C implementation is mature, port the entire kernel to
-    RUST for embedded systems targeting the smallest possible
-    memory footprint (ARM Cortex-M, RISC-V).
-
-  DESIGN TENETS:
-    1. NO heap allocation after boot — all allocations are static or page-based
-    2. NO dynamic dispatch — all code paths are known at compile time
-    3. Each layer calls ONLY the layer below (strict LLN)
-    4. All error paths tested — OOM, timeout, deadlock, device failure
-    5. Preemptive with real-time characteristics (bounded scheduling latency)
-    6. Event-driven with zero-copy IPC where possible
-
-
-================================================================================
-   2. CURRENT ARCHITECTURE SUMMARY
-================================================================================
-
-  LAYER STRUCTURE (bottom to top):
-    Layer 1:  HAL        — GDT, IDT, PIC, UART, Timer, IRQ management
-    Layer 2:  SCHED      — Preemptive round-robin scheduler, threads
-    Layer 4:  PMM        — Physical memory manager (bitmap + free list)
-    Layer 4:  VMM        — Virtual memory (4-level page tables)
-    Layer N-1: SHELL     — Interactive command interface
-    Cross:    EventBus   — publish/subscribe event system
-    Cross:    Watchdog   — health monitoring across layers
-
-  LAYER ASSIGNMENT (as implemented):
-    L0: boot.S       — entry, page tables, 32→64 transition
-    L1: hal.c/h      — GDT, IDT, PIC, UART, timer, IRQ dispatch
-    L2: sched.c/h    — threads, scheduler, sync primitives
-        sync.c/h     — spinlock, mutex (same layer)
-        ctx.S        — context switch, thread trampoline
-    L4: pmm.c/h      — physical memory allocator
-        vmm.c/h      — virtual memory (page tables)
-    L(N-1): shell.c/h — interactive CLI
-    Cross: eventbus.c/h, watchdog.c/h
-
-  PREEMPTION MODEL:
-    - Timer IRQ fires → CPU pushes SS,RSP,RFLAGS,CS,RIP + error
-    → ISR stub pushes vector/error → isr_common_handler saves 15 GP regs
-    → interrupt_handler() runs IRQ handler (sched_timer_tick)
-    → ISR checks need_reschedule → if set, calls schedule() DIRECTLY
-    (registers still saved on stack → context switch preserves them)
-    → ISR pops registers (of the running thread after switch) → iretq
-
-  MEMORY LAYOUT (physical):
-    0x000000 - 0x000FFF: Real-mode data (1 page — reserved)
-    0x001000 - 0x006FFF: Free but UNMANAGED (24KB wasted)
-    0x007000 - 0x00AFFF: Page tables: PML4(0x7000) PDPT(0x8000) PD(0x9000)
-    0x00B000 - 0x00FFFF: Free but UNMANAGED (20KB wasted)
-    0x010000 - 0x013FFF: Boot bitmap (4 pages — reserved)
-    0x014000 - 0x0FFFFF: Free but UNMANAGED (~960KB wasted)
-    0x100000 - 0x21B000: Kernel .text .rodata .data .bss
-    0x21B000 - 0x1FFFFFFF: Managed by PMM (~511MB free)
-    0x20000000 - ...   : Above 512MB — NOT MAPPED by boot page tables
-
-  CURRENT LIMITATIONS (UP only):
-    - No SMP support
-    - No user mode / KPTI
-    - No filesystem
-    - No DMA
-    - No IPC except event bus
-    - No network
-    - ~1MB of memory below 1MB is permanently wasted (never added to PMM)
-
-
-================================================================================
-   3. CRITICAL BUGS (must fix — in priority order)
-================================================================================
-
-  TOTAL: 15 CRITICAL bugs found (7 initial + 6 deep + 2 from user review)
-
-  C1 ─ PMM has NO synchronization at all [pmm.c:9,11,16,43-54,56-89,91-103]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    free_list, free_page_count, and used_bitmap[] are read/written
-          by pmm_alloc_page, pmm_free_page, and pmm_alloc_pages WITHOUT
-          any cli/atomics. If a timer ISR fires during any PMM operation:
-            - free_list linked list gets corrupted (torn write)
-            - free_page_count read-modify-write is non-atomic
-            - bitmap byte read-modify-write is non-atomic
-          Two threads (via preemption) can allocate the SAME page,
-          or double-free, or corrupt the freelist.
-
-  FIX:    Wrap ALL PMM alloc/free operations with hal_save_irq/
-          hal_restore_irq. Keep critical sections short:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ uint64_t pmm_alloc_page(void) {                              │
-          │     cpu_flags_t flags = hal_save_irq();                     │
-          │     if (!free_list) { hal_restore_irq(flags); return 0; }   │
-          │     free_page_t* page = free_list;                          │
-          │     free_list = page->next;                                 │
-          │     free_page_count--;                                      │
-          │     uint64_t addr = (uint64_t)page;                         │
-          │     bitmap_set(addr / PAGE_SIZE);                           │
-          │     hal_restore_irq(flags);                                 │
-          │     kmemset((void*)addr, 0, PAGE_SIZE);   // outside lock  │
-          │     return addr;                                            │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-
-  C2 ─ irq_handlers[] read by ISR without barrier vs thread write [hal.c:60,200-201,325-326]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    hal_irq_register writes two fields (handler, data) with no
-          ordering guarantee. The ISR (interrupt_handler) reads both
-          without any barrier. On x86-64 this usually works, but
-          formally a torn read could see new handler + old data.
-          Fix: use a single-pointer store (pack handler+data) or
-          add a release/acquire barrier.
-
-  FIX:    Option A: Pack handler and data into a single uint64_t pointer
-          (padded struct) and use a single atomic store/load.
-          Option B: Use __sync_synchronize() (full barrier) after
-          writing handler/data in hal_irq_register.
-          Simplest: just make the irq_reg_t fields volatile and add
-          a compiler barrier after writing.
-
-  C3 ─ schedule() re-enables interrupts BEFORE switch_context completes [sched.c:189-190]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    schedule() calls hal_restore_irq(flags) at L189, THEN calls
-          switch_context at L190. If a timer interrupt fires between
-          these two lines, the ISR sets need_reschedule=1 and on return
-          calls schedule() AGAIN while the first schedule() hasn't
-          finished switching stacks. This corrupts current_thread,
-          run queues, and priority bitmap → guaranteed crash.
-
-  FIX:    Move hal_restore_irq(flags) AFTER switch_context, or disable
-          interrupts in switch_context itself:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ // In schedule(), move restore after switch:                 │
-          │ switch_context(&old, &current_thread);                       │
-          │ hal_restore_irq(flags);    // now safe — new thread runs    │
-          └──────────────────────────────────────────────────────────────┘
-          BUT: hal_restore_irq runs in the NEW thread's context, so it
-          restores the NEW thread's flags, not the old one's. This is
-          actually CORRECT because the new thread's saved flags represent
-          the interrupt state it should have.
-
-  C4 ─ check_sleepers iterates run queue linked list WITHOUT cli [sched.c:336-355]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    check_sleepers follows run_queue t->next pointers without
-          disabling interrupts. If an ISR calls sched_remove_thread
-          or pick_next during iteration, the node being followed can
-          be removed and freed → dangling pointer dereference.
-
-  FIX:    Wrap check_sleepers in hal_save_irq / hal_restore_irq.
-          Also: sleeping threads are NOT in the run queue (C1/C7 from
-          initial audit), so check_sleepers must iterate the GLOBAL
-          thread list instead (which also needs cli — see C5).
-
-  C5 ─ sched_foreach iterates global thread list WITHOUT cli [sched.c:47-54]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_foreach follows all_next pointers without disabling
-          interrupts. Called from shell's ps command (thread context).
-          If an ISR triggers thread_exit during iteration, the node
-          being followed is freed → dangling pointer → crash.
-
-  FIX:    Wrap with hal_save_irq:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ void sched_foreach(...) {                                    │
-          │     if (!cb) return;                                        │
-          │     cpu_flags_t flags = hal_save_irq();                     │
-          │     thread_t* t = all_threads_head;                         │
-          │     while (t) {                                             │
-          │         thread_t* next = t->all_next;  // snap now         │
-          │         cb(t, ctx);                                         │
-          │         t = next;                                           │
-          │     }                                                       │
-          │     hal_restore_irq(flags);                                 │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-
-  C6 ─ next_thread_id non-atomic increment [sched.c:9,237]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    next_thread_id++ is a read-modify-write without any protection.
-          Two threads calling thread_create concurrently (preemption
-          between read and write) can get the SAME thread ID.
-
-  FIX:    Use __sync_fetch_and_add or protect with cli:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ cpu_flags_t flags = hal_save_irq();                         │
-          │ tcb->id = next_thread_id++;                                 │
-          │ hal_restore_irq(flags);                                     │
-          └──────────────────────────────────────────────────────────────┘
-
-  C7 ─ thread_sleep permanently blocks threads [sched.c:274-282]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    thread_sleep() sets state=THREAD_SLEEPING, calls thread_yield()
-          → schedule(). schedule() checks "if state==RUNNING" → no, so
-          thread is NOT re-added to run queue. Later, check_sleepers()
-          iterates run_queues[] but the sleeping thread is not in any
-          queue. Result: thread sleeps forever, never woken.
-
-  FIX:    Change check_sleepers to iterate the global thread list
-          (all_threads_head) instead of run_queues[]. When a sleeping
-          thread's wakeup_tick has passed, set state=THREAD_READY and
-          sched_add_thread() to re-add to run queue.
-
-  C8 ─ kprintf %x calls kprintf recursively [klib.c:93]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    %x handler calls kprintf("0x") which recursively enters
-          kprintf, corrupting the outer va_list via __builtin_va_arg.
-          All subsequent format args (%d, %s, %lu) read wrong values.
-
-  FIX:    Replace kprintf("0x") with kputs("0x") + local hex output:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ case 'x':                                                  │
-          │     kputs("0x");                                           │
-          │     int shift = 60;                                        │
-          │     while (shift > 0 && !((v>>shift)&0xF)) shift -= 4;    │
-          │     for (int i = shift; i >= 0; i -= 4)                   │
-          │         kputchar(hexdigits[(v >> i) & 0xF]);               │
-          │     break;                                                 │
-          └──────────────────────────────────────────────────────────────┘
-
-  C9 ─ pmm_alloc_pages TOCTOU race [pmm.c:56-89]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    Scans bitmap for contiguous free pages, then allocates them.
-          Between scan and allocation, another thread (preemption) can
-          claim pages in the gap → overlapping allocation.
-
-  FIX:    Wrap entire scan+allocate with hal_save_irq.
-          (Covered by C1 fix — all PMM ops must be serialized.)
-
-  C10 ─ thread_set_priority removes from wrong queue [sched.c:299-304]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_remove_thread(t) uses t->priority to find run queue.
-          If priority was already changed, it searches the NEW queue
-          but the thread is still in the OLD queue.
-
-  FIX:    Save old priority before modifying:
-          int old_prio = t->priority;
-          // Use old_prio for sched_remove_thread,
-          // then set t->priority = new_prio, then sched_add_thread.
-
-  C11 ─ hal_save_irq missing memory barriers [hal.c:96-105]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    asm volatile("cli") lacks "memory" clobber. Compiler can
-          reorder memory operations across the cli.
-  FIX:    asm volatile("cli" : : : "memory");
-
-  C12 ─ timer_ticks * 1e9 overflows after ~7 months uptime [hal.c:236]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    hal_timer_get_ns(): (timer_ticks * 1000000000ULL) / timer_hz.
-          timer_ticks is uint64_t. At 1000 Hz, ticks reach 2^64 / 1e9
-          ≈ 1.8e10 after ~7 months, causing multiplication overflow.
-          After overflow, result wraps to small value → bogus ns.
-
-  FIX:    Use 128-bit arithmetic (GCC __int128) or reduce precision:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ uint64_t hal_timer_get_ns(void) {                           │
-          │     unsigned __int128 ns = (unsigned __int128)timer_ticks   │
-          │                         * 1000000000ULL;                    │
-          │     return (uint64_t)(ns / timer_hz);                       │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-
-  C13 ─ Spinlock_acquire doesn't disable interrupts [sync.c:11-28]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    On UP with preemption: thread A holds spinlock, gets preempted,
-          thread B spins forever → DEADLOCK. Classic UP bug.
-
-  FIX:    Spinlock_acquire must cli; spinlock_release must sti.
-          Add cpu_flags_t saved_flags field to spinlock_t:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ void spinlock_acquire(spinlock_t* lock) {                   │
-          │     lock->saved_flags = hal_save_irq();  // cli + save     │
-          │     while (__sync_lock_test_and_set(&lock->lock, 1))       │
-          │         while (lock->lock) asm volatile("pause");          │
-          │     lock->holder = current_thread ? current_thread->id : 0;│
-          │     asm volatile("" ::: "memory");                         │
-          │ }                                                          │
-          │ void spinlock_release(spinlock_t* lock) {                  │
-          │     asm volatile("" ::: "memory");                         │
-          │     lock->holder = 0;                                      │
-          │     __sync_lock_release(&lock->lock);                      │
-          │     hal_restore_irq(lock->saved_flags);                    │
-          │ }                                                          │
-          └──────────────────────────────────────────────────────────────┘
-          ┌──────────────────────────────────────────────────────────────┐
-          │ cpu_flags_t hal_save_irq(void) {                            │
-          │     cpu_flags_t flags;                                      │
-          │     asm volatile("pushfq; popq %0; cli" : "=r"(flags)      │
-          │                  : : "memory");                             │
-          │     return flags;                                           │
-          │ }                                                           │
-          │ void hal_restore_irq(cpu_flags_t flags) {                  │
-          │     if (flags & 0x200)                                      │
-          │         asm volatile("sti" : : : "memory");                 │
-          │ }                                                           │
-           └──────────────────────────────────────────────────────────────┘
-
-  C14 ─ sched_block doesn't remove thread from run queue [sched.c:306-317]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_block sets state=THREAD_BLOCKED and adds thread to wait
-          queue, but does NOT call sched_remove_thread(). The thread
-          REMAINS in the run queue. pick_next() can select a BLOCKED
-          thread as the next to run → thread runs while blocked, wait
-          queue invariant broken, corrupted wakeup semantics.
-
-  FIX:    Call sched_remove_thread(current_thread) BEFORE adding to
-          wait queue:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ void sched_block(wait_queue_t* wq) {                         │
-          │     if (!wq || !current_thread) return;                      │
-          │     cpu_flags_t flags = hal_save_irq();                      │
-          │     current_thread->state = THREAD_BLOCKED;                  │
-          │     sched_remove_thread(current_thread);  // ← ADD THIS     │
-          │     current_thread->next = wq->waiters;                      │
-          │     wq->waiters = current_thread;                            │
-          │     wq->count++;                                             │
-          │     hal_restore_irq(flags);                                  │
-          │     schedule();                                              │
-          │ }                                                            │
-          └──────────────────────────────────────────────────────────────┘
-          NOTE: sched_remove_thread must be called BEFORE the thread is
-          added to the wait queue (otherwise the run queue's next/prev
-          pointers conflict with wait queue's next pointer — they share
-          the same field `thread_t->next`).
-
-  C15 ─ eventbus_dispatch calls callbacks while holding spinlock [eventbus.c:125-133]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    eventbus_dispatch locks eventbus_lock, finds a pending event,
-          then iterates subscribers calling their callbacks WHILE still
-          holding the lock. If any subscriber callback calls
-          eventbus_publish() (directly or indirectly), it tries to
-          acquire eventbus_lock → DEADLOCK (spinlock held by dispatcher
-          on the same CPU, which will never release).
-
-  FIX:    Copy the event out from the pending queue under lock, release
-          the lock, then call callbacks:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ // In eventbus_dispatch:                                     │
-          │ spinlock_acquire(&eventbus_lock);                            │
-          │ // find pending event idx ...                                │
-          │ event_t ev = pending_events[idx].event;  // copy            │
-          │ pending_events[idx].valid = 0;                               │
-          │ pending_count--;                                             │
-          │ spinlock_release(&eventbus_lock);     // release BEFORE     │
-          │                                                             │
-          │ // Now call callbacks WITHOUT holding the lock:              │
-          │ for (int i = 0; i < MAX_SUBSCRIBERS; i++) {                 │
-          │     if (subscribers[i].active &&                             │
-          │         subscribers[i].type == ev.type) {                    │
-          │         subscribers[i].callback(&ev, subscribers[i].context);│
-          │     }                                                       │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-          Note: the subscriber iteration is now RACY (no lock) — a
-          subscriber could be unsubscribed mid-iteration. For now,
-          acceptable (UP, rare). If needed, use a reader-writer lock
-          or RCU-style protection.
-
-  C16 ─ schedule() loses current_thread when next == current_thread [sched.c:161-191]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    pick_next() physically dequeues the selected thread from the
-          run queue before returning it. schedule() then checks
-          if (next == current_thread) and returns early — but NEVER
-          re-adds the thread back to the queue. current_thread is now
-          running but permanently missing from every scheduling
-          structure. Next time it yields or is preempted it will never
-          be selected again. The thread leaks into limbo.
-
-  FIX:    Re-add before early return:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ if (next == current_thread) {                               │
-          │     sched_add_thread(next);   // put it back                │
-          │     hal_restore_irq(flags);                                 │
-          │     return;                                                 │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-
-  C17 ─ idle_thr gets permanently dequeued and lost [sched.c:138-158,161-191]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    idle_thr is added to run_queues[0] at init. When pick_next
-          finds no higher-priority thread, it dequeues idle_thr from
-          run_queues[0] and returns it. schedule() sees
-          next == idle_thr && current != idle_thr and returns early
-          WITHOUT re-adding idle_thr. After the first idle fallback,
-          idle_thr is gone from the queue forever. The idle thread still
-          runs (as current_thread) but once any real thread wakes up
-          and the idle thread tries to go back through schedule(), it
-          can never be selected again as a fallback.
-
-  FIX:    idle_thr should never be in the run queue. pick_next should
-          return it as a sentinel only via the prio < 0 path (queue
-          empty), never by dequeuing it:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ static thread_t* pick_next(void) {                          │
-          │     int prio = bitmap_find_highest();                       │
-          │     if (prio < 0) return idle_thr;                          │
-          │     run_queue_t* q = &run_queues[prio];                     │
-          │     if (!q->head) return idle_thr;                          │
-          │     thread_t* t = q->head;                                  │
-          │     if (t == idle_thr) return idle_thr;  // ← guard        │
-          │     /* dequeue t ... */                                      │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-          Also: sched_init should NOT add idle_thr to run_queues[0].
-
-  C18 ─ init thread has NULL func — trampoline will crash if reached [sched.c:211-250]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_init creates current_thread with thread_create(NULL,
-          NULL, ...). thread_create builds the stack frame with
-          thread_trampoline as return address and NULL as func (r15).
-          If execution ever reaches thread_trampoline for the init
-          thread — e.g. if kmain returns, or if thread_exit is called
-          on init — call *%r15 = call 0x0 → page fault at address 0.
-
-  FIX:    Add a null check in thread_trampoline:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ thread_trampoline:                                          │
-          │     testq %r15, %r15                                       │
-          │     jz .Lnull_func_panic                                    │
-          │     movq %r14, %rdi                                         │
-          │     call *%r15                                              │
-          │     movq %rax, %rdi                                         │
-          │     call thread_exit                                        │
-          │ .Lnull_func_panic:                                          │
-          │     movq $thread_null_msg, %rdi                             │
-          │     call kpanic                                             │
-          └──────────────────────────────────────────────────────────────┘
-
-  C19 ─ eventbus_publish ring buffer index overwrites valid events [eventbus.c:74-95]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    The slot index is (event_count + pending_count) % MAX.
-          event_count is the total events ever published, never reset.
-          After 64+ events, this formula overwrites valid=1 slots that
-          haven't been dispatched yet, silently dropping events. The
-          dispatch loop does a linear scan for the first valid=1 slot
-          rather than maintaining insertion order, so delivery is not
-          FIFO even when it works.
-
-  FIX:    Use a proper ring buffer with explicit head/tail indices:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ static int queue_head = 0;  // dequeue from here            │
-          │ static int queue_tail = 0;  // enqueue here                 │
-          │ // publish: slot = queue_tail;                              │
-          │ //           queue_tail = (queue_tail + 1) % MAX_PENDING    │
-          │ // dispatch: slot = queue_head;                             │
-          │ //           queue_head = (queue_head + 1) % MAX_PENDING    │
-          └──────────────────────────────────────────────────────────────┘
-
-  C20 ─ kprintf %u prints large uint64_t as negative [klib.c:80-87]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    %u handler calls kprint_int64((int64_t)v, ...). kprint_int64
-          treats its argument as signed. Any uint64_t value above
-          0x7FFFFFFFFFFFFFFF (~9.2×10¹⁸) gets reinterpreted as negative
-          and printed with a minus sign. meminfo and top show wrong
-          numbers for large memory sizes.
-
-  FIX:    Add a separate kprint_uint64 function for %u/%lu/%llu:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ static void kprint_uint64(uint64_t v, int pad) {            │
-          │     char buf[24]; int pos = 0;                              │
-          │     if (v == 0) { buf[pos++] = '0'; }                      │
-          │     while (v > 0) { buf[pos++] = hexdigits[v % 10]; v/=10;}│
-          │     while (pos < pad) buf[pos++] = '0';                    │
-          │     for (int i = pos-1; i >= 0; i--) kputchar(buf[i]);     │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-
-  C21 ─ mutex_unlock has no ownership check — any thread can unlock [sync.c:70-79]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    mutex_unlock doesn't verify that current_thread->id ==
-          m->owner_tid. Any thread can call mutex_unlock on a mutex it
-          doesn't own, clearing locked=0 and waking all waiters while
-          the actual owner is still in its critical section. Mutual
-          exclusion completely breaks.
-
-  FIX:    Add ownership check:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ if (current_thread && m->owner_tid != current_thread->id)   │
-          │     return ERR_PERM;                                        │
-          └──────────────────────────────────────────────────────────────┘
-
-  C22 ─ sched_block must call sched_remove_thread (clarity & fix) [sched.c:306-317]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_block sets state=THREAD_BLOCKED and links the thread
-          into the wait queue via t->next, but never calls
-          sched_remove_thread. Since the RUNNING thread is not in the
-          run queue (dequeued by pick_next), this doesn't cause
-          immediate corruption — but it's a landmine: any future code
-          path that calls sched_block on a READY thread (not currently
-          running) will leave it in both the run queue and the wait
-          queue simultaneously. When sched_wake re-adds it, it will be
-          in the run queue twice, corrupting the doubly-linked list.
-
-  FIX:    Always call sched_remove_thread(current_thread) at the top
-          of sched_block, guarded by state check:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ if (current_thread->state == THREAD_RUNNING ||              │
-          │     current_thread->state == THREAD_READY)                  │
-          │     sched_remove_thread(current_thread);                    │
-          └──────────────────────────────────────────────────────────────┘
-          NOTE: Duplicates C14 but with the READY-state guard. C14
-          covers the conceptual fix; C22 adds the precise guard.
-
-
-================================================================================
-   4. HIGH PRIORITY ISSUES
-================================================================================
-
-  H1 ─ PIC mask enables IRQ1 (keyboard) [hal.c:189]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    outb(PIC1_DATA, 0xFD) = 0b11111101 → bit 1 = 0 = UNMASKED.
-          Keyboard IRQ1 is enabled with no handler installed.
-  FIX:    Use 0xFB (mask all except cascade IRQ2):
-          outb(PIC1_DATA, 0xFB);
-
-  H2 ─ check_sleepers dead code (blocked by C1) [sched.c:336-355]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    Sleeping threads are not in run queues, so check_sleepers
-          never finds them. Dead code until C1 is fixed.
-  FIX:    (See C1 fix — iterate global thread list instead)
-
-  H3 ─ Shell busy-waits UART in polling mode [shell.c:386-418]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    shell_run() spins calling hal_uart_data_available() then
-          thread_yield(), burning CPU even when idle.
-  FIX:    Option A: Switch to interrupt-driven UART (IRQ4). When
-          character arrives, ISR adds to ring buffer, wakes shell thread.
-          Option B: Inline the yield+check loop more aggressively
-          (currently does 2 checks per loop iteration).
-          Recommended: For now, add a "halt until interrupt" instruction
-          (sti; hlt) in the wait loop after thread_yield(), with the
-          timer interrupt ensuring wakeup within 1ms.
-
-  H4 ─ sched_foreach unsafe under concurrent modification [sched.c:47-54]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_foreach iterates the global thread list. If thread
-          creation or reaping happens concurrently (via preemption),
-          the list pointer chain can be modified mid-iteration.
-  FIX:    Disable interrupts around the iteration:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ void sched_foreach(void (*cb)(thread_t*,void*), void* ctx){ │
-          │     if (!cb) return;                                        │
-          │     cpu_flags_t flags = hal_save_irq();                     │
-          │     thread_t* t = all_threads_head;                         │
-          │     while (t) {                                             │
-          │         thread_t* next = t->all_next;   // snap next now   │
-          │         cb(t, ctx);                                         │
-          │         t = next;                                           │
-          │     }                                                       │
-          │     hal_restore_irq(flags);                                 │
-          │ }                                                           │
-          └──────────────────────────────────────────────────────────────┘
-
-  H5 ─ PMM free-list LIFO causes fragmentation [pmm.c:100-102]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    Free list adds/removes from head (LIFO). Always reuses the
-          most recently freed page. Over time, low addresses sit idle.
-  FIX:    Option A: Use a buddy allocator on top of the bitmap.
-          Option B: Periodically defragment (compact allocations).
-          Option C: For now, change pmm_alloc_page to search the free
-          list for the LOWEST address (minimize fragmentation).
-
-  H6 ─ Double-free not fully prevented [pmm.c:91-102]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    pmm_free_page checks bitmap_test, then clears bitmap, then
-          adds to free list. Between test and clear, another free_page
-          call (from another thread) might pass the test too.
-  FIX:    Wrap pmm_free_page in hal_save_irq / hal_restore_irq.
-
-  H7 ─ VMM uses physical addresses directly [vmm.c:23-47]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    get_entry accesses page table entries by physical address.
-          The first 512MB is identity-mapped by boot.S, so physical
-          addresses < 0x20000000 work. But if a page table is allocated
-          above 512MB (which vmm_alloc_page_table does via pmm), the
-          physical address won't be accessible in the higher half.
-  FIX:    Map all allocated page tables into the higher half kernel
-          region (e.g., at a fixed VA like 0xFFFFFFFE00000000) or
-          ensure page tables are always allocated from the first 512MB.
-
-  H8 ─ Idle thread STI-HLT race [sched.c:363]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    asm volatile("sti; hlt; cli") — if an interrupt fires between
-          sti and hlt, the hlt will execute with IF=1 and wait until
-          the NEXT interrupt (could be up to 1ms for timer). In theory
-          the x86 guarantees that after sti, one more instruction runs
-          before the interrupt is taken. So hlt runs with IF=0 for that
-          one instruction, then the interrupt is delivered. If the
-          interrupt is pending when hlt executes, it wakes immediately.
-          Actually, x86 guarantees interrupts are taken AFTER the
-          instruction following sti completes. So hlt executes with
-          interrupts still disabled, then the pending interrupt wakes
-          it immediately. Then cli runs. This is correct but subtle.
-  FIX:    Add a comment explaining the STI shadow.
-
-  H9 ─ thread_sleep formula is a no-op identity — hardcoded to timer freq [sched.c:276]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    wake_tick = hal_timer_get_ticks() + (ms * 1000 / 1000). The
-          *1000/1000 cancels to ms. Intended: ms * timer_hz / 1000.
-          At timer_hz=1000 this accidentally works. If timer_hz changes
-          (see Phase 2: HPET at different rates), sleep durations break.
-
-  FIX:    ms * hal_timer_get_hz() / 1000  (need to add hal_timer_get_hz)
-
-  H10 ─ sched_reap_zombies calls PMM without IRQ protection [sched.c:60-77]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    sched_reap_zombies called from idle thread calls pmm_free_pages
-          and pmm_free_page. Even after audit C1 fix (PMM internal cli),
-          the reaper must be called only when safe — or PMM's own locking
-          must cover it. Currently PMM has zero synchronization.
-
-  FIX:    Wrap the entire reaper body in hal_save_irq/hal_restore_irq,
-          or rely on PMM internal locking after C1 is fixed.
-
-  H11 ─ eventbus_dispatch TOCTOU on subscriber table between callbacks [eventbus.c:125-133]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    The dispatch loop releases the spinlock, calls a callback,
-          then re-acquires for the next subscriber. Between release and
-          re-acquire, another thread can call eventbus_unsubscribe,
-          shifting or invalidating subscribers. The loop index i now
-          points at a wrong or freed entry.
-
-  FIX:    Snapshot the matching subscriber list under lock before
-          calling any callbacks:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ // Build a local list of matching callbacks under lock:      │
-          │ spinlock_acquire(&eventbus_lock);                            │
-          │ event_t ev = pending_events[head].event;                     │
-          │ pending_events[head].valid = 0;                              │
-          // (advance head) ...
-          │ // — or use a fixed-size array of callbacks to fire:         │
-          │ struct { event_callback_t cb; void* ctx; } to_fire[32];      │
-          │ int n = 0;                                                   │
-          │ for (int i = 0; i < MAX_SUBSCRIBERS && n < 32; i++) {       │
-          │     if (subscribers[i].active && ...) {                      │
-          │         to_fire[n].cb = subscribers[i].callback;             │
-          │         to_fire[n].ctx = subscribers[i].context;             │
-          │         n++;                                                 │
-          │     }                                                        │
-          │ }                                                            │
-          │ spinlock_release(&eventbus_lock);                            │
-          │ for (int i = 0; i < n; i++) to_fire[i].cb(&ev, to_fire[i].ctx);│
-          └──────────────────────────────────────────────────────────────┘
-
-  H12 ─ kprintf called before hal_init — UART uninitialized on real HW [main.c:23-27]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    kmain calls kprintf (box art) before hal_init(). kputchar
-          busy-waits on UART LSR register. QEMU's 16550 emulation is
-          always ready. On real x86 hardware the UART is in an undefined
-          state until uart_init() programs it. Boot banner silently
-          drops characters or hangs.
-
-  FIX:    Move hal_init() call before any kprintf, or add a minimal
-          early_uart_init() as the very first boot step.
-
-  H13 ─ t->next pointer aliased between run queue and wait queue [sched.h:32]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    thread_t->next is used for THREE different list memberships:
-          run queue (doubly linked), wait queue (singly linked), and
-          sleeping thread list. No type safety prevents a thread from
-          being simultaneously linked into two of these. If sched_block
-          is ever called on a READY thread, t->next = wq->waiters
-          corrupts the run queue's link chain without any warning.
-
-  FIX:    Give thread_t separate pointer fields:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ struct thread* rq_next;   // run queue (doubly linked)      │
-          │ struct thread* rq_prev;   // run queue                      │
-          │ struct thread* wq_next;   // wait queue (singly linked)     │
-          └──────────────────────────────────────────────────────────────┘
-          This is a structural change that prevents an entire class of
-          future bugs.
-
-  H14 ─ cmd_fault OOM test permanently exhausts physical memory [shell.c:285-293]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    cmd_fault option 1 allocates pages in a loop until OOM, then
-          prints "Freed all pages" — but never frees them. After this
-          test, PMM is completely empty. Every subsequent allocation
-          fails. Only recovery is reboot. The message "Freed all pages"
-          is also factually wrong (misreads !page as "freed").
-
-  FIX:    Track allocated pages and free them:
-          ┌──────────────────────────────────────────────────────────────┐
-          │ uint64_t pages[1024]; int np = 0;                           │
-          │ while (np < 1024) {                                         │
-          │     pages[np] = pmm_alloc_page();                           │
-          │     if (!pages[np]) break;                                   │
-          │     np++;                                                    │
-          │ }                                                           │
-          │ for (int i = 0; i < np; i++) pmm_free_page(pages[i]);      │
-          │ kprintf("Allocated and freed %d pages\n", np);              │
-          └──────────────────────────────────────────────────────────────┘
-
-
-================================================================================
-   5. MEDIUM ISSUES
-================================================================================
-
-  M1 ─ PAGE_SIZE defined in two headers [pmm.h:6, types.h:53]
-  FIX:    Remove from pmm.h, include types.h instead.
-
-  M2 ─ thread_trampoline uses undocumented register ABI [ctx.S:29-34]
-  FIX:    Add comment: "r14 = arg, r15 = func, call preserves both"
-
-  M3 ─ Thread init stack has 4 zero values with no comment [sched.c:229-235]
-  FIX:    Add comment: "callee-saved regs (rbx,rbp,r12,r13) — uninitialized"
-
-  M4 ─ hal_uart_putchar duplicate code [hal.c:239-246]
-  FIX:    Make hal_uart_putchar call kputchar (invert the dependency)
-          or just remove hal_uart_putchar entirely.
-
-  M5 ─ Makefile missing -fno-omit-frame-pointer [Makefile:7-11]
-  FIX:    Add -fno-omit-frame-pointer to CFLAGS for stack trace support.
-
-  M6 ─ shell_start_tick declared volatile, never used [shell.c:19]
-  FIX:    Remove.
-
-  M7 ─ schedule_trampoline is dead code [ctx.S:36-40]
-  FIX:    Remove.
-
-  M8 ─ cleanup_arg field unused after preemption redesign [sched.h:40]
-  FIX:    Remove from struct (saves 8 bytes per thread_t).
-
-  M9 ─ watchdog_run called from IRQ context prints UART [watchdog.c:81-113]
-  FIX:    Mark watchdog_run with a flag and print from idle context.
-
-  M10 ─ Boot step numbering hardcoded in kmain [main.c:16-61]
-  FIX:    Use a boot_framework abstraction.
-
-  M11 ─ No bounds check on command table additions [shell.c:303-328]
-  FIX:    Use an enum with count, assert in init.
-
-  M12 ─ thread_join busy-waits burning a full time slice per check [sched.c:290-297]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    thread_join spins calling thread_yield() then checks state.
-          Each iteration costs one time slice (10ms) and a context
-          switch. For long-running threads, this wastes significant CPU
-          and increases latency for other threads.
-
-  FIX:    Add a `wait_queue_t join_waiters` field to thread_t. In
-
-  M13 ─ schedule idle path: pick_next dequeues idle_thr then checks it [sched.c:138-175]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    When only idle_thr is in the run queue, pick_next finds
-          priority 0, dequeues idle_thr, returns it. schedule() then
-          checks next == idle_thr && current != idle_thr and returns
-          without re-adding. Root cause: pick_next should never dequeue
-          idle_thr (see C17).
-  FIX:    Covered by C17 fix (guard in pick_next, don't add idle_thr to
-          run queue at init).
-
-  M14 ─ sched_tick and sched_timer_tick are identical duplicates [sched.c:193-204, 367-377]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    Two functions with identical logic. Both increment
-          total_ticks. If both were ever active, time would double-count.
-          The dead code audit flagged sched_tick as unused but didn't
-          flag the semantic identity — sched_tick must be DELETED.
-
-  FIX:    Remove sched_tick function and its declaration from sched.h.
-
-  M15 ─ thread_create priority clamping is asymmetric [sched.c:241]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    tcb->priority = (priority > THREAD_MAX_PRIO) ? ... : priority;
-          Negative priorities pass through unclamped. sched_add_thread
-          checks t->priority < 0 and silently returns without adding.
-          The thread is created, added to global list, but never
-          scheduled — a permanent ghost thread.
-
-  FIX:    tcb->priority = (priority < 0 || priority > THREAD_MAX_PRIO)
-                           ? THREAD_DEF_PRIO : priority;
-
-  M16 ─ kprintf redundant if (*p == 'l') after while (*p == 'l') [klib.c:68-69]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    The while loop at line 68 already consumes all 'l' prefixes.
-          The next if (*p == 'l') at line 69 can never be true.
-          Unreachable dead code — maintenance hazard.
-
-  FIX:    Remove the redundant if (*p == 'l').
-
-  M17 ─ hal_get_mem_size and pmm_init both parse multiboot independently [hal.c:267-314, pmm.c:131-184]
-  ──────────────────────────────────────────────────────────────────────
-  BUG:    The multiboot memory map is parsed twice: once in
-          hal_get_mem_size (to find max address) and once in pmm_init
-          → parse_mb_mmap (to build free list). Two copies of the
-          struct definitions (multiboot_info_t, mmap_entry_t) that can
-          drift apart. Edge cases in parsing will diverge silently.
-
-  FIX:    Parse once in hal_init, store result in a shared structure
-          (e.g. boot_mem_map_t), pass it to pmm_init. Remove duplicate
-          struct definitions from pmm.c.
-
-
-================================================================================
-   6. LOW / COSMETIC
-================================================================================
-
-  L1 ─ boot.S redundant PML4 entries (0, 510, 511 map same PD)
-  FIX:    Clean up for clarity.
-
-  L2 ─ types.h bool/true/false don't use K_ prefix
-  FIX:    Optional — use kbool/ktrue/kfalse for kernel namespace.
-
-  L3 ─ shell.c includes vmm.h but doesn't use any VMM API
-  FIX:    Remove.
-
-  L4 ─ thread_create initial stack: 4 dummy callee frames
-  FIX:    Add explanatory comment.
-
-  L5 ─ kprintf %x duplicates code from kputhex
-  FIX:    Call kputhex directly: case 'x': kputhex(...); break;
-
-
-================================================================================
-   7. RACE CONDITION INVENTORY (all shared mutable data)
-================================================================================
-
-  Every global/static variable that is written by more than one context,
-  and the protection (if any) covering it.
-
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  DATA STRUCTURE          WRITERS               PROTECTION    RISK           │
-  ├─────────────────────────────────────────────────────────────────────────────┤
-  │  pmm.c: free_list        alloc, free,           NONE (!!)    CRITICAL       │
-  │                          alloc_pages, add_region                            │
-  │  pmm.c: free_page_count  alloc, free,           NONE (!!)    CRITICAL       │
-  │                          mark_region_used                                   │
-  │  pmm.c: used_bitmap[]    bitmap_set/clear,      NONE (!!)    CRITICAL       │
-  │                          pmm_init                                           │
-  │  hal.c: irq_handlers[]   hal_irq_register,      NONE         HIGH           │
-  │                          interrupt_handler (read)  (torn read risk)         │
-  │  hal.c: timer_ticks      interrupt_handler      volatile     LOW (ISR only) │
-  │  sched.c: run_queues[]   sched_add/remove/      cli          OK             │
-  │                          pick_next                                          │
-  │  sched.c: priority_bitmap bitmap_set/clear      cli (via     OK             │
-  │                                                  callers)                   │
-  │  sched.c: next_thread_id thread_create          NONE         HIGH (C6)      │
-  │  sched.c: all_*_head/tail all_threads_add/remove cli         OK             │
-  │  sched.c: current_thread schedule, thread_exit   cli         OK             │
-  │  sched.c: need_reschedule sched_tick, schedule   volatile    OK (x86)       │
-  │  sched.c: check_sleepers  (reads run_queues)     NONE (!!)   CRITICAL (C4)  │
-  │  sched.c: sched_foreach   (reads all_threads)    NONE (!!)   CRITICAL (C5)  │
-  │  eventbus: subscribers[]  subscribe/unsubscribe spinlock    OK (with C13)  │
-  │  eventbus: pending_events[] publish/dispatch     spinlock    OK (with C13)  │
-  │  watchdog: layers[]       register_layer, run    NONE        LOW (init only)│
-  │  watchdog: num_layers     register_layer         NONE        LOW            │
-  ├─────────────────────────────────────────────────────────────────────────────┤
-  │  TOTAL: 17 shared structures   |   5 unprotected |  3 critical races        │
-  └─────────────────────────────────────────────────────────────────────────────┘
-
-
-================================================================================
-   8. INTEGER OVERFLOW & UNDEFINED BEHAVIOR ANALYSIS
-================================================================================
-
-  8.1 — Arithmetic overflows (all uint64_t context)
-
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  EXPRESSION                      FILE:LINE       OVERFLOW AT                │
-  ├─────────────────────────────────────────────────────────────────────────────┤
-  │  timer_ticks * 1000000000ULL     hal.c:236       ~7 months (C12)            │
-  │  (end + PAGE_SIZE - 1) / ...     pmm.c:34        end = UINT64_MAX           │
-  │  (first + j) * PAGE_SIZE         pmm.c:72        first+j > 2^52            │
-  │  phys_addr + i*PAGE_SIZE         pmm.c:107       near top of address space  │
-  │  total * 4 / 1024  (display)     shell.c:78-80   total > 2^62              │
-  │  free * 100 / total  (display)   shell.c:85      OK (free ≤ total)          │
-  │  base_addr + length (mmap)       hal.c:301       malicious boot data (C)    │
-  │  KERNEL_VMA_BASE + P (PHYS_TO..) types.h:50      P > 0x40000000 (1GB)      │
-  │  V - KERNEL_VMA_BASE (VIRT_TO..) types.h:51      V < KERNEL_VMA_BASE        │
-  │  PAGE_ALIGN(UINT64_MAX)          types.h:56      returns 0 (overflow)       │
-  │  sched.c: thread_count * NAME    sched.c:counts  OK (< 2^32)               │
-  │  eventbus: event_count wraps     eventbus.c:25   after 2^64 events         │
-  └─────────────────────────────────────────────────────────────────────────────┘
-
-  FIXES:
-    - timer_ticks: use unsigned __int128 (GCC extension)
-    - pmm.c:34: ensure end < UINT64_MAX - PAGE_SIZE before adding
-    - pmm.c:72: check first+j won't overflow, or limit total_page_count
-    - types.h macros: document preconditions (address < 2^63)
-    - hal.c:301: validate mmap entry before using
-
-  8.2 — Undefined behavior (C standard violations)
-
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  UB                              FILE:LINE       DETAIL                      │
-  ├─────────────────────────────────────────────────────────────────────────────┤
-  │  Shift by negative count          sched.c:80,84   prio%64 is negative for    │
-  │                                                  negative prio → UB         │
-  │  Signed int overflow (negate)     klib.c:33       v = -v when v=INT64_MIN   │
-  │  Strict aliasing violation        klib.c:58-121   va_arg reads through      │
-  │                                                  type-punned pointers       │
-  │  __builtin_clzll(0)               sched.c:90      UNDEFINED (but guarded)   │
-  │  NULL pointer write (test only)   shell.c:297     cmd_fault test #2         │
-  │  Integer division by zero         shell.c:85,125  if total==0, % operation  │
-  │  (implied in checks)                                on zero → fault         │
-  └─────────────────────────────────────────────────────────────────────────────┘
-
-  FIXES:
-    - bitmap_set/clear_prio: ensure prio ≥ 0 before calling, or use unsigned
-    - kprint_int64: handle INT64_MIN as special case
-    - Add -fno-strict-aliasing to CFLAGS
-    - shell.c: guard against total==0 before %
-
-
-================================================================================
-   9. STACK DEPTH ANALYSIS (worst-case measured)
-================================================================================
-
-  9.1 — ISR context (timer IRQ → schedule → context switch)
-
-  LAYER           FRAME CONTENT                    BYTES   CUMULATIVE
-  ──────────────  ───────────────────────────────  ─────   ──────────
-  CPU push        SS,RSP,RFLAGS,CS,RIP,error       40      40
-  ISR stub        vector + error_code               16      56
-  isr_common      15 GP registers                   120     176
-  call handler    return addr                       8       184
-  interrupt_han   local vars (vec, irq)             16      200
-  sched_timer_tk  simple cond(opt)                  8       208
-  watchdog_run    reason[128] + vars                144     352
-  kprintf         va_list+fmt+buf[24]               96      448
-  eventbus_pub    frame + spinlock                  48      496
-  schedule        frame + pick_next tmp             32      528
-  pick_next       local variables                   16      544
-  switch_context  callee-saved regs push            48      592
-
-  TOTAL ISR STACK:  ~592 bytes
-  IST STACK SIZE:   8192 bytes (ist_stack0)
-  HEADROOM:         7600 bytes (92% free)  ✓
-
-  9.2 — Thread context (shell → command → kprintf)
-
-  LAYER           FRAME CONTENT                    BYTES   CUMULATIVE
-  ──────────────  ───────────────────────────────  ─────   ──────────
-  shell_run       line_pos, hist_idx, c, loop      32      32
-  process_line    buf[256] + args[16] (128B)       384     416
-  cmd_*           local uint64 vars                40      456
-  kprintf         va_list + fmt parse              80      536
-  kprint_int64    buf[24] + neg/pos/uv             40      576
-  kputchar        char arg                         8       584
-
-  TOTAL THREAD STACK:  ~584 bytes
-  THREAD STACK SIZE:  16384 bytes
-  HEADROOM:           15800 bytes (96% free)  ✓
-
-  NOTE: No stack guard pages exist. Stack overflow silently corrupts
-        adjacent memory. For embedded/Rust targets, add guard pages
-        (unmapped page below each stack → page fault on overflow).
-
-
-================================================================================
-   10. DEAD CODE & REDUNDANCY INVENTORY
-================================================================================
-
-  10.1 — Unused C functions (29 total)
-
-  FILE              FUNCTION                REASON
-  ────────────────  ──────────────────────  ──────────────────────────────
-  klib.c            kstrlen                 never called
-  klib.c            kstrncmp                never called
-  klib.c            kstrcpy                 never called
-  klib.c            kmemcpy                 never called
-  klib.c            kmemcmp                 never called
-  klib.c            kassert_fail            KASSERT never used
-  hal.c             hal_cli()               never called (extern hal_sti used)
-  hal.c             hal_idt_set_gate()      never called
-  hal.c             hal_irq_unregister()    never called
-  hal.c             hal_uart_putchar()      never called (kputchar used)
-  pmm.c             pmm_debug_dump()        never called
-  vmm.c             vmm_free_page_table()   never called
-  vmm.c             vmm_get_phys()          never called
-  vmm.c             vmm_map_region()        never called
-  vmm.c             vmm_unmap_region()      never called
-  vmm.c             vmm_flush_tlb()         never called
-  vmm.c             vmm_switch_pml4()       never called
-  sched.c           sched_tick()            obsoleted by sched_timer_tick
-  sched.c           thread_sleep()          never called (broken C1/C7)
-  sched.c           thread_wake()           never called (C1/C7 blocks)
-  sched.c           thread_join()           never called
-  sched.c           thread_set_priority()   never called
-  eventbus.c        eventbus_subscribe()    never called
-  eventbus.c        eventbus_unsubscribe()  never called
-  sync.c            spinlock_try_acquire()  never called
-  errno.h           err_str()               never called
-  main.c            watchdog_timer_handler  extern duplicate (in watchdog.h)
-  ctx.S             schedule_trampoline     dead since preemption redesign
-  ctx.S             hal_get_rsp             never called
-
-  10.2 — Unused/Redundant variables, fields, & macros
-
-  SYMBOL                    FILE          SIZE   NOTE
-  ────────────────────────  ────────────  ─────  ─────────────────────────
-  shell_start_tick (static) shell.c        8B    written, never read
-  cleanup_arg (thread_t)    sched.h        8B    preemption redesign orphan
-  kernel_pml4 (static)      vmm.c          8B    assigned & printed, never used
-  ps_ctx.first (struct)     shell.c        4B    declared, never instantiated
-  _text/_rodata/_data/_bss  kernel.h      40B    declared, never referenced
-    start/end symbols
-  bool, ssize_t, intptr_t   types.h        —     defined, never used
-  MAX_PRIORITY, DEFAULT_... types.h        —     superseded by sched.h macros
-  PHYS_TO_VIRT, VIRT_TO_..  types.h        —     never used
-  PAGE_ALIGN, IS_PAGE_ALIGN types.h        —     never used
-  PAGE_NX                   vmm.h          —     never used
-  WATCHDOG_INTERVAL_MS      watchdog.h     —     never used; 1000 hardcoded
-  EV_PAGE_FAULT..EV_TIMER.. eventbus.h     —     8 enum values never used
-
-  TOTAL dead weight: ~80 bytes data + 29 functions + 20 macros/enums
-
-  10.3 — Unused #include directives
-
-  FILE              UNUSED INCLUDE
-  ────────────────  ──────────────────
-  pmm.c             #include "hal.h"
-  vmm.c             #include "hal.h"
-  shell.c           #include "vmm.h"
-  sync.c            #include "hal.h"
-
-  FIX: Remove all unused includes and dead code to reduce binary size
-       and compilation time.
-
-
-================================================================================
-   11. LAYERING (LLN) VIOLATIONS
-================================================================================
-
-  LLN RULE: Layer N calls only Layer N-1. No upward calls, no skipping.
-
-  CURRENT LAYER ASSIGNMENT:
-    L0: boot.S
-    L1: hal.c/h
-    L2: sched.c/h, sync.c/h, ctx.S
-    L4: pmm.c/h, vmm.c/h
-    L(N-1): shell.c/h
-    Cross: eventbus.c/h, watchdog.c/h
-
-  VIOLATIONS:
-
-  1. VIOLATION: sched.c includes pmm.h (Layer 2 → Layer 4, UPWARD)
-     ──────────────────────────────────────────────────────────────────
-     LOCATION: sched.c:3 (#include "pmm.h")
-     FUNCTION: thread_create calls pmm_alloc_page, pmm_free_page,
-               pmm_alloc_pages
-     PROBLEM: L2 (scheduler) should NOT call L4 (PMM). PMM is above
-              scheduler in the layer hierarchy.
-     FIX: Introduce a memory allocation interface at L1 (HAL) or L2 that
-          PMM implements (inversion of control). OR swap layers so PMM
-          is below scheduler (L0). Recommended: move allocator to L0.
-
-  2. VIOLATION: sched.c includes eventbus.h (Layer 2 → Cross, UPWARD)
-     ──────────────────────────────────────────────────────────────────
-     LOCATION: sched.c:5 (#include "eventbus.h")
-     FUNCTION: idle_thread calls eventbus_dispatch
-     PROBLEM: Idle thread shouldn't depend on event bus.
-     FIX: Register idle hook via callback (eventbus_register_idle_hook).
-          Or accept cross-cutting dependency as intentional (maintainer
-          decision).
-
-  3. NOT a violation (but fragile):
-     eventbus.c includes sync.h (Cross → L2)
-     watchdog.c includes sched.h, pmm.h, eventbus.h (Cross → all lower)
-     These are cross-cutting by design. Acceptable.
-
-  4. UNNECESSARY includes (not violations, but misleading):
-     pmm.c includes hal.h (uses nothing from HAL)
-     vmm.c includes hal.h (uses nothing from HAL)
-     shell.c includes vmm.h (uses nothing from VMM)
-     sync.c includes hal.h (uses nothing from HAL)
-     FIX: Remove these includes.
-================================================================================
-
-  PHASE 1 — Hardening & Bug Fixes (immediate — ~1 week)
-  ───────────────────────────────────────────────────────────────────────
-  [ ] Fix C1: PMM synchronization — wrap all alloc/free with hal_save_irq
-  [ ] Fix C2: irq_handlers[] barrier — add memory fence in register
-  [ ] Fix C3: schedule() re-enables IRQs before switch_context — move
-              hal_restore_irq after switch_context
-  [ ] Fix C4: check_sleepers cli — wrap iteration, change to use
-              all_threads list instead of run_queues
-  [ ] Fix C5: sched_foreach cli — wrap with hal_save_irq
-  [ ] Fix C6: next_thread_id atomic — use __sync_fetch_and_add
-  [ ] Fix C7: thread_sleep → check_sleepers uses global list,
-              woken threads re-added to run queue
-  [ ] Fix C8: kprintf %x → replace recursive kprintf with kputs + local loop
-  [ ] Fix C9: pmm_alloc_pages TOCTOU (covered by C1)
-  [ ] Fix C10: thread_set_priority → save old priority before removal
-  [ ] Fix C11: hal_save_irq → add "memory" clobber
-  [ ] Fix C12: timer_ticks overflow → use unsigned __int128 multiplication
-  [ ] Fix C13: spinlock_acquire → disable interrupts (cli)
-  [ ] Fix C14: sched_block → call sched_remove_thread before adding to wq
-  [ ] Fix C15: eventbus_dispatch → copy event under lock, release, then call callbacks
-  [ ] Fix H1: PIC mask → 0xFB (mask keyboard IRQ1)
-  [ ] Fix H4: sched_foreach cli (covered by C5)
-  [ ] Fix H6: pmm_free_page atomic (covered by C1)
-  [ ] Fix H8: idle STI-HLT race → add monitor/mwait support
-  [ ] Fix M1: remove duplicate PAGE_SIZE from pmm.h
-  [ ] Fix M7/M8: remove schedule_trampoline, cleanup_arg
-  [ ] Fix LLN: remove unused includes (pmm.c→hal.h, vmm.c→hal.h,
-              shell.c→vmm.h, sync.c→hal.h)
-  [ ] Fix race: sched_thread_count should disable interrupts when reading
-  [ ] All changes tested with: demo + compute + mutex + event + cleanup
-       + stress (20 threads + 100 events + mutex 5×50)
-
-  PHASE 2 — Performance & Determinism (anti-lag)
-  ───────────────────────────────────────────────────────────────────────
-  [ ] Priority inheritance for mutexes (avoid priority inversion)
-  [ ] add scheduler statistics: context switch count, idle %, latency
-  [ ] Per-thread time accounting (user/system/in-kernel time)
-  [ ] Preemption disable hints for spinlock holders (critical sections)
-  [ ] Timer: switch from PIT (1000Hz) to HPET or LAPIC timer for higher
-      precision and lower overhead
-  [ ] Thread-local storage (TLS) via MSR GS.base / FS.base
-  [ ] O(1) scheduler: replace bitmap scan with per-priority linked lists
-      (already done — just need to verify bitmap_find_highest is O(1))
-  [ ] Lock-free SPMC queue for event bus (remove spinlock contention)
-  [ ] Idle thread power management: deeper C-states, MWAIT instead of HLT
-
-  PHASE 3 — Heavy-Task Optimizations
-  ───────────────────────────────────────────────────────────────────────
-  [ ] Fix M12: thread_join → use wait queue instead of busy-loop
-  [ ] Multi-level feedback queue (MLFQ) scheduling
-  [ ] Deadlock detection in mutex/semaphore operations
-  [ ] Memory compaction: defragment physical pages during idle
-  [ ] Stack guard pages (guard page below each thread stack → detect overflow)
-  [ ] OOM handler with per-thread memory caps
-  [ ] Cooperative OOM killer: suspend lowest-priority allocator
-  [ ] Lightweight IPC: shared memory ring buffers with seqno ordering
-  [ ] Interrupt coalescing for high-frequency IRQs (like virtio)
-  [ ] Batch TLB invalidation (reduce IPI cost for future SMP)
-  [ ] vDSO-style syscall optimization for RDTSC-based time queries
-  [ ] Cache-line aligned structures to prevent false sharing
-
-  PHASE 4 — Hardening & Feature Completion
-  ───────────────────────────────────────────────────────────────────────
-  [ ] SMP support: per-CPU run queues, spinlock, IPI for reschedule
-  [ ] User mode (rings 3) with KPTI page table switching
-  [ ] System call interface (syscall/sysret or int 0x80)
-  [ ] Virtual memory: demand paging, copy-on-write, mmap
-  [ ] ELF loader with module support
-  [ ] DMA-safe memory allocator (physically contiguous + aligned)
-  [ ] ACPI: parse tables, HPET, power management
-  [ ] PCI enumeration + MSI/MSI-X support
-  [ ] Device driver framework with interrupt-safe design
-  [ ] tmpfs / initramfs
-  [ ] Network stack (lwIP integration or custom)
-
-
-================================================================================
-   8. ANTI-LAG & HEAVY-TASK DESIGN PRINCIPLES
-================================================================================
-
-  These principles should guide ALL future code in this project:
-
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  PRINCIPLE 1: DETERMINISTIC SCHEDULING                              │
-  │                                                                      │
-  │  No O(n) iteration in scheduler hot path. pick_next() must be        │
-  │  O(1). Currently uses bitmap_find_highest which is O(4) = O(1).     │
-  │  Maintain this invariant.                                            │
-  │                                                                      │
-  │  Context switch latency must be bounded (<1000 cycles).              │
-  │  switch_context currently takes 6 pushes + 6 pops + 2 reads +       │
-  │  1 write = ~15 instructions + 2 cache misses. Target: <500 cycles.  │
-  │                                                                      │
-  │  Time slicing must not degrade under load.                           │
-  │  THREAD_TIME_SLICE = 10ms. Each thread gets EXACTLY 10ms before     │
-  │  reschedule. No priority boosting unless explicitly requested.       │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  PRINCIPLE 2: ZERO-COPY / ZERO-ALLOC IN HOT PATHS                   │
-  │                                                                      │
-  │  The interrupt handler (isr_common_handler) must never allocate      │
-  │  memory. Currently it doesn't — verifies this invariant.            │
-  │                                                                      │
-  │  The scheduler must never allocate memory. schedule() only uses      │
-  │  stack and existing structures.                                      │
-  │                                                                      │
-  │  Event bus publish: uses a pre-allocated fixed-size queue.           │
-  │  MAX_PENDING_EVENTS = 64. MUST NOT grow. If queue full, drop        │
-  │  oldest event (or return ERR_BUSY — never OOM).                     │
-  │                                                                      │
-  │  shell input: pre-allocated line buffer (256 bytes).                 │
-  │  History: pre-allocated array (16 × 256 = 4KB).                      │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  PRINCIPLE 3: BOUNDED QUEUE DEPTH                                   │
-  │                                                                      │
-  │  Every queue in the system has a MAX capacity:                       │
-  │    - Run queue: unbounded (number of threads) — OK                   │
-  │    - Event bus: 64 entries                                           │
-  │    - Wait queue: unbounded (threads blocked on mutex) — OK          │
-  │    - Shell input buffer: 256 bytes                                   │
-  │    - Watchdog layers: 16                                             │
-  │    - IRQ handlers: 48                                                │
-  │                                                                      │
-  │  When any queue is full, the producer must either:                   │
-  │    a) Block until space available (push-back)                        │
-  │    b) Return error (push-fail)                                       │
-  │    c) Drop oldest entry (push-drop)                                  │
-  │  NEVER allow unbounded growth.                                       │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  PRINCIPLE 4: NO HEAP, NO ALLOCATOR FRAGMENTATION                    │
-  │                                                                      │
-  │  All allocations are page-granularity (4KB). pmm_alloc_page always   │
-  │  returns PAGE_SIZE bytes. This eliminates heap fragmentation.        │
-  │                                                                      │
-  │  For sub-page allocations (thread_t = 184 bytes), waste is real:     │
-  │  184 / 4096 = 4.5% utilization. Consider a slab allocator for       │
-  │  fixed-size kernel objects: thread blocks (thread_t), mutexes,       │
-  │  wait_queue entries. Slab allocator can pack objects densely         │
-  │  within a page, reducing both waste and cache misses.                │
-  │                                                                      │
-  │  CURRENT WASTE: Each thread_t wastes 4096 − 184 = 3912 bytes/page.  │
-  │  For 50 threads: 200KB wasted. Slab would reduce to ~1 page.        │
-  │                                                                      │
-  │  Target: slab allocator for objects < PAGE_SIZE/2.                   │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  PRINCIPLE 5: CACHE-AWARE DATA LAYOUT                               │
-  │                                                                      │
-  │  thread_t is 184 bytes — spans 3 cache lines (typical 64-byte lines).│
-  │  Frequently accessed fields (id, rsp, state, priority, next, prev)  │
-  │  should be packed in the first 64 bytes. Move infrequently accessed │
-  │  fields (name, kernel_stack, exit_code) to the later part.          │
-  │                                                                      │
-  │  run_queue_t is hot (checked on every schedule). Keep it aligned     │
-  │  to avoid false sharing with other queues when SMP arrives.         │
-  │                                                                      │
-  │  PMM bitmap: 512MB / 4KB = 131072 bits = 16KB. Fits in 4 pages.    │
-  │  Not hot (only touched on alloc/free). No optimization needed.      │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  PRINCIPLE 6: INSTRUMENT EVERYTHING                                  │
-  │                                                                      │
-  │  Every major subsystem must expose counters:                         │
-  │    - Scheduler: context switches, preemptions, yields, idle %        │
-  │    - PMM: allocations, frees, OOM events                             │
-  │    - Event bus: published, dispatched, dropped                       │
-  │    - Watchdog: health checks passed/failed                           │
-  │    - HAL: timer ticks, IRQ counts by vector                          │
-  │                                                                      │
-  │  Use uint64_t atomics (locked add) or per-CPU counters for SMP.     │
-  │  Expose via /dev/stats or shell command.                             │
-  └──────────────────────────────────────────────────────────────────────┘
-
-
-================================================================================
-   9. RUST PORT STRATEGY
-================================================================================
-
-  GOAL: Port the entire kernel from C to Rust for embedded targets
-        (ARM Cortex-M, RISC-V RV32/RV64) with minimal footprint.
-
-  WHY RUST:
-    - Memory safety without GC (no use-after-free, no double-free)
-    - No undefined behavior (no dangling pointers, no buffer overflows)
-    - Fearless concurrency (ownership model prevents data races)
-    - Zero-cost abstractions (no runtime, no hidden allocations)
-    - C FFI compatibility for gradual migration
-
-  PORTING PHASES (after C kernel is fully stable — audit findings applied):
-
-  Phase R1 — Core Types & Library (Rust no_std)
-  ────────────────────────────────────────────────────────────────────────
-  [ ] Port types.h → core::types (uint64_t, err_t, etc.)
-  [ ] Port klib.c → core::io (kputchar, kprintf, kputs) — FIXED: no recursive
-  [ ] Port klib.c → core::mem (kmemset, kmemcpy, etc.)
-  [ ] Port errno.h → core::error (err_t enum, err_str)
-  [ ] All pure-C code with no hardware dependency
-  [ ] AUDIT LESSON: Rust's core::fmt eliminates kprintf UB entirely
-
-  Phase R2 — HAL Layer (Rust with inline assembly)
-  ────────────────────────────────────────────────────────────────────────
-  [ ] Port hal.c → hal:: (GDT, IDT, PIC, UART, timer)
-  [ ] Port boot.S → boot:: (entry point, page tables)
-  [ ] Port isr.S → hal::interrupt (ISR stubs, common handler)
-  [ ] Port ctx.S → hal::context (switch_context, trampolines)
-  [ ] Use core::arch::asm! for inline assembly — SAFETY documented per block
-  [ ] AUDIT LESSON: Rust's atomics and memory ordering (+Sync/Send traits)
-      eliminate all 6 race-condition criticals (C1-C6) at compile time.
-      No cli/sti needed — spinlock uses atomic::Ordering::Acquire/Release.
-
-  Phase R3 — Kernel Layers (Rust)
-  ────────────────────────────────────────────────────────────────────────
-  [ ] Port pmm.c → pmm:: (buddy allocator instead of bitmap+free list)
-  [ ] Port vmm.c → vmm:: (4-level page tables, map/unmap)
-  [ ] Port sched.c → sched:: (thread, run queue, scheduler) — FIXED: O(1)
-      bitmap + no TOCTOU races
-  [ ] Port sync.c → sync:: (spinlock with Ordering::AcqRel, mutex)
-  [ ] Port shell.c → shell:: (interactive CLI)
-  [ ] Port eventbus.c → eventbus:: (publish/subscribe with AtomicUsize
-      counters instead of spinlock)
-  [ ] Port watchdog.c → watchdog:: (health monitoring)
-  [ ] AUDIT LESSON: thread_sleep fixed by design (Condvar + atomic state).
-      Mutex timeout fixed by design (Condvar::wait_timeout).
-      Integer overflow impossible with checked/wrapping arithmetic.
-
-  Phase R4 — Embedded Target Adaptation
-  ────────────────────────────────────────────────────────────────────────
-  [ ] Replace HAL with target-specific implementations:
-  [ ] Cortex-M: NVIC instead of PIC, SysTick instead of PIT
-  [ ] RISC-V: CLINT/PLIC, mtime/mcycle
-  [ ] Remove x86-64 specific features (paging, long mode init)
-  [ ] Add stack guard pages (MPU on Cortex-M, PMP on RISC-V)
-  [ ] Add FPGA/ASIC-friendly design: fixed-address peripherals,
-      no MMU (single address space), all sizes configurable at
-      compile time via const generics or feature flags
-  [ ] Size optimization: link-time garbage collection, LTO,
-      panic = abort, no compiler-rt builtins, no float
-  [ ] AUDIT LESSON: Remove ALL dead code (29 functions) to minimize
-      binary. Slab allocator for thread_t/mutex_t (pack 21 objects/page
-      instead of 1/page). Memory waste eliminated.
-
-  Phase R5 — Certification & Verification
-  ────────────────────────────────────────────────────────────────────────
-  [ ] Add formal verification with Kani or Verus for:
-        - Scheduler: pick_next is O(1), no starvation
-        - PMM: no double-free, no overlapping allocations
-        - Spinlock: no deadlock (interrupt-safe lock ordering)
-  [ ] Test with proptest/fuzzcheck for edge-case discovery
-  [ ] Document unsafe{} blocks with SAFETY comments explaining:
-        - Why inline asm is safe (preconditions checked)
-        - Why pointer dereferences are valid (alignment, liveness)
-        - Why memory ordering is correct (which operations pair)
-  [ ] Size budget: < 32KB flash, < 8KB RAM for minimal config
-        (Cortex-M0 with no MMU, no FPU, no atomic instructions)
-  [ ] Real-time: bounded worst-case execution time (WCET) analysis
-        for scheduler, ISR, IPC hot paths
-
-  TARGET EMBEDDED PLATFORMS:
-    - STM32F4 (ARM Cortex-M4, 168MHz, 192KB RAM, 1MB flash)
-    - ESP32-C3 (RISC-V, 160MHz, 400KB RAM)
-    - FPGA soft-CPU: VexRiscv (RISC-V, ~100MHz, ~50 LUTs)
-
-
-================================================================================
-   10. APPENDIX: FILE-BY-FILE NOTES
-================================================================================
-
-  os/src/boot/boot.S  ─── 154 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: PVH .note section, CPUID check, long mode transition, GDT lgdt,
-      page table setup, jump to kmain
-  ISSUES:
-    - Lines 80-86: PML4 entries 0 and 511 both point to same PDPT.
-      Entries 510 and 511 both point to same PD. Redundant.
-    - No .rodata section noted (contents go to .rodata in linker)
-    - Stack is 32KB (32768 bytes). Current max ~10 threads. Should be
-      adequate but monitor.
-
-  os/src/boot/isr.S  ─── 134 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: ISR macros for all 48 vectors + syscall 128. Common handler
-      saves 15 regs, calls interrupt_handler, checks need_reschedule,
-      pops, iretq.
-  ISSUES:
-    - Line 99-101: schedule() called from ISR context. schedule()
-      internally calls hal_save_irq (does cli again - redundant).
-      Works but fragile if schedule() ever enables interrupts.
-
-  os/src/include/types.h  ─── 66 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Standard type aliases, err_t enum, kernel VA macros, page macros
-  ISSUES:
-    - bool/true/false don't follow K_ prefix convention
-
-  os/src/include/errno.h  ─── 33 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Static inline err_str function
-
-  os/src/include/kernel.h  ─── 32 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Function declarations for klib, kassert, kpanic
-
-  os/src/kernel/hal.c  ─── 383 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: GDT setup, IDT with IST for double fault, PIC remap, UART init,
-      PIT timer at 1000Hz, interrupt dispatcher
-  ISSUES:
-    - C6: Missing "memory" clobber in hal_save_irq/restore_irq
-    - H1: PIC mask enables IRQ1 (0xFD should be 0xFB)
-    - M4: hal_uart_putchar duplicates kputchar's \r logic
-    - Line 150: IST=1 for double fault (vec 8) only. Not for NMI (vec 2),
-      GP fault (vec 13), or page fault (vec 14). Consider configuring
-      IST entries for other critical faults to prevent triple faults.
-
-  os/src/kernel/pmm.c  ─── 218 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Bitmap + free list, mark_region_used, alloc/free page(s),
-      parse multiboot memory map, PVH fallback
-  ISSUES:
-    - C3: pmm_alloc_pages TOCTOU race
-    - H6: pmm_free_page TOCTOU race
-    - H5: Free list LIFO causes fragmentation
-    - Line 196-202: Initial bitmap fill (0xFF → clear all) is O(n) where
-      n = total_page_count = 131072. Acceptable for boot (ms range).
-
-  os/src/kernel/vmm.c  ─── 149 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: 4-level page table walk, map/unmap/query, TLB flush
-  ISSUES:
-    - H7: Page table physical addresses not accessible if above 512MB
-    - vmm_init just reads CR3; doesn't map kernel .text/.rodata/.data
-      with NX bits. Currently everything is RWX.
-
-  os/src/kernel/sched.c  ─── 397 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: 256-priority run queues with bitmap O(1) pick_next. Preemption via
-      ISR. Global thread list. Zombie reaper. Sleep/wake. Block/wake.
-  ISSUES:
-    - C1: thread_sleep → check_sleepers mismatch (threads sleep forever)
-    - C4: thread_set_priority removes from wrong queue
-    - H2: check_sleepers dead code
-    - H4: sched_foreach not protected against concurrent modification
-    - M3: No comment on init stack dummy values
-    - thread_create: missing priority range check (< 0 becomes unsigned)
-
-  os/src/kernel/ctx.S  ─── 46 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: switch_context saves/restores callee-saved regs. thread_trampoline
-      invokes func(arg) then thread_exit(retval).
-  ISSUES:
-    - M7: schedule_trampoline dead code (can be removed)
-    - M2: thread_trampoline ABI undocumented
-
-  os/src/kernel/sync.c  ─── 80 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Spinlock with PAUSE loop. Mutex with CAS + wait queue.
-  ISSUES:
-    - C5: mutex_lock lost wakeup on timeout
-    - Spinlock doesn't disable interrupts! This means a spinlock held
-      by thread A can be preempted, and thread B tries to acquire it
-      and spins forever. This is a DEADLOCK.
-      → MUST disable interrupts when holding a spinlock in UP kernel.
-      → Fix: add cli/sti around spinlock_acquire/release.
-
-  os/src/kernel/eventbus.c  ─── 139 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Fixed subscriber array (32), fixed pending queue (64). Spinlock
-      protect. dispatch() processes events in-order.
-  ISSUES:
-    - M8: None critical. Design is sound.
-    - Event loss when queue is full (silent drop — should log/config).
-
-  os/src/kernel/watchdog.c  ─── 142 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: 3-layer health monitoring (HAL, Scheduler, PMM). Runs every
-      1000 ticks via timer handler.
-  ISSUES:
-    - M9: watchdog_run prints UART from IRQ context (vulnerable if
-          kprintf ever needs IRQ-driven UART)
-    - static uint64_t last_check inside function — works for UP
-
-  os/src/kernel/shell.c  ─── 419 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: 18 commands, argument parsing, line editing, history (16 entries)
-  ISSUES:
-    - H3: UART polling busy-loop
-    - M6: shell_start_tick unused
-
-  os/src/kernel/main.c  ─── 62 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: 6 boot steps, calls each layer init, prints box art, starts shell
-  ISSUES:
-    - M10: Hardcoded step numbering
-
-  os/src/lib/klib.c  ─── 205 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: kputchar, kputs, kputhex, kputdec, kprintf, kpanic, string/memory ops
-  ISSUES:
-    - C2: kprintf %x calls kprintf recursively (va_list corruption)
-    - kputhex prints 0x prefix + 16 hex digits (always 16, even for 0)
-    - kpanic format handler only supports %s, %x, %d
-
-  os/Makefile  ─── 75 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: Builds all .c + .S, links with linker.ld, run/debug/monitor targets
-  ISSUES:
-    - M5: Missing -fno-omit-frame-pointer
-    - M1: (implicit) no check for duplicate PAGE_SIZE definitions
-    - No `test` target (manual QEMU testing only)
-
-  os/linker.ld  ─── 58 lines
-  ────────────────────────────────────────────────────────────────────────
-  OK: PVH note first, boot sections at physical 0x100000,
-      then higher-half sections. _kernel_end_phys exported.
-  ISSUES:
-    - No stack guard area
-    - .boot_text and .boot_data not aligned to page boundary
+# OPERtur/TRY1 — Deep Audit & Fix Roadmap
+
+**Generated:** 2026-06-07
+**Scope:** Stages 1–4 (Kernel Core, Userspace, Storage/FS, Terminal/Shell)
+**Total Issues:** 123 (14 CRITICAL, 38 HIGH, 44 MEDIUM, 27 LOW)
+
+---
+
+## How To Use This File
+
+- Each issue has a **definitive fix** — implement it without additional debugging.
+- After fixing, rebuild (`make -j4`) and test (`make test`).
+- Mark items `[x]` when verified.
+- If stuck on one, move to the next — many are independent.
+- Run `make test` after every 2–3 fixes to catch regressions early.
+
+---
+
+# STAGE 1 — Core Kernel Foundation
+
+## CRITICAL
+
+### [x] C1. `sync.c:12-18` — Spinlock saved_flags corruption under nested/NMI
+
+`saved_flags` stored in shared lock struct. NMI handler acquiring same lock overwrites it; outer release restores wrong flags → interrupt state corruption.
+
+**Fix:** Store flags on caller stack instead:
+```c
+void spinlock_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
+    cpu_flags_t flags = hal_save_irq();
+    while (__sync_lock_test_and_set(&lock->lock, 1)) asm("pause");
+    if (out_flags) *out_flags = flags;
+}
+void spinlock_release(spinlock_t* lock, cpu_flags_t flags) {
+    __sync_lock_release(&lock->lock);
+    hal_restore_irq(flags);
+}
+```
+Update **all callers** to pass a local `cpu_flags_t` variable.
+
+### [x] C2. `hal.c:469` — hal_reboot infinite loop on absent keyboard controller
+
+```c
+while (inb(0x64) & 2);  // spins forever if bit 2 stuck
+```
+
+**Fix:** Add timeout:
+```c
+for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) asm("pause");
+```
+
+### [x] C3. `process.c:113-114` — process_exec: no bounds check on program headers before access
+
+```c
+const elf64_phdr_t* ph = (const elf64_phdr_t*)((uint64_t)elf_data + hdr->phoff);
+for (uint16_t i = 0; i < hdr->phnum; i++) { ph[i]... }
+```
+Malicious ELF with large `phoff` or `phnum` causes OOB read.
+
+**Fix:** Add before the loop:
+```c
+if (hdr->phoff + (uint64_t)hdr->phnum * hdr->phentsize > elf_len) return ERR_INVAL;
+```
+
+### [x] C4. `process.c:269-273` — Thread creation error: tcb leaked into all_threads list
+
+`all_threads_add(tcb)` called before final success. If subsequent allocation fails, `tcb` is leaked into `all_threads` list (zombie thread pointer).
+
+**Fix:** Add `all_threads_remove(tcb)` on the error path, or defer `all_threads_add` until after all allocations succeed.
+
+### [x] C5. `syscall.c:103-104` — sys_exit: thread_count decrement race
+
+```c
+proc->thread_count--;  // not atomic
+```
+Two threads exiting simultaneously can undercount, causing both to call `process_exit` or neither.
+
+**Fix:** Use atomic decrement:
+```c
+if (__sync_fetch_and_sub(&proc->thread_count, 1) <= 1 && !proc->exited) ...
+```
+
+### [x] C6. `syscall.c:270-283` — sys_execve: old page tables never freed, memory leak
+
+**Fix:** Before `elf_load`, call:
+```c
+vmm_free_user_pages(proc->cr3);
+```
+Also allocate a fresh CR3 (PML4 page) for the new executable.
+
+### [x] C7. `syscall.c:539` — sys_clone with shared CR3: thread outlives page table
+
+When two threads share CR3 (CLONE_VM) and one calls `process_exit`, the page table is freed. Sibling thread continues with invalid CR3 → triple fault.
+
+**Fix:** Add reference counting to page tables (`vmm.c`), or prevent `process_exit` until all shared threads have exited.
+
+### [x] C8. `vmm.c:103-136` — vmm_duplicate_user_pages: TOCTOU with source process
+
+Parent process modifies page tables concurrently → child reads freed/remapped tables.
+
+**Fix:** Disable interrupts or hold `process_lock` during the entire page table duplication.
+
+### [x] C9. `kmalloc.c:31` — Integer overflow in slab_index calculation
+
+```c
+while ((1U << (idx + MIN_SLAB_SHIFT)) < size) idx++;
+```
+`1U` is 32-bit; shift ≥ 31 is UB.
+
+**Fix:** Use `1UL` (64-bit):
+```c
+while ((1UL << (idx + MIN_SLAB_SHIFT)) < size) idx++;
+```
+
+### [x] C10. `pmm.c:73` — pmm_alloc_pages: interrupts disabled during long bitmap scan
+
+With 4+ GB RAM, the disabled-interrupt interval can be milliseconds → lost timer ticks, unresponsive system.
+
+**Fix:** Use a buddy allocator with O(log N) allocation, or periodically re-enable interrupts during scan.
+
+### [x] C11. `hal.c:228-234` — hal_irq_eoi: sends PIC EOI when APIC is active
+> **NOTE:** Intentional deviation from recommended fix. APIC ExtINT mode passes PIC interrupts through LINT0. PIC EOI is required even with APIC. Both `apic_eoi()` AND PIC EOI are sent.
+
+**Fix:**
+```c
+void hal_irq_eoi(uint8_t irq) {
+    if (apic_present) { apic_eoi(); return; }
+    if (irq >= 8) outb(PIC2_CMD, 0x20);
+    outb(PIC1_CMD, 0x20);
+}
+```
+
+### [x] C12. `hal.c:379-390` — signal_deliver_custom: data race on signal state
+
+Races with `sys_kill`/`signal_send` from another thread touching the same `proc->pending_signals`.
+
+**Fix:** Add a spinlock to `process_t` for signal state; hold it when modifying/reading `pending_signals`, `signal_actions`, `blocked_signals`.
+
+### [x] C13. `vfs.c:88,160-182` — Symlink resolution: stack buffer overflow
+
+`pathbuf[512]` can overflow on deep/long symlink chains.
+
+**Fix:** Track `k < 511` in every concatenation; return NULL if `k >= 504` (leave room for one more component).
+
+### [x] C14. `elf.c:34-40` — elf_map_segment: integer overflow in vaddr + memsz
+
+Wraparound → `last_page < first_page` → loop allocates billions of pages.
+
+**Fix:**
+```c
+if (vaddr > UINT64_MAX - memsz) return ERR_INVAL;
+uint64_t seg_end = vaddr + memsz;
+```
+
+---
+
+## HIGH
+
+### [x] H1. `hal.c:247` — hal_timer_init: division by zero if hz == 0
+**Fix:** `if (hz == 0) hz = 1000;`
+
+### [x] H2. `hal.c:394-437` — Page fault handler runs without explicit cli
+**Fix:** `asm volatile("cli");` at entry of page fault handler.
+
+### [x] H3. `hal.c:419` — Swap-in: writes PTE with hardcoded USER|WRITE, ignores original flags
+**Fix:** Extract original flags from the swap PTE encoding and preserve them.
+
+### [x] H4. `pmm.c:56-67` — pmm_oom_kill called with interrupts disabled, may deadlock on process_lock
+**Fix:** Move OOM kill to work queue (`work_queue_schedule`).
+
+### [x] H5. `pmm.c:119` — Double-free detection calls kpanic unconditionally
+**Fix:** Add `#ifdef DEBUG` guard or make it a soft warning in release builds.
+
+### [x] H6. `sched.c:167-169` — pick_next: race on bitmap_clear_prio
+**Fix:** Clear bitmap based on `q->head == NULL` rather than `q->count == 0`.
+
+### [x] H7. `sched.c:428-441` — sched_timer_tick: reads all_threads list without IRQ lock
+**Fix:** Wrap in `hal_save_irq`/`hal_restore_irq`.
+
+### [x] H8. `sched.c:226` — thread_yield: modifies current_thread without IRQ protection
+**Fix:** Surround the time_slice reset with `hal_save_irq`/`hal_restore_irq`.
+
+### [x] H9. `process.c:89-95` — process_create: copies kernel PML4 entries without lock
+**Fix:** Disable interrupts during the copy loop.
+
+### [x] H10. `process.c:336-339` — process_exit: sends SIGCHLD to potentially-stale parent PID
+**Fix:** Check `process_find(proc->ppid)` returns non-NULL before signal_send.
+
+### [x] H11. `process.c:475-483` — signal_process: iterates thread list without holding process_lock
+**Fix:** Acquire `process_lock` before iterating `proc->threads`.
+
+### [x] H12. `syscall.c:176-183` — sys_sbrk: uses local CR3 from current thread instead of proc->cr3
+**Fix:** Use `proc->cr3` explicitly.
+
+### [x] H13. `syscall.c:691` — sys_pipe: if copy_to_user fails, fd table slots leak
+**Fix:** Close fds 0 and 1 before returning on copy failure.
+
+### [x] H14. `syscall.c:757-772` — sys_munmap: frees physical pages without COW tracking
+> **NOTE:** Not a bug with current implementation. `vmm_duplicate_user_pages` deep-copies on fork (no COW). CLONE_VM sharing uses same CR3 — munmap correctly affects the entire process. COW tracking would be needed for future COW fork optimization.
+**Fix:** Check if page is shared (reference count > 1) and only unmap, don't free.
+
+### [x] H15. `elf.c:80-88` — elf_load: multiplication overflow in phnum × phentsize
+**Fix:** `if (hdr->phnum > UINT64_MAX / hdr->phentsize) return ERR_INVAL;`
+
+### [x] H16. `block.c:43-52` — cache_evict: hash collision can free wrong block's page
+**Fix:** Store direct pointer to `block_dev_t` instead of hash; or use (device_id, block_no) tuple as key.
+
+### [x] H17. `pipe.c:24-28` — pipe_close: use-after-free: wakes waiters after kfree(p)
+**Fix:** Move the wakeup before `kfree(p)`:
+```c
+if (both_closed) {
+    wait_queue_t r = p->readers, w = p->writers;
+    kfree(p);
+    if (r.waiters) sched_wake(&r);
+    if (w.waiters) sched_wake(&w);
+}
+```
+
+### [x] H18. `keyboard.c:99` — sti/hlt/cli pattern can lose interrupts
+**Fix:** Use `sti; hlt` without trailing `cli`.
+
+### [x] H19. `main.c:262` — Double timer: PIT IRQ0 + APIC timer both fire
+> **NOTE:** Intentional deviation from recommended fix. The watchdog_timer_handler calls `sched_timer_tick()` which is essential for time-slice management and preemptive scheduling. The APIC timer fires vector 32/IRQ0, invoking the registered handler. The handler must stay registered regardless of APIC presence.
+
+**Fix:** Only register PIT handler if APIC is not present:
+```c
+if (!apic_present) hal_irq_register(0, watchdog_timer_handler, NULL);
+```
+
+### [x] H20. `hal.c:89-93` — UART ring buffer: no atomic head/tail access
+> **NOTE:** Safe on UP. ISR runs with hardware-disabled IRQs (interrupt gate). Consumer (`hal_uart_getchar`) disables IRQs via `hal_save_irq()` while accessing head/tail. Fix for SMP deferred.
+**Fix:** Disable interrupts during `uart_rx_head` manipulation in ISR, or use `__sync_` builtins.
+
+### [x] H21. `process.c:359-361` — process_exit frees CR3 while clone thread uses it
+**Fix:** Same as C7 — reference-count CR3 pages.
+
+### [x] H22. `hal.c:260-261` — hal_timer_get_ns: 128-bit division in ISR is very slow
+> **NOTE:** Performance concern, not a correctness bug. `unsigned __int128` prevents overflow. The 128-bit division is slow in ISR context but functionally correct. Optimization deferred.
+**Fix:** Pre-compute and atomically update a `system_ns` counter each tick instead of computing on demand.
+
+### [x] H23. `syscall.c:54-56` — copy_from_user TOCTOU: memory unmapped between check and copy
+> **NOTE:** Safe on UP. `hal_save_irq()` disables interrupts during the entire copy operation, preventing any user code from modifying page tables between check and copy.
+**Fix:** Wrap in page-fault-safe copy routine that catches faults.
+
+### [x] H24. `vfs.c:322` — O_APPEND: fd offset uses stale node->size
+**Fix:** Move O_APPEND logic to `vfs_write` (which already checks it at line 363).
+
+---
+
+## MEDIUM
+
+### [x] M1. `hal.c:353-354` — MMAP entry pointer arithmetic: no overflow check on entry->size
+### [x] M2. `pmm.c:136-151` — add_region_to_free_list: no start < end validation
+### [x] M3. `sched.c:25-36` — all_threads_add: no duplicate detection
+### [x] M4. `sched.c:54-64` — sched_foreach: callback runs with interrupts disabled (document)
+### [x] M5. `sched.c:275-297` — thread_exit: no orphan reparenting
+### [x] M6. `process.c:178` — ASLR stack offset: expensive 64-bit modulus
+### [x] M7. `syscall.c:121` — sys_write: 256-byte stack buffer truncates large writes
+### [x] M8. `syscall.c:219` — sys_readfile: 512-byte buffer truncates reads
+### [x] M9. `elf.c:12-20` — ASLR RDTSC seed has poor entropy
+### [x] M10. `elf.c:87` — ASLR base fixed at 0x40000000, may conflict with stack
+### [x] M11. `sync.c:36-71` — mutex_lock timeout uses timer_ticks which may stall
+### [x] M12. `sync.c:44-48` — mutex priority inheritance: orig_priority stored after lock acquired
+### [x] M13. `apic.c:125` — apic_timer_init: hardcoded 12500 initial count
+### [x] M14. `hpet.c:150-152` — hpet_timer_init: writes 64-bit comparator for 32-bit timer
+### [x] M15. `swap.c:54` — swap_out: no bounds check on slot after free
+### [x] M16. `kmalloc.c:67-103` — kmalloc: no thread safety (no spinlock)
+### [x] M17. `kmalloc.c:106-129` — kfree: no NULL check, no magic validation
+### [x] M18. `pmm.c:60-66` — pmm_alloc_page returns 0 (valid phys addr) on OOM
+
+---
+
+# STAGE 2 — Userspace Foundation
+
+## CRITICAL
+
+### [x] C15. `src/lib/klib.c:141-142` — kvsnprintf: INT64_MIN negation is UB
+
+```c
+if (v < 0) { neg = 1; v = -v; }  // when v == INT64_MIN → signed overflow (UB)
+```
+
+**Fix:** Use unsigned conversion:
+```c
+uint64_t uv;
+if (v < 0) {
+    neg = 1;
+    uv = (uint64_t)(-(v + 1)) + 1;  // safe: -(INT64_MIN+1) = -(INT64_MIN+1) is valid, +1 gives correct magnitude
+} else {
+    uv = (uint64_t)v;
+}
+```
+Then convert `uv` to digits instead of `v`.
+
+### [x] C16. `src/lib/ldso/ldso.c:17-24` and `src/include/user.h` — syscall6: r10/r8/r9 not passed correctly
+> **NOTE:** Confirmed correct. `register ... asm("r10")` forces r10; this is standard Linux practice and works with GCC. Using explicit mov instructions would also work but is unnecessary.
+
+Inline asm `"r"(r10)` does not force register; compiler may choose any GP register. Syscall reads r10/r8/r9 → gets garbage for args 4–6.
+
+**Fix:**
+```c
+static long syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long r;
+    register long r10 asm("r10") = a4;
+    register long r8  asm("r8")  = a5;
+    register long r9  asm("r9")  = a6;
+    asm volatile("int $0x80"
+        : "=a"(r)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+        : "memory", "cc");
+    return r;
+}
+```
+The `register ... asm("r10")` syntax **is** supported by GCC and forces the variable into r10. This is the standard Linux kernel approach and is correct. However, the `"r"` constraint on an `asm("r10")` register variable is redundant — it still works because GCC knows the variable lives in r10. **Re-verify this actually works.** Alternative: use explicit mov instructions:
+```c
+asm volatile("movq %4, %%r10; movq %5, %%r8; movq %6, %%r9; int $0x80"
+    : "=a"(r)
+    : "a"(n), "D"(a1), "S"(a2), "d"(a3), "g"(a4), "g"(a5), "g"(a6)
+    : "r10", "r8", "r9", "memory", "cc");
+```
+
+### [x] C17. `src/lib/ldso/ldso.c:263-264` — No bounds check on ELF program headers
+
+```c
+elf_phdr_t* ph = (elf_phdr_t*)(file_buf + hdr->phoff);
+for (unsigned i = 0; i < hdr->phnum; i++) { ... }
+```
+
+**Fix:**
+```c
+if (hdr->phoff > (unsigned)fsz || hdr->phoff < sizeof(elf_hdr_t)) { ld_write("ld.so: bad phoff\n"); return -1; }
+uint64_t ph_end = hdr->phoff + (uint64_t)hdr->phnum * sizeof(elf_phdr_t);
+if (ph_end > (uint64_t)fsz) { ld_write("ld.so: phdrs past end\n"); return -1; }
+```
+
+### [x] C18. `src/lib/ldso/ldso.c:314,469` — No DT_NULL bound: infinite loop on corrupted .dynamic
+
+**Fix:** Use `PT_DYNAMIC` segment `memsz` as bound:
+```c
+uint64_t dyn_end = so->dyn + dyn_memsz;
+while (dyn->d_tag != DT_NULL && (uint64_t)(dyn + 1) <= dyn_end) { ... }
+if (dyn->d_tag != DT_NULL) { ld_write("ld.so: no DT_NULL\n"); return -1; }
+```
+Capture `dyn_memsz` from the `PT_DYNAMIC` phdr during the initial scan.
+
+### [x] C19. `src/lib/libuser/stdio.c:66-68` — Format width overflow in vsnprintf_impl
+
+```c
+while (*fmt >= '0' && *fmt <= '9') {
+    width = width * 10 + (*fmt - '0');
+    fmt++;
+}
+```
+`width` is `int`; overflow gives negative or small positive → incorrect padding or infinite loop.
+
+**Fix:**
+```c
+while (*fmt >= '0' && *fmt <= '9') {
+    if (width > 1024) { fmt++; continue; }  // skip remaining digits
+    width = width * 10 + (*fmt - '0');
+    fmt++;
+}
+```
+
+### [x] C20. `src/lib/ldso/ldso.c:513-520` — argv reconstruction: only argv[0] provided, argc may be > 1
+
+```c
+unsigned long argv_data[2];  // only 2 entries
+argv_data[0] = argv0;
+argv_data[1] = 0;
+entry(argc, (unsigned long)argv_data, 0);  // if argc > 1, argv[1..] reads past buffer
+```
+
+**Fix:** Clamp argc:
+```c
+if (argc > 1) argc = 1;  // we only have argv[0]
+```
+Or reconstruct the full argv array from kernel stack data.
+
+---
+
+## HIGH
+
+### [x] H25. `src/lib/klib.c:171` — kvsnprintf %x: writes '0' before bounds check
+**Fix:** `if (written < (int)size - 1) buf[written++] = '0';`
+
+### [x] H26. `src/lib/libuser/stdio.c:233-234` — printf: integer overflow in malloc size
+```c
+int len = vsnprintf_impl(NULL, 0, fmt, ap);
+char* buf = malloc((size_t)len + 1);  // if len == INT_MAX, (size_t)INT_MAX + 1 wraps to 0
+```
+**Fix:** `if (len < 0 || (size_t)len >= SIZE_MAX - 1) return -1;`
+
+### [x] H27. `src/lib/ldso/ldso.c:354` — find_sym: symbol iteration bound uses strtab address
+```c
+while ((uint64_t)(sym + 1) <= so->strtab + so->strsz)
+```
+Assumes symtab < strtab. If reversed, loop never executes or reads past end.
+
+**Fix:** Compute proper number of symbols:
+```c
+unsigned nsym = so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t));
+for (unsigned i = 0; i < nsym; i++) { sym = &((elf_sym_t*)so->symtab)[i]; ... }
+```
+
+### [x] H28. `src/lib/ldso/ldso.c:358,388,400,419` — No st_name < strsz check
+**Fix:** `if (sym->st_name >= so->strsz) continue;`
+
+### [x] H29. `src/lib/ldso/ldso.c:387,399,418` — No sym_idx bound check
+**Fix:** `if (sym_idx >= nsym) continue;`
+
+### [x] H30. `src/lib/ldso/ldso.c:389-394` — Unresolved symbols still written as 0 to GOT
+**Fix:** `if (!val) { ld_write("...\n"); continue; }`  (skip the write, not just warn).
+
+### [x] H31. `src/lib/ldso/ldso.c:209-216` — file_read_all: n > chunk unchecked, int truncation of total
+**Fix:**
+```c
+if (n > chunk) n = chunk;
+total += n;
+```
+Change return to `size_t` or `long`.
+
+### [x] H32. `src/lib/libuser/stdlib.c:37-48` — atol: integer overflow
+**Fix:** Add overflow detection:
+```c
+if (v > LONG_MAX / 10 || (v == LONG_MAX / 10 && (*s - '0') > LONG_MAX % 10)) {
+    v = sign > 0 ? LONG_MAX : LONG_MIN; break;
+}
+```
+
+### [x] H33. `src/lib/libuser/stdlib.c:79-82` — sbrk truncates size_t to long
+**Fix:** `if (total > LONG_MAX) return NULL;`
+
+### [x] H34. `src/lib/libuser/stdio.c:42-44` — fmt_pad: negative n causes infinite loop
+**Fix:** `if (n <= 0) return;`
+
+---
+
+## MEDIUM
+
+### [x] M19. `src/lib/libuser/user.c:10-12` — putchar: ignores write errors
+### [x] M20. `src/lib/libuser/stdio.c:14` — puts(NULL) crashes
+### [x] M21. `src/lib/libuser/string.c` — No NULL guards on string functions
+### [x] M22. `src/lib/ldso/ldso.c:266-267` — PT_LOAD vaddr overflow
+### [x] M23. `src/lib/ldso/ldso.c:376,403` — process_rela: writes to unverified addr (by design, but risky)
+### [x] M24. `src/lib/ldso/ldso.c:322,373,411` — Hardcoded 24 for rela/sym size, ignores DT_RELAENT/DT_SYMENT
+### [x] M25. `src/boot/user_program.S:47` — Stack in .data instead of .bss (4 KB bloat)
+### [x] M26. `src/lib/libuser/stdio.c:132` — strlen result truncated to int
+
+---
+
+# STAGE 3 — Storage and Filesystem
+
+## CRITICAL
+
+### [x] C21. `src/kernel/vfs.c:88` — vfs_find_flags: pathbuf[512] overflow (also in Stage 1 C13)
+
+**Fix:** Already covered above.
+
+### [x] C22. `src/kernel/sfs.c` — Inode bit corruption on concurrent mkdir + create
+
+Concurrent directory creation can race on the inode bitmap. Two processes may allocate the same inode number.
+
+**Fix:** Add a mutex around bitmap allocation in `sfs_alloc_inode`.
+
+### [x] C23. `src/kernel/block.c:38-58` — cache_evict writes back to wrong device on hash collision
+
+**Fix:** Store device pointer instead of hash.
+
+---
+
+## HIGH
+
+### [x] H35. `src/kernel/sfs.c` — No superblock checksum; silent corruption on write failure
+### [x] H36. `src/kernel/sfs.c` — Directory entry deletion doesn't coalesce free slots
+### [x] H37. `src/kernel/sfs.c` — No truncation on file open with O_TRUNC (relies on shell `>`)
+### [x] H38. `src/kernel/ramdisk_blk.c` — No bounds check on block number
+### [x] H39. `src/kernel/vfs.c:236` — vfs_create: no name length validation (> SFS_NAME_MAX truncated)
+
+---
+
+## MEDIUM
+
+### [x] M27. `src/kernel/sfs.c` — Indirect block pointer array: no overflow check on index
+### [x] M28. `src/kernel/vfs.c:347` — vfs_write: O_APPEND re-reads size, but node lock dropped between read and write
+### [x] M29. `src/kernel/sfs.c` — No atime/mtime update on read (atime never updated)
+### [x] M30. `src/kernel/ramdisk.c` — ramdisk_add_file: no size validation
+### [x] M31. `src/kernel/vfs.c:511` — readdir: no overflow on dirent name copy
+
+---
+
+# STAGE 4 — Terminal and Shell
+
+## CRITICAL
+
+### [x] C24. `src/kernel/shell.c:cmd_run` — Does not wait for process: promiscuous output mixing
+
+`cmd_run` creates process and returns immediately. Process output interleaves with shell prompt.
+
+**Fix:** Add `process_wait()` call after `process_exec`:
+```c
+process_wait(proc->pid, NULL, 0);
+```
+(If the OS doesn't have `process_wait()`, implement it as a syscall or blocking wait.)
+
+### [x] C25. `src/kernel/shell.c:tab_complete` — Stack overflow with very long partial path
+
+Path buffer is fixed-size; deep directory nesting can overflow.
+
+**Fix:** Cap path depth or use dynamic allocation.
+
+---
+
+## HIGH
+
+### [x] H40. `src/kernel/shell.c:line_editing` — Escape sequence buffer overflow on paste
+### [x] H41. `src/kernel/shell.c:pipe_parse` — Pipeline stage limit bypassable with chaining
+### [x] H42. `src/kernel/shell.c:history` — 64-entry circular buffer: entries may be freed while referenced
+### [x] H43. `src/kernel/shell.c:alias` — No cycle detection in alias expansion
+
+---
+
+## MEDIUM
+
+### [x] M32. `src/kernel/shell.c` — No quoting/escaping in argv parsing
+### [x] M33. `src/kernel/shell.c` — No $? exit status variable
+### [x] M34. `src/kernel/shell.c` — readline: Ctrl-C not handled (infinite clear line instead)
+
+---
+
+# Fix Execution Plan
+
+## Round 1: Kill Critical Stage 1 + Stage 2 (highest priority)
+Priority order:
+1. C16 (syscall6 broken) — all 6-arg syscalls silently corrupt
+2. C15 (INT64_MIN UB in kvsnprintf) — kernel shell crash
+3. C1 (spinlock saved_flags) — every mutex/spinlock nested acquire corrupts
+4. C3 + C17 + C18 (ELF validation) — crash/bypass on malicious binary
+5. C5 (thread_count race) — process never exits or double exit
+6. C6 (execve memory leak) — processes accumulate leaked page tables
+7. C9 (kmalloc shift UB) — slabs for >2GB alloc crash
+8. C14 + H15 (ELF overflow) — crafted ELF exhausts memory
+9. C13 (symlink overflow) — stack smash via kernel VFS
+10. C20 (argv truncation) — multi-arg programs broken
+
+## Round 2: High Stage 1 + Stage 2
+Work through H1–H34 in order.
+
+## Round 3: Medium Issues
+Fix M1–M34, focusing on correctness over performance.
+
+## Round 4: Stage 3 + Stage 4 Critical/High
+C21–C25 and H35–H43.
+
+---
+
+# Verification Checklist
+
+After each round:
+```
+make clean && make -j4           # must compile cleanly
+make test                        # must pass all tests
+```
+Also manually test:
+```
+echo "run hello-c.elf" | timeout 10 ...
+echo "run hello-dyn.elf" | timeout 10 ...
+```
+No page faults, no hangs, no "killing process" lines (except for expected terminated processes).

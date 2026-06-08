@@ -100,8 +100,8 @@ static uint64_t sys_exit(int_frame_t* frame) {
     int exit_code = (int)frame->rdi;
     if (current_thread && current_thread->proc) {
         process_t* proc = current_thread->proc;
-        proc->thread_count--;
-        if (proc->thread_count <= 0 && !proc->exited) {
+        unsigned long old = __sync_fetch_and_sub(&proc->thread_count, 1);
+        if (old <= 1 && !proc->exited) {
             process_exit(proc, exit_code);
         } else {
             proc->exit_code = exit_code;
@@ -117,43 +117,39 @@ static uint64_t sys_write(int_frame_t* frame) {
     int fd = (int)frame->rdi;
     const char* buf = (const char*)frame->rsi;
     size_t count = (size_t)frame->rdx;
-
-    if (fd <= 2) {
-        char kbuf[256];
-        size_t written = 0;
-        while (count > 0) {
-            size_t chunk = count;
-            if (chunk > sizeof(kbuf)) chunk = sizeof(kbuf);
-            if (copy_from_user(kbuf, buf + written, chunk) != 0)
-                return (uint64_t)(int64_t)ERR_FAULT;
-            for (size_t i = 0; i < chunk; i++)
-                kputchar(kbuf[i]);
-            written += chunk;
-            count -= chunk;
-        }
-        return (uint64_t)written;
+    char kbuf[512];
+    size_t written = 0;
+    while (count > 0) {
+        size_t chunk = count;
+        if (chunk > sizeof(kbuf)) chunk = sizeof(kbuf);
+        if (copy_from_user(kbuf, buf + written, chunk) != 0)
+            return (uint64_t)(int64_t)ERR_FAULT;
+        int64_t ret = vfs_write(fd, kbuf, chunk);
+        if (ret < 0) return (uint64_t)(int64_t)ERR_IO;
+        written += (size_t)ret;
+        count -= (size_t)ret;
     }
-    return (uint64_t)(int64_t)ERR_NOSYS;
+    return (uint64_t)written;
 }
 
 static uint64_t sys_read(int_frame_t* frame) {
     int fd = (int)frame->rdi;
     char* buf = (char*)frame->rsi;
     size_t count = (size_t)frame->rdx;
-
-    if (fd <= 2) {
-        char kbuf[256];
-        size_t i;
-        for (i = 0; i < count && i < sizeof(kbuf); i++) {
-            char c = hal_uart_getchar();
-            kbuf[i] = c;
-            if (c == '\n' || c == '\r') { i++; break; }
-        }
-        if (copy_to_user(buf, kbuf, i) != 0)
-            return (uint64_t)(int64_t)ERR_FAULT;
-        return i;
+    char kbuf[512];
+    size_t total = 0;
+    while (count > 0) {
+        size_t chunk = count;
+        if (chunk > sizeof(kbuf)) chunk = sizeof(kbuf);
+        int64_t ret = vfs_read(fd, kbuf, chunk);
+        if (ret < 0) return total ? (uint64_t)total : (uint64_t)(int64_t)ERR_IO;
+        if (copy_to_user(buf + total, kbuf, (size_t)ret) != 0)
+            return total ? (uint64_t)total : (uint64_t)(int64_t)ERR_FAULT;
+        total += (size_t)ret;
+        count -= (size_t)ret;
+        if ((size_t)ret < chunk) break;
     }
-    return (uint64_t)(int64_t)ERR_NOSYS;
+    return (uint64_t)total;
 }
 
 static uint64_t sys_getpid(int_frame_t* frame) {
@@ -170,15 +166,17 @@ static uint64_t sys_sbrk(int_frame_t* frame) {
 
     uint64_t old_brk = proc->user_stack_top;
     if (increment > 0) {
-        uint64_t new_brk = old_brk + increment;
-        uint64_t pages_needed = (new_brk - proc->user_stack_top + PAGE_SIZE - 1) / PAGE_SIZE;
-        uint64_t cr3_val;
-        asm volatile("mov %%cr3, %0" : "=r"(cr3_val));
-        for (uint64_t i = 0; i < pages_needed; i++) {
+        uint64_t new_brk = old_brk + (uint64_t)increment;
+        uint64_t start_page = old_brk & PAGE_MASK;
+        uint64_t end_page   = (new_brk + PAGE_SIZE - 1) & PAGE_MASK;
+        uint64_t cr3_val = proc->cr3;
+        for (uint64_t addr = start_page; addr < end_page; addr += PAGE_SIZE) {
+            page_entry_t* pte = vmm_walk_pagetable(cr3_val, addr);
+            if (pte && (*pte & PAGE_PRESENT)) continue;
             uint64_t phys = pmm_alloc_page();
             if (!phys) return (uint64_t)-1;
             kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-            vmm_map_page(cr3_val, old_brk + i * PAGE_SIZE, phys, PAGE_USER | PAGE_WRITE);
+            vmm_map_page(cr3_val, addr, phys, PAGE_USER | PAGE_WRITE);
         }
         proc->user_stack_top = new_brk;
     }
@@ -215,13 +213,19 @@ static uint64_t sys_readfile(int_frame_t* frame) {
     char* buf = (char*)frame->rsi;
     size_t count = (size_t)frame->rdx;
     char kbuf[512];
-    size_t chunk = count;
-    if (chunk > sizeof(kbuf)) chunk = sizeof(kbuf);
-    int64_t ret = vfs_read(fd, kbuf, chunk);
-    if (ret < 0) return (uint64_t)(int64_t)ERR_IO;
-    if (copy_to_user(buf, kbuf, (size_t)ret) != 0)
-        return (uint64_t)(int64_t)ERR_FAULT;
-    return (uint64_t)ret;
+    size_t total = 0;
+    while (count > 0) {
+        size_t chunk = count;
+        if (chunk > sizeof(kbuf)) chunk = sizeof(kbuf);
+        int64_t ret = vfs_read(fd, kbuf, chunk);
+        if (ret < 0) return total ? (uint64_t)total : (uint64_t)(int64_t)ERR_IO;
+        if (copy_to_user(buf + total, kbuf, (size_t)ret) != 0)
+            return total ? (uint64_t)total : (uint64_t)(int64_t)ERR_FAULT;
+        total += (size_t)ret;
+        count -= (size_t)ret;
+        if ((size_t)ret < chunk) break;
+    }
+    return (uint64_t)total;
 }
 
 static uint64_t sys_writefile(int_frame_t* frame) {
@@ -265,6 +269,17 @@ static uint64_t sys_execve(int_frame_t* frame) {
     }
     vfs_close(fd);
     if ((uint64_t)total < sz) { kfree(buf); return (uint64_t)(int64_t)ERR_IO; }
+    if (proc->cr3) {
+        vmm_free_user_pages(proc->cr3);
+        uint64_t new_cr3 = pmm_alloc_page();
+        if (!new_cr3) { kfree(buf); return (uint64_t)(int64_t)ERR_NOMEM; }
+        kmemset((void*)PHYS_TO_VIRT(new_cr3), 0, PAGE_SIZE);
+        uint64_t* old_pml4 = (uint64_t*)PHYS_TO_VIRT(proc->cr3);
+        uint64_t* new_pml4 = (uint64_t*)PHYS_TO_VIRT(new_cr3);
+        for (int i = 256; i < 512; i++) new_pml4[i] = old_pml4[i];
+        pmm_free_page(proc->cr3);
+        proc->cr3 = new_cr3;
+    }
     err_t e = elf_load(proc, buf, sz);
     kfree(buf);
     if (e) return (uint64_t)(int64_t)e;
@@ -276,14 +291,26 @@ static uint64_t sys_execve(int_frame_t* frame) {
     if (!stack_page) return (uint64_t)(int64_t)ERR_NOMEM;
     kmemset((void*)PHYS_TO_VIRT(stack_page), 0, PAGE_SIZE);
     uint64_t user_stack = 0x70000000;
-    uint64_t user_stack_top = user_stack + PAGE_SIZE - 8;
     vmm_map_page(proc->cr3, user_stack, stack_page, PAGE_USER | PAGE_WRITE);
     if (proc->cr3 != old_cr3)
         asm volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
+
+    uint8_t* stk = (uint8_t*)PHYS_TO_VIRT(stack_page);
+    uint64_t off = PAGE_SIZE;
+    size_t nlen = kstrlen(proc->name) + 1;
+    off -= nlen; kmemcpy(stk + off, proc->name, nlen);
+    off &= ~7ULL;
+    uint64_t prog_vaddr = user_stack + off;
+    off -= 8; *(uint64_t*)(stk + off) = 0;
+    off -= 8; *(uint64_t*)(stk + off) = 0;
+    off -= 8; *(uint64_t*)(stk + off) = 0;
+    off -= 8; *(uint64_t*)(stk + off) = prog_vaddr;
+    off -= 8; *(uint64_t*)(stk + off) = 1;
+
     frame->rip = proc->entry_point;
-    frame->rsp = user_stack_top;
-    frame->rdi = 0;
-    frame->rsi = 0;
+    frame->rsp = user_stack + off;
+    frame->rdi = 1;
+    frame->rsi = user_stack + off + 8;
     return 0;
 }
 
@@ -366,6 +393,7 @@ static uint64_t sys_fork(int_frame_t* frame) {
     ct->cr3 = cp->cr3;
     ct->state = THREAD_CREATED;
     ct->priority = parent->priority;
+    ct->base_priority = parent->base_priority;
     ct->time_slice_remaining = 0;
     ct->kernel_stack = ks;
     ct->kernel_stack_size = THREAD_STACK_SIZE;
@@ -376,6 +404,94 @@ static uint64_t sys_fork(int_frame_t* frame) {
     cp->thread_count++;
     sched_add_thread(ct);
     return cp->pid;
+}
+
+static uint64_t sys_sigreturn(int_frame_t* frame) {
+    (void)frame;
+    /* Restore user context from the sigframe on user stack.
+     * rdi points to the sigframe_t pushed by signal delivery.
+     * Copy the saved registers back into the interrupt frame.
+     */
+    sigframe_t sf;
+    if (copy_from_user(&sf, (void*)frame->rdi, sizeof(sf)) != 0)
+        return (uint64_t)(int64_t)ERR_FAULT;
+
+    /* Restore all registers from the saved signal frame */
+    frame->rax  = sf.rax;
+    frame->rbx  = sf.rbx;
+    frame->rcx  = sf.rcx;
+    frame->rdx  = sf.rdx;
+    frame->rsi  = sf.rsi;
+    frame->rdi  = sf.rdi;
+    frame->rbp  = sf.rbp;
+    frame->r8   = sf.r8;
+    frame->r9   = sf.r9;
+    frame->r10  = sf.r10;
+    frame->r11  = sf.r11;
+    frame->r12  = sf.r12;
+    frame->r13  = sf.r13;
+    frame->r14  = sf.r14;
+    frame->r15  = sf.r15;
+    frame->rip  = sf.rip;
+    frame->cs   = sf.cs;
+    frame->rflags = sf.rflags;
+    frame->rsp  = sf.rsp;
+    frame->ss   = sf.ss;
+
+    /* We don't return to user via normal iretq here.
+     * The frame is modified in place and the ISR's iretq will use it.
+     */
+    return 0;
+}
+
+static uint64_t sys_getcwd(int_frame_t* frame) {
+    char* buf = (char*)frame->rdi;
+    size_t size = frame->rsi;
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    if (!proc || !buf) return (uint64_t)(int64_t)ERR_INVAL;
+
+    size_t len = kstrlen(proc->cwd) + 1;
+    if (len > size) return (uint64_t)(int64_t)ERR_NOSPACE;
+    if (copy_to_user(buf, proc->cwd, len) != 0)
+        return (uint64_t)(int64_t)ERR_FAULT;
+    return len;
+}
+
+static uint64_t sys_chdir(int_frame_t* frame) {
+    char* path = (char*)frame->rdi;
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    if (!proc || !path) return (uint64_t)(int64_t)ERR_INVAL;
+
+    char kpath[256];
+    if (copy_from_user(kpath, path, sizeof(kpath)) != 0)
+        return (uint64_t)(int64_t)ERR_FAULT;
+    kpath[sizeof(kpath) - 1] = 0;
+
+    /* Verify the path exists via stat */
+    vfs_stat_t st;
+    if (vfs_stat(kpath, &st) != 0)
+        return (uint64_t)(int64_t)ERR_NOENT;
+
+    kstrncpy(proc->cwd, kpath, sizeof(proc->cwd) - 1);
+    return 0;
+}
+
+static uint64_t sys_dup2(int_frame_t* frame) {
+    int oldfd = (int)frame->rdi;
+    int newfd = (int)frame->rsi;
+    if (oldfd < 0 || oldfd >= VFS_MAX_FDS) return (uint64_t)(int64_t)ERR_INVAL;
+    if (newfd < 0 || newfd >= VFS_MAX_FDS) return (uint64_t)(int64_t)ERR_INVAL;
+    if (!fd_table[oldfd].used) return (uint64_t)(int64_t)ERR_INVAL;
+
+    /* Close newfd if it's open */
+    if (fd_table[newfd].used) {
+        vfs_close(newfd);
+    }
+
+    /* Duplicate the fd entry */
+    fd_table[newfd] = fd_table[oldfd];
+    fd_table[newfd].offset = fd_table[oldfd].offset;
+    return newfd;
 }
 
 static uint64_t sys_clone(int_frame_t* frame) {
@@ -585,8 +701,11 @@ static uint64_t sys_pipe(int_frame_t* frame) {
     int kfds[2];
     if (pipe_create(kfds) != 0)
         return (uint64_t)(int64_t)ERR_IO;
-    if (copy_to_user(fds, kfds, sizeof(kfds)) != 0)
+    if (copy_to_user(fds, kfds, sizeof(kfds)) != 0) {
+        vfs_close(kfds[0]);
+        vfs_close(kfds[1]);
         return (uint64_t)(int64_t)ERR_FAULT;
+    }
     return 0;
 }
 
@@ -611,6 +730,81 @@ static uint64_t sys_lseek(int_frame_t* frame) {
     int64_t ret = vfs_lseek(fd, offset, whence);
     if (ret < 0) return (uint64_t)(int64_t)ERR_INVAL;
     return (uint64_t)ret;
+}
+
+static uint64_t sys_mmap(int_frame_t* frame) {
+    uint64_t addr  = frame->rdi;
+    size_t   len   = frame->rsi;
+    int      prot  = (int)frame->rdx;
+    int      flags = (int)frame->r10;
+    /* fd = frame->r8; offset = frame->r9; (ignored for anonymous) */
+
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    if (!proc) return (uint64_t)-1;
+
+    size_t page_len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (page_len == 0) return (uint64_t)-1;
+
+    uint64_t vaddr;
+    if (flags & 0x10) { /* MAP_FIXED */
+        if (addr & 0xFFF) return (uint64_t)-1;
+        if (addr < 0x40000000 || addr + page_len > 0x80000000) return (uint64_t)-1;
+        vaddr = addr;
+    } else {
+        vaddr = proc->mmap_brk;
+        proc->mmap_brk += page_len;
+        if (proc->mmap_brk > 0x7FFF0000) return (uint64_t)-1;
+    }
+
+    uint64_t pgfl = PAGE_USER;
+    if (prot & 0x2) pgfl |= PAGE_WRITE;
+
+    for (uint64_t p = vaddr; p < vaddr + page_len; p += PAGE_SIZE) {
+        page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
+        if (pte && (*pte & PAGE_PRESENT)) continue;  /* already mapped */
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return (uint64_t)-1;
+        kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+        vmm_map_page(proc->cr3, p, phys, pgfl);
+    }
+    return vaddr;
+}
+
+static uint64_t sys_munmap(int_frame_t* frame) {
+    uint64_t addr = frame->rdi;
+    size_t   len  = frame->rsi;
+    if (addr & 0xFFF) return (uint64_t)(int64_t)ERR_INVAL;
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    if (!proc) return (uint64_t)-1;
+    size_t page_len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t p = addr; p < addr + page_len; p += PAGE_SIZE) {
+        page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
+        if (!pte || !(*pte & PAGE_PRESENT)) continue;
+        uint64_t phys = *pte & ~0xFFFULL;
+        pmm_free_page(phys);
+        vmm_unmap_page(proc->cr3, p);
+    }
+    return 0;
+}
+
+static uint64_t sys_mprotect(int_frame_t* frame) {
+    uint64_t addr = frame->rdi;
+    size_t   len  = frame->rsi;
+    int      prot = (int)frame->rdx;
+    if (addr & 0xFFF) return (uint64_t)(int64_t)ERR_INVAL;
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    if (!proc) return (uint64_t)-1;
+    size_t page_len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t p = addr; p < addr + page_len; p += PAGE_SIZE) {
+        page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
+        if (!pte || !(*pte & PAGE_PRESENT)) continue;
+        uint64_t base = *pte & ~0xFFFULL;
+        uint64_t flags = PAGE_USER | PAGE_PRESENT;
+        if (prot & 0x2) flags |= PAGE_WRITE;
+        *pte = base | flags;
+        vmm_flush_tlb_page(p);
+    }
+    return 0;
 }
 
 typedef uint64_t (*syscall_fn)(int_frame_t*);
@@ -642,6 +836,13 @@ static syscall_fn syscall_table[] = {
     sys_kill,      /* 24 */
     sys_sigaction, /* 25 */
     sys_clone,     /* 26 */
+    sys_sigreturn, /* 27 */
+    sys_getcwd,    /* 28 */
+    sys_chdir,     /* 29 */
+    sys_dup2,      /* 30 */
+    sys_mmap,      /* 31 */
+    sys_munmap,    /* 32 */
+    sys_mprotect,  /* 33 */
 };
 
 void syscall_init(void) {

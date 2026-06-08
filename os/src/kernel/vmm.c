@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "vmm.h"
 #include "pmm.h"
+#include "hal.h"
 
 #define PML4_INDEX(v)  (((v) >> 39) & 0x1FF)
 #define PDPT_INDEX(v)  (((v) >> 30) & 0x1FF)
@@ -100,6 +101,7 @@ void vmm_flush_tlb_page(uint64_t virt) {
 }
 
 err_t vmm_duplicate_user_pages(uint64_t dst_pml4, uint64_t src_pml4) {
+    cpu_flags_t flags = hal_save_irq();
     page_entry_t* src_entries = (page_entry_t*)PHYS_TO_VIRT(src_pml4);
     for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
         if (!(src_entries[pml4_idx] & PAGE_PRESENT)) continue;
@@ -122,16 +124,17 @@ err_t vmm_duplicate_user_pages(uint64_t dst_pml4, uint64_t src_pml4) {
                                     ((uint64_t)pd_idx << 21) |
                                     ((uint64_t)pt_idx << 12);
                     uint64_t src_phys = src_pt[pt_idx] & ~0xFFFULL;
-                    uint64_t flags = src_pt[pt_idx] & 0xFFF;
+                    uint64_t flags2 = src_pt[pt_idx] & 0xFFF;
                     uint64_t new_phys = pmm_alloc_page();
-                    if (!new_phys) return ERR_NOMEM;
+                    if (!new_phys) { hal_restore_irq(flags); return ERR_NOMEM; }
                     kmemcpy((void*)PHYS_TO_VIRT(new_phys),
                             (void*)PHYS_TO_VIRT(src_phys), PAGE_SIZE);
-                    vmm_map_page(dst_pml4, virt, new_phys, flags);
+                    vmm_map_page(dst_pml4, virt, new_phys, flags2);
                 }
             }
         }
     }
+    hal_restore_irq(flags);
     return ERR_OK;
 }
 

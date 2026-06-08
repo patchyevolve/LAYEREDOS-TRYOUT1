@@ -18,6 +18,7 @@
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 void shell_init(void);
 void shell_run(void);
+int  shell_source(const char* path);
 
 /* ── Pipe / redirection engine (used by built-ins that want to be pipeable) */
 

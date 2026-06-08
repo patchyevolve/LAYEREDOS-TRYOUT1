@@ -34,7 +34,14 @@
 #define SYS_KILL      24
 #define SYS_SIGACTION 25
 #define SYS_CLONE     26
+#define SYS_SIGRETURN 27
+#define SYS_GETCWD   28
+#define SYS_CHDIR    29
+#define SYS_DUP2     30
+#define SYS_MMAP     31
+#define SYS_MUNMAP   32
+#define SYS_MPROTECT 33
 
-#define SYSCALL_COUNT 27
+#define SYSCALL_COUNT 34
 
 #endif

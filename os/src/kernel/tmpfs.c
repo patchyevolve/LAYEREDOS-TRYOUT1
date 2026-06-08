@@ -232,10 +232,25 @@ static int tmpfs_vfs_rename(vfs_node_t* old_dir, const char* old_name,
     tmpfs_dirent_t* d = tmpfs_lookup(old_parent, old_name);
     if (!d) return -1;
 
-    if (tmpfs_lookup(new_parent, new_name)) return -1;
+    /* If target exists, unlink it first (atomically replace) */
+    tmpfs_dirent_t* t = tmpfs_lookup(new_parent, new_name);
+    if (t) {
+        if (t->file == d->file) return 0;
+        tmpfs_file_t* tf = t->file;
+        if (tf->nlink > 1) {
+            tf->nlink--;
+        } else {
+            for (uint32_t i = 0; i < tf->nblocks; i++)
+                if (tf->blocks[i]) pmm_free_page(tf->blocks[i]);
+            if (tf->blocks) kfree(tf->blocks);
+            kfree(tf);
+        }
+        tmpfs_remove_dirent(new_parent, new_name);
+    }
 
     tmpfs_add_dirent(new_parent, new_name, d->file);
-    tmpfs_remove_dirent(old_parent, old_name);
+    if (old_parent != new_parent || kstrcmp(old_name, new_name) != 0)
+        tmpfs_remove_dirent(old_parent, old_name);
     return 0;
 }
 

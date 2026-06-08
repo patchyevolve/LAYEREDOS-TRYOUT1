@@ -3,6 +3,12 @@
 #include "sched.h"
 #include "syscall.h"
 #include "process.h"
+#include "hpet.h"
+#include "apic.h"
+#include "swap.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "tty.h"
 
 
 #define UART_BASE 0x3F8
@@ -24,7 +30,6 @@
 
 #define IDT_ENTRIES 256
 #define GDT_ENTRIES 7
-#define UART_RX_BUF_SIZE 256
 
 typedef struct {
     uint16_t size;
@@ -81,10 +86,6 @@ int hal_smap_enabled(void) {
     return available;
 }
 
-static volatile char uart_rx_buf[UART_RX_BUF_SIZE];
-static volatile int uart_rx_head = 0;
-static volatile int uart_rx_tail = 0;
-static wait_queue_t uart_rx_waitq;
 static int uart_rx_irq_active = 0;
 
 static inline void io_wait(void) { outb(0x80, 0); }
@@ -199,10 +200,12 @@ uint64_t hal_get_kernel_stack(void) {
 }
 
 void hal_enable_irqs(void) {
-    // Unmask timer IRQ0 and UART IRQ4
+    // Unmask timer IRQ0, UART IRQ4, ATA IRQ14+15
     uint16_t mask = inb(PIC1_DATA) | (inb(PIC2_DATA) << 8);
-    mask &= ~(1 << 0); // Timer IRQ0
+    mask &= ~(1 << 0);       // Timer IRQ0
     mask &= ~(1 << UART_IRQ); // UART IRQ4
+    mask &= ~(1 << 14);       // ATA primary IRQ14
+    mask &= ~(1 << 15);       // ATA secondary IRQ15
     outb(PIC1_DATA, mask & 0xFF);
     outb(PIC2_DATA, (mask >> 8) & 0xFF);
 }
@@ -221,6 +224,7 @@ static void pic_remap(void) {
 }
 
 void hal_irq_eoi(uint8_t irq) {
+    if (apic_present) apic_eoi();
     if (irq >= 8) outb(PIC2_CMD, 0x20);
     outb(PIC1_CMD, 0x20);
 }
@@ -235,6 +239,7 @@ err_t hal_irq_register(uint8_t irq, irq_handler_t handler, void* data) {
 }
 
 err_t hal_timer_init(uint32_t hz) {
+    if (hz == 0) hz = 1000;
     timer_hz = hz;
     uint32_t divisor = 1193182 / hz;
     outb(PIT_CMD, 0x36);
@@ -246,6 +251,9 @@ err_t hal_timer_init(uint32_t hz) {
 uint64_t hal_timer_get_ticks(void) { return timer_ticks; }
 
 uint64_t hal_timer_get_ns(void) {
+    if (hpet_present) {
+        return hpet_ns();
+    }
     unsigned __int128 ns = (unsigned __int128)timer_ticks * 1000000000ULL;
     return (uint64_t)(ns / timer_hz);
 }
@@ -256,19 +264,12 @@ static void uart_rx_isr(int_frame_t* frame, void* data) {
     (void)frame; (void)data;
     while (inb(UART_LSR) & 1) {
         char c = inb(UART_RBR);
-        int next = (uart_rx_head + 1) % UART_RX_BUF_SIZE;
-        if (next != uart_rx_tail) {
-            uart_rx_buf[uart_rx_head] = c;
-            uart_rx_head = next;
-        }
+        tty_input_push(c);
     }
-    sched_wake(&uart_rx_waitq);
     need_reschedule = 1;
 }
 
 err_t hal_uart_rx_init(void) {
-    uart_rx_waitq.waiters = NULL;
-    uart_rx_waitq.count = 0;
     err_t e = hal_irq_register(UART_IRQ, uart_rx_isr, NULL);
     if (e) return e;
     outb(UART_IER, 0x01);
@@ -281,19 +282,14 @@ char hal_uart_getchar(void) {
         while (!(inb(UART_LSR) & 1));
         return inb(UART_RBR);
     }
-    cpu_flags_t flags = hal_save_irq();
-    while (uart_rx_head == uart_rx_tail) {
-        sched_block(&uart_rx_waitq);
-    }
-    char c = uart_rx_buf[uart_rx_tail];
-    uart_rx_tail = (uart_rx_tail + 1) % UART_RX_BUF_SIZE;
-    hal_restore_irq(flags);
-    return c;
+    return tty_getchar();
 }
 
 int hal_uart_data_available(void) {
-    if (uart_rx_irq_active)
-        return (uart_rx_head != uart_rx_tail) ? 1 : 0;
+    if (uart_rx_irq_active) {
+        extern tty_t tty_console;
+        return (tty_console.raw_head != tty_console.raw_tail) ? 1 : 0;
+    }
     return (inb(UART_LSR) & 1) ? 1 : 0;
 }
 
@@ -339,7 +335,9 @@ uint64_t hal_get_mem_size(uint64_t mb_info) {
                 uint64_t end = entry->base_addr + entry->length;
                 if (end > max_addr) max_addr = end;
             }
-            uint32_t entry_size = entry->size + 4;
+            uint32_t entry_size;
+            if (entry->size > ((uint32_t)-1) - 4) break;
+            entry_size = entry->size + 4;
             entry = (mmap_entry_t*)((uint64_t)entry + entry_size);
             remaining -= (remaining >= entry_size) ? entry_size : remaining;
         }
@@ -364,19 +362,54 @@ void interrupt_handler(int_frame_t* frame) {
             irq_handlers[irq].handler(frame, irq_handlers[irq].data);
         }
         hal_irq_eoi(irq);
+        /* Deliver pending signals when returning to user mode */
+        if ((frame->cs & 3) == 3 && current_thread && current_thread->proc) {
+            signal_deliver_custom(current_thread->proc, frame);
+        }
         return;
     }
 
     if (vec == 128) {
         syscall_handler(frame);
+        /* Deliver pending custom signals on return to user mode */
+        if ((frame->cs & 3) == 3 && current_thread && current_thread->proc) {
+            signal_deliver_custom(current_thread->proc, frame);
+        }
         return;
     }
 
     if (vec == 14) {
+        asm volatile("cli");
         uint64_t cr2 = read_cr2();
         uint64_t fault_rip = frame->rip;
         uint64_t err = frame->error_code;
         if ((frame->cs & 3) == 3) {
+            /* Check if this is a swapped-out page */
+            if (current_thread && current_thread->proc) {
+                uint64_t cr3 = current_thread->cr3;
+                if (cr3) {
+                    page_entry_t* pte = vmm_walk_pagetable(cr3, cr2);
+                    if (pte && (*pte & SWAP_PTE_MARKER) && !(*pte & PAGE_PRESENT)) {
+                        int slot = swap_decode_pte(*pte);
+                        kprintf("[SWAP] Page fault resolved: slot %d -> %llx\n",
+                                slot, cr2);
+                        uint64_t new_page = pmm_alloc_page();
+                        if (!new_page) {
+                            kprintf("[SWAP] Failed to allocate page for swap-in\n");
+                            process_exit(current_thread->proc, -11);
+                            thread_exit(-11);
+                            for (;;) asm volatile("cli; hlt");
+                        }
+                        if (swap_in(slot, new_page) != ERR_OK) {
+                            kprintf("[SWAP] swap_in failed for slot %d\n", slot);
+                        }
+                        swap_free_slot(slot);
+                        *pte = new_page | PAGE_PRESENT | swap_decode_pte_flags(*pte);
+                        vmm_flush_tlb_page(cr2);
+                        return;
+                    }
+                }
+            }
             kprintf("PAGE FAULT pid=%lu rip=%lx addr=%lx error=%lu -- killing process\n",
                     current_thread && current_thread->proc ? current_thread->proc->pid : 0,
                     fault_rip, cr2, err);
@@ -417,7 +450,7 @@ void hal_poweroff(void) {
 
 void hal_reboot(void) {
     kputs("System reboot.\n");
-    while (inb(0x64) & 2);
+    for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) asm("pause");
     outb(0x64, 0xFE);
     for (;;) { asm volatile("cli; hlt"); }
 }

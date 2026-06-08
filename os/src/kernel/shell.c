@@ -32,10 +32,14 @@
 #include "keyboard.h"
 #include "ata.h"
 #include "process.h"
+#include "tty.h"
 #include "elf.h"
 #include "kmalloc.h"
 #include "block.h"
 #include "sfs.h"
+#include "fsck.h"
+#include "snap.h"
+#include "backup.h"
 
 extern char _binary_build_user_program_elf_start[];
 extern char _binary_build_user_program_elf_end[];
@@ -68,6 +72,7 @@ static int       env_count = 0;
 
 /* Current working directory */
 static char cwd[SHELL_LINE_BUF] = "/";
+static int last_exit_code = 0;
 
 /* Script nesting depth */
 static int script_depth = 0;
@@ -153,6 +158,23 @@ static void expand_vars(const char* src, char* dst, int dst_size) {
     while (*s && d < dst_size - 1) {
         if (*s == '$') {
             s++;
+            if (*s == '?') {
+                s++;
+                char buf[16];
+                int  bn = 0;
+                int  ec = last_exit_code;
+                if (ec == 0) { buf[bn++] = '0'; }
+                else {
+                    int neg = (ec < 0);
+                    if (neg) { ec = -ec; buf[bn++] = '-'; }
+                    char tmp[16]; int tn = 0;
+                    while (ec) { tmp[tn++] = (char)('0' + ec % 10); ec /= 10; }
+                    while (tn) buf[bn++] = tmp[--tn];
+                }
+                for (int i = 0; i < bn && d < dst_size - 1; i++)
+                    dst[d++] = buf[i];
+                continue;
+            }
             char vname[SHELL_ENV_NAME];
             int  vn = 0;
             while (*s && ((*s >= 'a' && *s <= 'z') ||
@@ -345,6 +367,20 @@ static int parse_pipeline(char* line, pipeline_stage_t stages[]) {
                 if (*p) { *p = '\0'; p++; }
                 continue;
             }
+            if (*p == '\'') {
+                p++;
+                st->argv[st->argc++] = p;
+                while (*p && *p != '\'') p++;
+                if (*p) { *p = '\0'; p++; }
+                continue;
+            }
+            if (*p == '\\') {
+                p++;
+                if (!*p) continue;
+                st->argv[st->argc++] = p;
+                p++;
+                continue;
+            }
 
             st->argv[st->argc++] = p;
             while (*p && *p != ' ' && *p != '\t' &&
@@ -424,8 +460,9 @@ static void do_tab_complete(void) {
             kprintf("%s", line_buf);
         }
     } else {
-        char dir_part[SHELL_LINE_BUF];
-        char file_part[SHELL_LINE_BUF];
+        char* dir_part = kmalloc(SHELL_LINE_BUF);
+        char* file_part = kmalloc(SHELL_LINE_BUF);
+        if (!dir_part || !file_part) { kfree(dir_part); kfree(file_part); return; }
         kmemset(dir_part, 0, SHELL_LINE_BUF);
         kmemset(file_part, 0, SHELL_LINE_BUF);
         dir_part[0] = '/';
@@ -443,11 +480,12 @@ static void do_tab_complete(void) {
         }
 
         int fplen = kstrlen(file_part);
-        char resolved[SHELL_LINE_BUF];
+        char* resolved = kmalloc(SHELL_LINE_BUF);
+        if (!resolved) { kfree(dir_part); kfree(file_part); return; }
         resolve_path(dir_part, resolved, SHELL_LINE_BUF);
 
         vfs_node_t* dir = vfs_find(resolved);
-        if (!dir || !dir->fs || !dir->fs->ops || !dir->fs->ops->readdir) return;
+        if (!dir || !dir->fs || !dir->fs->ops || !dir->fs->ops->readdir) { kfree(resolved); kfree(dir_part); kfree(file_part); return; }
 
         char match_name[256] = "";  int n_match = 0;
         uint32_t idx = 0;
@@ -481,6 +519,9 @@ static void do_tab_complete(void) {
             line_buf[line_pos] = '\0';
             kprintf("%s", line_buf);
         }
+        kfree(resolved);
+        kfree(dir_part);
+        kfree(file_part);
     }
 }
 
@@ -844,10 +885,18 @@ static void cmd_fg(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
         signal_send((pid_t)pid, SIGCONT);
         signal_process(proc);
     }
+
+    /* Give foreground TTY ownership to the process */
+    uint64_t old_fg = tty_get_fg_pgid();
+    tty_set_fg_pgid(proc->pgid);
+
     shell_update_job((pid_t)pid);
-    /* Wait for the process to exit */
+    /* Wait for the process to exit or be stopped again */
     while (!proc->exited && !(proc->flags & PROC_FLAG_STOPPED))
         sched_block(&proc->exit_waiters);
+
+    tty_set_fg_pgid(old_fg);
+
     if (proc->exited) {
         kprintf("[fg] pid %lu exited with code %d\n", pid, proc->exit_code);
         shell_remove_job((pid_t)pid);
@@ -956,8 +1005,16 @@ static void cmd_run(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     process_t* proc = process_create(args[1], 1);
     if (!proc) { kfree(buf); kprintf("run: create failed\n"); return; }
     err_t e = process_exec(proc, buf, fsz);
-    if (e) kprintf("run: exec failed: %d\n", e);
-    else   kprintf("[run] pid=%d '%s'\n", proc->pid, args[1]);
+    if (e) { kprintf("run: exec failed: %d\n", e); kfree(buf); return; }
+    kprintf("[run] pid=%d '%s'\n", proc->pid, args[1]);
+
+    /* Give foreground TTY ownership to the child */
+    uint64_t old_fg = tty_get_fg_pgid();
+    tty_set_fg_pgid(proc->pgid);
+    while (!proc->exited && !(proc->flags & PROC_FLAG_STOPPED))
+        sched_block(&proc->exit_waiters);
+    tty_set_fg_pgid(old_fg);
+
     kfree(buf);
 }
 
@@ -1650,6 +1707,58 @@ static void cmd_format(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     kprintf("SFS formatted and remounted.\n");
 }
 
+static void cmd_snap(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)in; (void)out;
+    if (argc < 2) { kprintf("Usage: snap take|rollback|info\n"); return; }
+    block_dev_t* bdev = block_find("ramdisk");
+    if (!bdev) { kprintf("snap: no ramdisk\n"); return; }
+    if (kstrcmp(args[1], "take") == 0) {
+        err_t e = snapshot_take(bdev);
+        kprintf("snap: %s\n", e ? "failed" : "ok");
+    } else if (kstrcmp(args[1], "rollback") == 0) {
+        if (!snapshot_exists()) { kprintf("snap: no snapshot\n"); return; }
+        err_t e = snapshot_rollback(bdev);
+        kprintf("snap: %s (%d)\n", e ? "rollback failed" : "rolled back", e);
+    } else if (kstrcmp(args[1], "info") == 0) {
+        if (snapshot_exists())
+            kprintf("snap: snapshot exists\n");
+        else
+            kprintf("snap: no snapshot\n");
+    } else {
+        kprintf("snap: unknown subcommand '%s'\n", args[1]);
+    }
+}
+
+static void cmd_backup(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)in; (void)out;
+    if (argc < 3) { kprintf("Usage: backup save <archive> | restore <archive>\n"); return; }
+    if (kstrcmp(args[1], "save") == 0) {
+        if (backup_create(args[2]) == 0)
+            kprintf("backup: saved to '%s'\n", args[2]);
+        else
+            kprintf("backup: save failed\n");
+    } else if (kstrcmp(args[1], "restore") == 0) {
+        if (backup_restore(args[2]) == 0)
+            kprintf("backup: restored from '%s'\n", args[2]);
+        else
+            kprintf("backup: restore failed\n");
+    } else {
+        kprintf("backup: unknown subcommand '%s'\n", args[1]);
+    }
+}
+
+static void cmd_fsck(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)in; (void)out;
+    int repair = (argc > 1 && kstrcmp(args[1], "-r") == 0);
+    block_dev_t* bdev = block_find("ramdisk");
+    if (!bdev) { kprintf("fsck: no ramdisk\n"); return; }
+    err_t e = sfs_fsck(bdev, repair);
+    if (e == ERR_OK)
+        kprintf("fsck: filesystem is clean.\n");
+    else
+        kprintf("fsck: found errors (%d)\n", e);
+}
+
 static void cmd_mount(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     (void)args; (void)argc; (void)in;
     cmd_printf(out, "Block devices:\n");
@@ -1835,6 +1944,9 @@ static shell_cmd_t commands[] = {
     /* Hardware / storage */
     {"kbtest",    cmd_kbtest,    "Keyboard input test"},
     {"atatest",   cmd_atatest,   "Show ATA drives"},
+    {"snap",      cmd_snap,      "Snapshot: take|rollback|info"},
+    {"backup",    cmd_backup,    "Backup: save <archive> | restore <archive>"},
+    {"fsck",      cmd_fsck,      "Check SFS integrity [-r to repair]"},
     {"format",    cmd_format,    "Format+remount SFS on ramdisk"},
     {"mount",     cmd_mount,     "List block devices"},
     /* Danger zone */
@@ -1915,10 +2027,11 @@ static void exec_stage(pipeline_stage_t* st,
         if (kstrcmp(commands[i].name, cmd_name) == 0) {
             commands[i].func(st->argv, st->argc, eff_in, eff_out);
             found = 1;
+            last_exit_code = 0;
             break;
         }
     }
-    if (!found) kprintf("Unknown command: %s\n", cmd_name);
+    if (!found) { kprintf("Unknown command: %s\n", cmd_name); last_exit_code = 1; }
 
     if (redir_out_fd >= 0) {
         vfs_write(redir_out_fd, redir_out_buf.data, (uint64_t)redir_out_buf.len);
@@ -2113,6 +2226,9 @@ void shell_run(void) {
     kprintf("║  Vars:  $NAME     Aliases: alias n=v          ║\n");
     kprintf("╚══════════════════════════════════════════════╝\n");
 
+    /* Run startup script */
+    shell_source("/etc/rc");
+
     line_pos = line_len = 0;
     hist_nav = hist_count;
 
@@ -2127,8 +2243,10 @@ void shell_run(void) {
 
         if (c == 0x1B) {
             int b = hal_uart_getchar();
+            if (b < 0) { editor_insert(0x1B); continue; }
             if (b == '[') {
                 int d = hal_uart_getchar();
+                if (d < 0) { editor_insert(0x1B); editor_insert('['); continue; }
                 if (d == 'A') {
                     if (hist_count == 0) continue;
                     if (hist_nav == hist_count) {
@@ -2166,11 +2284,17 @@ void shell_run(void) {
                 } else if (d == '4') {
                     int e2 = hal_uart_getchar();
                     if (e2 == '~') editor_end();
+                } else if (d >= ' ') {
+                    editor_insert(0x1B); editor_insert('['); editor_insert((char)d);
                 }
             } else if (b == 'O') {
                 int d = hal_uart_getchar();
+                if (d < 0) { editor_insert(0x1B); editor_insert('O'); continue; }
                 if (d == 'H') editor_home();
                 else if (d == 'F') editor_end();
+                else { editor_insert(0x1B); editor_insert('O'); editor_insert((char)d); }
+            } else if (b >= ' ') {
+                editor_insert(0x1B); editor_insert((char)b);
             }
             continue;
         }

@@ -6,6 +6,8 @@
 #include "sync.h"
 #include "elf.h"
 #include "hal.h"
+#include "vfs.h"
+#include "kmalloc.h"
 
 /* ASLR helpers */
 #define ASLR_STACK_PAGES 0x100
@@ -45,7 +47,7 @@ err_t process_init(void) {
 }
 
 process_t* process_create(const char* name, pid_t ppid) {
-    spinlock_acquire(&process_lock);
+    cpu_flags_t _sflags; spinlock_acquire(&process_lock, &_sflags);
 
     // Find free slot in process table
     int slot = -1;
@@ -56,7 +58,7 @@ process_t* process_create(const char* name, pid_t ppid) {
         }
     }
     if (slot == -1) {
-        spinlock_release(&process_lock);
+        spinlock_release(&process_lock, _sflags);
         return NULL;
     }
 
@@ -64,17 +66,21 @@ process_t* process_create(const char* name, pid_t ppid) {
     kmemset(proc, 0, sizeof(process_t));
     proc->pid = next_pid++;
     proc->ppid = ppid;
+    proc->pgid = proc->pid;
     kstrncpy(proc->name, name, PROCESS_NAME_MAX - 1);
     list_init(&proc->threads);
     proc->pending_signals = 0;
     proc->blocked_signals = 0;
     proc->flags = 0;
     kmemset(proc->signal_actions, 0, sizeof(proc->signal_actions));
+    spinlock_init(&proc->signal_lock, "signal_lock");
+    proc->cwd[0] = '/';
+    proc->cwd[1] = 0;
 
     // Allocate new page table (copy kernel mappings)
     uint64_t pml4_phys = pmm_alloc_page();
     if (!pml4_phys) {
-        spinlock_release(&process_lock);
+        spinlock_release(&process_lock, _sflags);
         return NULL;
     }
 
@@ -82,6 +88,7 @@ process_t* process_create(const char* name, pid_t ppid) {
     kmemset((void*)PHYS_TO_VIRT(pml4_phys), 0, PAGE_SIZE);
 
     // Copy kernel mappings (top half) from current CR3
+    cpu_flags_t irq_flags = hal_save_irq();
     uint64_t cr3_val;
     asm volatile("mov %%cr3, %0" : "=r"(cr3_val));
     uint64_t* current_pml4 = (uint64_t*)PHYS_TO_VIRT(cr3_val);
@@ -89,33 +96,175 @@ process_t* process_create(const char* name, pid_t ppid) {
     for (int i = 256; i < 512; i++) {
         new_pml4[i] = current_pml4[i];
     }
+    hal_restore_irq(irq_flags);
 
     proc->cr3 = pml4_phys;
+    proc->mmap_brk = 0x40000000;
 
     list_add_tail(&process_list, &proc->process_node);
-    spinlock_release(&process_lock);
+    spinlock_release(&process_lock, _sflags);
 
     return proc;
 }
 
 err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
+    /* Step 1: Scan for PT_INTERP in the ELF */
+    char interp_path[256] = {0};
+    int has_interp = 0;
+    {
+        const elf64_hdr_t* hdr = (const elf64_hdr_t*)elf_data;
+        if (elf_len >= sizeof(elf64_hdr_t) && hdr->magic == ELF_MAGIC && hdr->cls == ELF_64) {
+            if (hdr->phoff + (uint64_t)hdr->phnum * hdr->phentsize > elf_len) return ERR_INVAL;
+            const elf64_phdr_t* ph = (const elf64_phdr_t*)((uint64_t)elf_data + hdr->phoff);
+            for (uint16_t i = 0; i < hdr->phnum; i++) {
+                if (ph[i].type == PT_INTERP) {
+                    size_t plen = ph[i].filesz;
+                    if (plen > sizeof(interp_path) - 1) plen = sizeof(interp_path) - 1;
+                    kmemcpy(interp_path, (const void*)((uint64_t)elf_data + ph[i].offset), plen);
+                    interp_path[plen] = '\0';
+                    /* Trim trailing newline if present */
+                    while (plen > 0 && (interp_path[plen-1] == '\n' || interp_path[plen-1] == '\r'))
+                        interp_path[--plen] = '\0';
+                    has_interp = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Step 2: Load main program */
     err_t e = elf_load(proc, elf_data, elf_len);
     if (e) return e;
 
+    /* Save main program info for aux vector */
+    const elf64_hdr_t* mhdr = (const elf64_hdr_t*)elf_data;
+    uint64_t main_entry  = proc->entry_point;
+    uint64_t main_base   = main_entry - mhdr->entry;
+    uint64_t main_phdr   = elf_phdr_vaddr(elf_data, main_base);
+    uint16_t main_phnum  = mhdr->phnum;
+
+    /* Step 3: Load interpreter if needed */
+    uint64_t interp_entry = 0;
+    uint64_t interp_base  = 0;
+
+    if (has_interp) {
+        int fd = vfs_open(interp_path, 0);
+        if (fd < 0) {
+            kprintf("[PROCESS] Interpreter '%s' not found\n", interp_path);
+            return ERR_NOENT;
+        }
+        uint64_t fsz = vfs_lseek(fd, 0, VFS_SEEK_END);
+        vfs_lseek(fd, 0, VFS_SEEK_SET);
+        uint8_t* ibuf = (uint8_t*)kmalloc(fsz);
+        if (!ibuf) { vfs_close(fd); return ERR_NOMEM; }
+        vfs_read(fd, ibuf, fsz);
+        vfs_close(fd);
+
+        /* Load interpreter at fixed address to avoid conflict with main program */
+        const elf64_hdr_t* ihdr = (const elf64_hdr_t*)ibuf;
+        uint64_t interp_load_at = 0x7F000000;
+        e = elf_load_fixed(proc, ibuf, fsz, interp_load_at);
+        if (e) { kfree(ibuf); return e; }
+
+        interp_entry = proc->entry_point;
+        interp_base  = interp_entry - ihdr->entry;
+        kfree(ibuf);
+
+        /* Verify the interpreter was loaded at the expected base */
+        if (interp_base != interp_load_at && ihdr->type != ELF_EXEC)
+            interp_base = interp_load_at; /* for EXEC the base is the linked address itself */
+    }
+
+    /* Step 4: Set up user stack */
     uint64_t stack_page = pmm_alloc_page();
     if (!stack_page) return ERR_NOMEM;
     kmemset((void*)PHYS_TO_VIRT(stack_page), 0, PAGE_SIZE);
 
-    /* Randomize stack address */
-    uint64_t stack_offset = (aslr_rand() % ASLR_STACK_PAGES) * PAGE_SIZE;
+    uint64_t stack_offset = (aslr_rand() & (ASLR_STACK_PAGES - 1)) * PAGE_SIZE;
     uint64_t user_stack   = ASLR_STACK_BASE + stack_offset;
     uint64_t user_stack_top = user_stack + PAGE_SIZE;
 
     uint64_t cr3 = proc->cr3;
     vmm_map_page(cr3, user_stack, stack_page, PAGE_USER | PAGE_WRITE);
 
-    /* Set heap base (brk) below stack */
-    proc->user_stack_top = user_stack;
+    /* Build ELF ABI stack layout */
+    uint8_t* stk = (uint8_t*)PHYS_TO_VIRT(stack_page);
+
+    size_t nlen = kstrlen(proc->name) + 1;
+    uint64_t string_off = PAGE_SIZE - nlen;
+    kmemcpy(stk + string_off, proc->name, nlen);
+    string_off &= ~7ULL;
+    uint64_t prog_vaddr = user_stack + string_off;
+
+    uint64_t n_auxv = has_interp ? 14 : 0;
+    uint64_t abi_size = 32 + n_auxv * 8;
+
+    uint64_t rsp_off = string_off - abi_size;
+    rsp_off &= ~(16ULL - 1);
+    user_stack_top = user_stack + rsp_off;
+
+    uint64_t pos = rsp_off;
+    *(uint64_t*)(stk + pos) = 1;          pos += 8;
+    *(uint64_t*)(stk + pos) = prog_vaddr; pos += 8;
+    *(uint64_t*)(stk + pos) = 0;          pos += 8;
+    *(uint64_t*)(stk + pos) = 0;          pos += 8;
+
+    if (has_interp) {
+        *(uint64_t*)(stk + pos) = 3;          pos += 8;
+        *(uint64_t*)(stk + pos) = main_phdr;  pos += 8;
+        *(uint64_t*)(stk + pos) = 4;                     pos += 8;
+        *(uint64_t*)(stk + pos) = sizeof(elf64_phdr_t);  pos += 8;
+        *(uint64_t*)(stk + pos) = 5;           pos += 8;
+        *(uint64_t*)(stk + pos) = main_phnum;  pos += 8;
+        *(uint64_t*)(stk + pos) = 6;      pos += 8;
+        *(uint64_t*)(stk + pos) = 4096;   pos += 8;
+        *(uint64_t*)(stk + pos) = 7;           pos += 8;
+        *(uint64_t*)(stk + pos) = interp_base; pos += 8;
+        *(uint64_t*)(stk + pos) = 9;          pos += 8;
+        *(uint64_t*)(stk + pos) = main_entry; pos += 8;
+        *(uint64_t*)(stk + pos) = 0; pos += 8;
+        *(uint64_t*)(stk + pos) = 0; pos += 8;
+    }
+
+    /* Update entry point to interpreter if dynamic linking */
+    if (has_interp) {
+        proc->entry_point = interp_entry;
+    }
+
+    /* Set heap base (brk) immediately after the user stack */
+    proc->user_stack_top = user_stack + PAGE_SIZE;
+
+    /* Map signal trampoline page for sigreturn, plus auxv data at a fixed offset */
+    {
+        uint64_t tramp_page = pmm_alloc_page();
+        if (!tramp_page) return ERR_NOMEM;
+        kmemset((void*)PHYS_TO_VIRT(tramp_page), 0, PAGE_SIZE);
+        uint8_t* tramp = (uint8_t*)PHYS_TO_VIRT(tramp_page);
+        tramp[0] = 0x48; tramp[1] = 0x89; tramp[2] = 0xE7;
+        tramp[3] = 0x48; tramp[4] = 0xC7; tramp[5] = 0xC0;
+        tramp[6] = 27;   tramp[7] = 0x00; tramp[8] = 0x00; tramp[9] = 0x00;
+        tramp[10] = 0xCD; tramp[11] = 0x80;
+        tramp[12] = 0xEB; tramp[13] = 0xFD;
+        vmm_map_page(cr3, SIGNAL_TRAMPOLINE_ADDR, tramp_page,
+                     PAGE_PRESENT | PAGE_USER);
+
+        /* Write auxv + argc at fixed offset 0x100 in the trampoline page */
+        uint64_t* ap = (uint64_t*)(tramp + 0x100);
+        if (has_interp) {
+            *ap++ = 3;    *ap++ = main_phdr;
+            *ap++ = 4;    *ap++ = sizeof(elf64_phdr_t);
+            *ap++ = 5;    *ap++ = main_phnum;
+            *ap++ = 6;    *ap++ = 4096;
+            *ap++ = 7;    *ap++ = interp_base;
+            *ap++ = 9;    *ap++ = main_entry;
+            *ap++ = 0;    *ap++ = 0;
+        } else {
+            *ap++ = 0; *ap++ = 0; /* AT_NULL sentinel */
+        }
+        /* Store argc and argv[0] at fixed offsets for ld.so */
+        *(uint64_t*)(tramp + 0x0F0) = 1;
+        *(uint64_t*)(tramp + 0x0F8) = prog_vaddr;
+    }
 
     thread_t* tcb = (thread_t*)PHYS_TO_VIRT(pmm_alloc_page());
     if (!tcb) return ERR_NOMEM;
@@ -142,7 +291,11 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
     *(--sp) = 0;
     *(--sp) = 0;
 
-    for (int i = 0; i < 15; i++) *(--sp) = 0;
+    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
+    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
+    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
+    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
+    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
 
     *(--sp) = (uint64_t)user_thread_entry;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
@@ -153,6 +306,7 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
     tcb->cr3 = cr3;
     tcb->state = THREAD_CREATED;
     tcb->priority = THREAD_DEF_PRIO;
+    tcb->base_priority = THREAD_DEF_PRIO;
     tcb->time_slice_remaining = 0;
     tcb->kernel_stack = kstack;
     tcb->kernel_stack_size = THREAD_STACK_SIZE;
@@ -171,8 +325,9 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
 
     sched_add_thread(tcb);
 
-    kprintf("[PROCESS] Exec'd %s (pid %d, entry=%llx, stack=%llx)\n",
-            proc->name, proc->pid, proc->entry_point, user_stack);
+    kprintf("[PROCESS] Exec'd %s (pid %d, entry=%llx, stack=%llx)%s\n",
+            proc->name, proc->pid, proc->entry_point, user_stack,
+            has_interp ? " [interp]" : "");
     return ERR_OK;
 }
 
@@ -184,15 +339,27 @@ err_t process_exit(process_t* proc, int exit_code) {
 
     /* Send SIGCHLD to parent */
     if (proc->ppid > 0) {
-        signal_send(proc->ppid, SIGCHLD);
-        signal_process(process_find(proc->ppid));
+        process_t* parent = process_find(proc->ppid);
+        if (parent) {
+            signal_send(proc->ppid, SIGCHLD);
+            signal_process(parent);
+        }
     }
+
+    /* Reparent orphan children to init (pid 1) */
+    cpu_flags_t _sflags; spinlock_acquire(&process_lock, &_sflags);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i].pid > 0 && process_table[i].ppid == proc->pid) {
+            process_table[i].ppid = 1;
+        }
+    }
+    spinlock_release(&process_lock, _sflags);
 
     /* Wake any waitpid waiters */
     sched_wake(&proc->exit_waiters);
 
-    /* Free all user pages and page tables */
-    if (proc->cr3) {
+    /* Free all user pages and page tables — only if no other threads */
+    if (proc->cr3 && proc->thread_count <= 0) {
         /* Save kernel CR3 on first call */
         if (!kernel_cr3) {
             uint64_t cr3_val;
@@ -215,25 +382,25 @@ err_t process_exit(process_t* proc, int exit_code) {
     }
 
     /* Remove from process list and recycle slot */
-    spinlock_acquire(&process_lock);
+    spinlock_acquire(&process_lock, &_sflags);
     proc->process_node.prev->next = proc->process_node.next;
     proc->process_node.next->prev = proc->process_node.prev;
     list_init(&proc->process_node);
     proc->pid = 0;  /* frees the slot in process_table */
-    spinlock_release(&process_lock);
+    spinlock_release(&process_lock, _sflags);
 
     return ERR_OK;
 }
 
 process_t* process_find(pid_t pid) {
-    spinlock_acquire(&process_lock);
+    cpu_flags_t _sflags; spinlock_acquire(&process_lock, &_sflags);
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (process_table[i].pid == pid) {
-            spinlock_release(&process_lock);
+            spinlock_release(&process_lock, _sflags);
             return &process_table[i];
         }
     }
-    spinlock_release(&process_lock);
+    spinlock_release(&process_lock, _sflags);
     return NULL;
 }
 
@@ -277,6 +444,7 @@ void signal_send(pid_t pid, int sig) {
     process_t* proc = process_find(pid);
     if (!proc) return;
 
+    cpu_flags_t _sflags; spinlock_acquire(&proc->signal_lock, &_sflags);
     /* SIGCONT cancels pending stop signals */
     if (sig == SIGCONT)
         proc->pending_signals &= ~((1UL << SIGSTOP) | (1UL << SIGTSTP));
@@ -286,6 +454,7 @@ void signal_send(pid_t pid, int sig) {
         proc->pending_signals &= ~(1UL << SIGCONT);
 
     proc->pending_signals |= (1UL << sig);
+    spinlock_release(&proc->signal_lock, _sflags);
 }
 
 void signal_process(process_t* proc) {
@@ -301,7 +470,8 @@ void signal_process(process_t* proc) {
         if (proc->signal_actions[sig].sa_handler &&
             proc->signal_actions[sig].sa_handler != SIG_DFL &&
             proc->signal_actions[sig].sa_handler != SIG_IGN) {
-            /* Custom handler would be delivered here. Skip for now. */
+            /* Custom handler delivery happens in interrupt_handler
+             * where the int_frame_t is available. Skip here. */
             continue;
         }
 
@@ -312,7 +482,7 @@ void signal_process(process_t* proc) {
         /* Default action */
         switch (signal_default_action(sig)) {
             case SIGACT_TERM: {
-                kprintf("[SIGNAL] pid %d terminated by signal %d\n", proc->pid, sig);
+                kprintf("[SIGNAL] pid %d TERMINATED by signal %d (exit_code=%d)\n", proc->pid, sig, 128 + sig);
                 process_exit(proc, 128 + sig);
                 return;
             }
@@ -321,6 +491,7 @@ void signal_process(process_t* proc) {
                     proc->flags |= PROC_FLAG_STOPPED;
                     kprintf("[SIGNAL] pid %d stopped by signal %d\n", proc->pid, sig);
                     /* Block all threads in the process */
+                    cpu_flags_t _sflags; spinlock_acquire(&process_lock, &_sflags);
                     struct list_head* iter = proc->threads.next;
                     while (iter != &proc->threads) {
                         thread_t* t = container_of(iter, thread_t, threads_node);
@@ -330,6 +501,7 @@ void signal_process(process_t* proc) {
                             t->state = THREAD_BLOCKED;
                         }
                     }
+                    spinlock_release(&process_lock, _sflags);
                 }
                 return;
             }
@@ -353,4 +525,95 @@ void signal_process(process_t* proc) {
                 break;
         }
     }
+}
+
+void signal_send_pgid(pid_t pgid, int sig) {
+    if (sig < 0 || sig >= NSIG) return;
+    if (pgid <= 0) return;
+
+    pid_t pids[MAX_PROCESSES];
+    int count = 0;
+
+    cpu_flags_t _sflags; spinlock_acquire(&process_lock, &_sflags);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i].pid > 0 && process_table[i].pgid == pgid) {
+            pids[count++] = process_table[i].pid;
+        }
+    }
+    spinlock_release(&process_lock, _sflags);
+
+    for (int i = 0; i < count; i++) {
+        signal_send(pids[i], sig);
+        process_t* p = process_find(pids[i]);
+        signal_process(p);
+    }
+}
+
+void signal_deliver_custom(process_t* proc, int_frame_t* frame) {
+    if (!proc || !frame) return;
+    if ((frame->cs & 3) != 3) return; /* not from user mode */
+
+    cpu_flags_t _sflags; spinlock_acquire(&proc->signal_lock, &_sflags);
+    uint64_t pending = proc->pending_signals & ~proc->blocked_signals;
+    if (!pending) { spinlock_release(&proc->signal_lock, _sflags); return; }
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!(pending & (1UL << sig))) continue;
+
+        void* handler = proc->signal_actions[sig].sa_handler;
+        if (!handler || handler == SIG_DFL || handler == SIG_IGN)
+            continue;
+
+        proc->pending_signals &= ~(1UL << sig);
+        spinlock_release(&proc->signal_lock, _sflags);
+
+        /* Build sigframe from saved user context */
+        sigframe_t sf;
+        sf.rax  = frame->rax;
+        sf.rbx  = frame->rbx;
+        sf.rcx  = frame->rcx;
+        sf.rdx  = frame->rdx;
+        sf.rsi  = frame->rsi;
+        sf.rdi  = frame->rdi;
+        sf.rbp  = frame->rbp;
+        sf.r8   = frame->r8;
+        sf.r9   = frame->r9;
+        sf.r10  = frame->r10;
+        sf.r11  = frame->r11;
+        sf.r12  = frame->r12;
+        sf.r13  = frame->r13;
+        sf.r14  = frame->r14;
+        sf.r15  = frame->r15;
+        sf.rip  = frame->rip;
+        sf.cs   = frame->cs;
+        sf.rflags = frame->rflags;
+        sf.rsp  = frame->rsp;
+        sf.ss   = frame->ss;
+        sf.sig  = sig;
+        sf.pad  = 0;
+
+        /* Push onto user stack (low to high):
+         *   [return address = SIGNAL_TRAMPOLINE_ADDR]  <- handler's RSP
+         *   [sigframe_t]                                 <- rdi for sigreturn
+         */
+        uint64_t user_rsp = frame->rsp;
+        user_rsp -= sizeof(sigframe_t);
+        user_rsp &= ~15ULL;
+        user_rsp -= 8;
+
+        {
+            uint64_t tramp_addr = SIGNAL_TRAMPOLINE_ADDR;
+            if (copy_to_user((void*)user_rsp, &tramp_addr, 8) != 0)
+                return;
+        }
+        if (copy_to_user((void*)(user_rsp + 8), &sf, sizeof(sf)) != 0)
+            return;
+
+        /* Modify int_frame to invoke user handler */
+        frame->rdi = sig;
+        frame->rip = (uint64_t)handler;
+        frame->rsp = user_rsp;
+        return;
+    }
+    spinlock_release(&proc->signal_lock, _sflags);
 }

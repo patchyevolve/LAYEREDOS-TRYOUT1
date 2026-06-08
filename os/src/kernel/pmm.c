@@ -4,6 +4,7 @@
 #include "eventbus.h"
 #include "sched.h"
 #include "process.h"
+#include "work.h"
 
 typedef struct free_page {
     struct free_page* next;
@@ -17,6 +18,29 @@ static uint64_t total_memory = 0;
 static uint64_t bitmap_base = 0;
 static uint64_t bitmap_pages = 0;
 static uint8_t* used_bitmap; /* Uses PHYS_TO_VIRT address for per-PML4 safety */
+
+static work_item_t oom_work_item;
+static volatile int oom_scheduled = 0;
+
+static void pmm_oom_kill_worker(void* arg) {
+    (void)arg;
+    kprintf("[OOM] Out of memory! Killing current process...\n");
+    eventbus_publish(EV_OOM_KILL, 0, 0, 0, 0);
+    if (current_thread && current_thread->proc) {
+        process_exit(current_thread->proc, -12);
+        thread_exit(-12);
+    }
+    oom_scheduled = 0;
+}
+
+static void pmm_oom_kill(void) {
+    if (!oom_scheduled) {
+        oom_scheduled = 1;
+        oom_work_item.func = pmm_oom_kill_worker;
+        oom_work_item.data = NULL;
+        work_queue_schedule(&system_wq, &oom_work_item);
+    }
+}
 
 static void bitmap_set(uint64_t page_idx) {
     used_bitmap[page_idx / 8] |= (1 << (page_idx % 8));
@@ -43,18 +67,10 @@ void pmm_mark_region_used(uint64_t start, uint64_t end) {
     }
 }
 
-static void pmm_oom_kill(void) {
-    kprintf("[OOM] Out of memory! Killing current process...\n");
-    eventbus_publish(EV_OOM_KILL, 0, 0, 0, 0);
-    if (current_thread && current_thread->proc) {
-        process_exit(current_thread->proc, -12);
-        thread_exit(-12);
-    }
-}
-
 uint64_t pmm_alloc_page(void) {
     cpu_flags_t flags = hal_save_irq();
     if (!free_list) { hal_restore_irq(flags); pmm_oom_kill(); return 0; }
+    /* 0 is used as OOM sentinel; page 0 is reserved in pmm_init so this is unambiguous */
 
     free_page_t* page = free_list;
     free_list = page->next;
@@ -75,6 +91,7 @@ uint64_t pmm_alloc_pages(uint32_t count) {
     uint32_t found = 0;
 
     for (uint64_t i = 0; i < total_page_count && found < count; i++) {
+        if ((i & 0xFFFF) == 0) { hal_restore_irq(flags); flags = hal_save_irq(); }
         if (!bitmap_test(i)) {
             if (found == 0) first = i;
             found++;
@@ -116,7 +133,15 @@ void pmm_free_page(uint64_t phys_addr) {
     cpu_flags_t flags = hal_save_irq();
     uint64_t idx = phys_addr / PAGE_SIZE;
     if (idx >= total_page_count) { hal_restore_irq(flags); return; }
-    if (!bitmap_test(idx)) { kpanic("Double free detected: page %lx already free", phys_addr); }
+    if (!bitmap_test(idx)) {
+#ifdef DEBUG
+        kpanic("Double free detected: page %lx already free", phys_addr);
+#else
+        kprintf("[PMM] Warning: double free detected: page %lx\n", phys_addr);
+        hal_restore_irq(flags);
+        return;
+#endif
+    }
 
     bitmap_clear(idx);
     free_page_count++;
@@ -134,6 +159,7 @@ void pmm_free_pages(uint64_t phys_addr, uint32_t count) {
 }
 
 static void add_region_to_free_list(uint64_t start, uint64_t end) {
+    if (start >= end) return;
     uint64_t s = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint64_t e = end & ~(PAGE_SIZE - 1);
     uint64_t count = 0;

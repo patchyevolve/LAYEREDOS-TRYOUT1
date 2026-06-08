@@ -8,7 +8,6 @@ typedef struct spinlock {
     volatile uint64_t lock;
     const char*       name;
     uint64_t          holder;
-    cpu_flags_t       saved_flags;
 } spinlock_t;
 
 typedef struct mutex {
@@ -23,8 +22,8 @@ typedef struct condvar {
 } condvar_t;
 
 void spinlock_init(spinlock_t* lock, const char* name);
-void spinlock_acquire(spinlock_t* lock);
-void spinlock_release(spinlock_t* lock);
+void spinlock_acquire(spinlock_t* lock, cpu_flags_t* out_flags);
+void spinlock_release(spinlock_t* lock, cpu_flags_t flags);
 
 void mutex_init(mutex_t* m);
 err_t mutex_lock(mutex_t* m, uint64_t timeout_ms);
