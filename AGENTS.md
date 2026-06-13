@@ -20,6 +20,8 @@ make -C os test-net                          # run 5 regression tests
 - **E1000 per-packet KDEBUG noise removed**: TX/RX descriptor KDEBUG calls commented out with note for re-enabling when debugging E1000.
 - **`make test` timing hardened**: initial `sleep 20` → `sleep 60`, overall `timeout 210` → `timeout 300` to accommodate slow QEMU (no-KVM) boot with network timeouts.
 - **test-runner.sh created**: prompt-detect script using bash coproc (bidirectional I/O). Works in principle but pipe buffering causes issues in no-KVM QEMU; kept for future use.
+- **SFS stack buffers moved to heap**: All 4 `uint8_t tmp[2*SFS_BLOCK_SIZE]` (1 KB each) stack allocations converted to `kmalloc`/`kfree`. Affected functions: `sfs_vfs_readdir`, `sfs_lookup`, `sfs_remove_dirent`, `sfs_remove_dirent_by_inum`.
+- **GPT partition support added**: New `gpt.c`/`gpt.h` — parses GPT headers and partition entries, registers partition wrappers as `block_dev_t` devices (`<parent>-p<N>` naming). Partition read/write transparently add LBA offset. `MAX_BLOCK_DEVICES` increased from 8 to 64. `gpt_scan()` called from `main.c` after block device init.
 
 ## Key Decisions
 - **Generic RST handling**: RST aborts the connection immediately (state=CLOSED, closed=1) but does NOT set `used=0` — the connection slot stays allocated for `tcp_find_conn` matching (prevents stray SYN+ACK from matching freed slots). Slot freed by `tcp_conn_connect` poll loop or `tcp_conn_destroy()`.
@@ -33,8 +35,6 @@ All major phases complete. All items from Phase roadmap now implemented.
 
 ### Potential next items
 - Make `make test` timing more robust (retry on timeout, test-runner.sh polish)
-- Reduce `tmp[2*SFS_BLOCK_SIZE]` stack allocations in SFS to heap where possible
-- Add GPT partition support to boot block I/O
 - User-level mmap for file-backed mappings
 
 ## Critical Context
@@ -47,6 +47,11 @@ All major phases complete. All items from Phase roadmap now implemented.
 - All spinlocks use `cpu_flags_t` (CLI/STI) for mutual exclusion on single-core.
 
 ## Relevant Files
+- `os/src/kernel/gpt.c` / `gpt.h`: GPT partition parser, partition wrapper block device
+- `os/src/kernel/block.c`: `MAX_BLOCK_DEVICES` increased from 8 to 64
+- `os/src/kernel/sfs.c`: `tmp[2*SFS_BLOCK_SIZE]` stack → heap in 4 functions
+- `os/src/kernel/main.c`: `gpt_scan()` called after block device init
+- `os/src/kernel/e1000.c`: Per-packet KDEBUG commented out
 - `os/src/kernel/udp.c`: Checksum validation on receive; `ipv6only` in `udp_bind_endpoint`; `ipv6only` field in `udp_endpoint_t`
 - `os/src/kernel/udp.h`: `udp_bind_endpoint` signature with `ipv6only`; `ipv6only` field in struct
 - `os/src/kernel/ipv4.h`: `ipv4_handler_t` signature now includes `ipv4_addr_t dst`

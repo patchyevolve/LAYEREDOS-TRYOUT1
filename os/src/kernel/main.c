@@ -47,6 +47,7 @@
 #include "storage_test.h"
 #include "dhcp.h"
 #include "slaac.h"
+#include "gpt.h"
 
 static uint64_t mb_info_phys = 0;
 #define BOOT_TOTAL_STEPS 16
@@ -241,6 +242,7 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     ata_blk_init();
     ahci_init();
     nvme_init();
+    gpt_scan();
     nic_init();
     eth_init();
     arp_init();

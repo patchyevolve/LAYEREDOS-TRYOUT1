@@ -2,7 +2,7 @@
 #include "block.h"
 #include "sync.h"
 
-#define MAX_BLOCK_DEVICES 8
+#define MAX_BLOCK_DEVICES 64
 #define BLOCK_CACHE_SIZE  64
 
 static block_dev_t block_devs[MAX_BLOCK_DEVICES];

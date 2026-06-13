@@ -462,25 +462,28 @@ static int sfs_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
     uint32_t entry_off = byte_off % SFS_BLOCK_SIZE;
     uint32_t file_block_num = entry_block;
 
-    uint8_t tmp[2 * SFS_BLOCK_SIZE];
+    uint8_t* tmp = kmalloc(2 * SFS_BLOCK_SIZE);
+    if (!tmp) return -1;
     int phys = sfs_inode_get_block(f->fs, &f->inode, file_block_num, 0);
-    if (phys < 0) return -1;
+    if (phys < 0) { kfree(tmp); return -1; }
     err_t e = sfs_read_data(f->fs, (uint32_t)phys, tmp);
-    if (e) return -1;
+    if (e) { kfree(tmp); return -1; }
 
     sfs_dirent_t* de;
     if (entry_off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
         /* Cross-block dirent — read next block too */
         int next_phys = sfs_inode_get_block(f->fs, &f->inode, file_block_num + 1, 0);
-        if (next_phys < 0) return -1;
+        if (next_phys < 0) { kfree(tmp); return -1; }
         e = sfs_read_data(f->fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE);
-        if (e) return -1;
+        if (e) { kfree(tmp); return -1; }
         de = (sfs_dirent_t*)(tmp + entry_off);
     } else {
         de = (sfs_dirent_t*)(tmp + entry_off);
     }
 
-    if (de->inode == 0) return -1;
+    if (de->inode == 0) { kfree(tmp); return -1; }
+
+    kfree(tmp);
 
     vfs_node_t* child = (vfs_node_t*)kmalloc(sizeof(vfs_node_t));
     if (!child) return -1;
@@ -751,28 +754,31 @@ static int sfs_lookup(sfs_fs_t* fs, int dir_inum, const char* name) {
 
     uint32_t max_entries = dir_inode.size / sizeof(sfs_dirent_t);
 
+    uint8_t* tmp = kmalloc(2 * SFS_BLOCK_SIZE);
+    if (!tmp) return -1;
+
     for (uint32_t i = 0; i < max_entries; i++) {
         uint32_t byte_off = i * sizeof(sfs_dirent_t);
         uint32_t bi = byte_off / SFS_BLOCK_SIZE;
         uint32_t off = byte_off % SFS_BLOCK_SIZE;
 
-        uint8_t tmp[2 * SFS_BLOCK_SIZE];
         if (off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
             int phys0 = sfs_inode_get_block(fs, &dir_inode, bi, 0);
-            if (phys0 < 0) return -1;
+            if (phys0 < 0) { kfree(tmp); return -1; }
             int phys1 = sfs_inode_get_block(fs, &dir_inode, bi + 1, 0);
-            if (phys1 < 0) return -1;
-            if (sfs_read_data(fs, (uint32_t)phys0, tmp) != ERR_OK) return -1;
-            if (sfs_read_data(fs, (uint32_t)phys1, tmp + SFS_BLOCK_SIZE) != ERR_OK) return -1;
+            if (phys1 < 0) { kfree(tmp); return -1; }
+            if (sfs_read_data(fs, (uint32_t)phys0, tmp) != ERR_OK) { kfree(tmp); return -1; }
+            if (sfs_read_data(fs, (uint32_t)phys1, tmp + SFS_BLOCK_SIZE) != ERR_OK) { kfree(tmp); return -1; }
         } else {
             int phys = sfs_inode_get_block(fs, &dir_inode, bi, 0);
-            if (phys < 0) return -1;
-            if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return -1;
+            if (phys < 0) { kfree(tmp); return -1; }
+            if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) { kfree(tmp); return -1; }
         }
         sfs_dirent_t* de = (sfs_dirent_t*)(tmp + off);
         if (de->inode == 0) continue;
-        if (kstrcmp(de->name, name) == 0) return (int)de->inode;
+        if (kstrcmp(de->name, name) == 0) { kfree(tmp); return (int)de->inode; }
     }
+    kfree(tmp);
     return -1;
 }
 
@@ -812,19 +818,21 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
     int found_idx = -1;
 
     /* Find the entry to remove */
+    uint8_t* tmp = kmalloc(2 * SFS_BLOCK_SIZE);
+    if (!tmp) return ERR_NOMEM;
+
     for (uint32_t i = 0; i < max_entries; i++) {
         uint32_t byte_off = i * sizeof(sfs_dirent_t);
         uint32_t bi = byte_off / SFS_BLOCK_SIZE;
         uint32_t off = byte_off % SFS_BLOCK_SIZE;
 
-        uint8_t tmp[2 * SFS_BLOCK_SIZE];
         int phys = sfs_inode_get_block(fs, &dir_inode, bi, 0);
-        if (phys < 0) return ERR_NOENT;
-        if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return ERR_IO;
+        if (phys < 0) { kfree(tmp); return ERR_NOENT; }
+        if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) { kfree(tmp); return ERR_IO; }
         if (off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
             int next_phys = sfs_inode_get_block(fs, &dir_inode, bi + 1, 0);
-            if (next_phys < 0) return ERR_NOENT;
-            if (sfs_read_data(fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE) != ERR_OK) return ERR_IO;
+            if (next_phys < 0) { kfree(tmp); return ERR_NOENT; }
+            if (sfs_read_data(fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE) != ERR_OK) { kfree(tmp); return ERR_IO; }
         }
         sfs_dirent_t* de = (sfs_dirent_t*)(tmp + off);
         if (de->inode != 0 && kstrcmp(de->name, name) == 0) {
@@ -832,6 +840,7 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
             break;
         }
     }
+    kfree(tmp);
     if (found_idx < 0) return ERR_NOENT;
 
     /* Compact: shift all subsequent entries back by one */
@@ -1005,27 +1014,30 @@ static int sfs_remove_dirent_by_inum(sfs_fs_t* fs, int dir_inum, int target_inum
     sfs_inode_t dir_inode;
     if (sfs_read_inode(fs, dir_inum, &dir_inode) != ERR_OK) return -1;
     uint32_t max_entries = dir_inode.size / sizeof(sfs_dirent_t);
+    uint8_t* tmp = kmalloc(2 * SFS_BLOCK_SIZE);
+    if (!tmp) return -1;
     for (uint32_t i = 0; i < max_entries; i++) {
         uint32_t byte_off = i * sizeof(sfs_dirent_t);
         uint32_t bi = byte_off / SFS_BLOCK_SIZE;
         uint32_t off = byte_off % SFS_BLOCK_SIZE;
 
-        uint8_t tmp[2 * SFS_BLOCK_SIZE];
         int phys = sfs_inode_get_block(fs, &dir_inode, bi, 0);
-        if (phys < 0) return -1;
-        if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return -1;
+        if (phys < 0) { kfree(tmp); return -1; }
+        if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) { kfree(tmp); return -1; }
         if (off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
             int next_phys = sfs_inode_get_block(fs, &dir_inode, bi + 1, 0);
-            if (next_phys < 0) return -1;
-            if (sfs_read_data(fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE) != ERR_OK) return -1;
+            if (next_phys < 0) { kfree(tmp); return -1; }
+            if (sfs_read_data(fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE) != ERR_OK) { kfree(tmp); return -1; }
         }
         sfs_dirent_t* de = (sfs_dirent_t*)(tmp + off);
         if (de->inode == (uint32_t)target_inum) {
             de->inode = 0;
             sfs_write_meta(fs, (uint32_t)phys, tmp);
+            kfree(tmp);
             return 0;
         }
     }
+    kfree(tmp);
     return -1;
 }
 
