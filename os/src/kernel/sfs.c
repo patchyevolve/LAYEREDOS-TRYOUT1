@@ -305,7 +305,7 @@ int sfs_inode_get_block(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t file_block, i
     return (int)iptrs[di_minor];
 }
 
-static err_t sfs_readlink(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_block, uint32_t file_off, void* buf, uint32_t count) {
+static err_t sfs_read_block_data(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_block, uint32_t file_off, void* buf, uint32_t count) {
     uint8_t tmp[SFS_BLOCK_SIZE];
     err_t e = sfs_read_data(fs, target_block, tmp);
     if (e) return e;
@@ -315,7 +315,7 @@ static err_t sfs_readlink(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_bloc
     return ERR_OK;
 }
 
-static err_t sfs_writelink(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_block, uint32_t file_off, const void* buf, uint32_t count) {
+static err_t sfs_write_block_data(sfs_fs_t* fs, sfs_inode_t* inode, uint32_t target_block, uint32_t file_off, const void* buf, uint32_t count) {
     uint8_t tmp[SFS_BLOCK_SIZE];
     if (count < SFS_BLOCK_SIZE) {
         err_t e = sfs_read_data(fs, target_block, tmp);
@@ -336,17 +336,34 @@ typedef struct sfs_file {
     uint32_t offset;
 } sfs_file_t;
 
+/* Helper: load a temporary sfs_file_t from node->inode when private_data is NULL */
+static int sfs_temp_load(vfs_node_t* node, sfs_file_t* tmp) {
+    sfs_fs_t* fs = (sfs_fs_t*)((uint64_t)node->fs - __builtin_offsetof(sfs_fs_t, vfs_fs));
+    kmemset(tmp, 0, sizeof(*tmp));
+    tmp->fs = fs;
+    tmp->inum = (int)node->inode;
+    return sfs_read_inode(fs, tmp->inum, &tmp->inode);
+}
+
+static void sfs_file_destructor(void* p) { if (p) kfree(p); }
+
 static int sfs_vfs_open(vfs_node_t* node) {
-    (void)node;
+    if (!node) return -1;
+    if (!node->private_data && node->inode) {
+        sfs_file_t* f = kmalloc(sizeof(sfs_file_t));
+        if (!f) return -1;
+        f->fs = (sfs_fs_t*)((uint64_t)node->fs - __builtin_offsetof(sfs_fs_t, vfs_fs));
+        f->inum = (int)node->inode;
+        f->offset = 0;
+        sfs_read_inode(f->fs, f->inum, &f->inode);
+        node->private_data = f;
+        node->destructor = sfs_file_destructor;
+    }
     return 0;
 }
 
 static int sfs_vfs_close(vfs_node_t* node) {
-    sfs_file_t* f = (sfs_file_t*)node->private_data;
-    if (f) {
-        kfree(f);
-        node->private_data = NULL;
-    }
+    (void)node;
     return 0;
 }
 
@@ -369,7 +386,7 @@ static int64_t sfs_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_
         if (phys < 0) {
             kmemset((uint8_t*)buf + done, 0, chunk);
         } else {
-            if (sfs_readlink(f->fs, &f->inode, (uint32_t)phys, block_off, (uint8_t*)buf + done, chunk))
+            if (sfs_read_block_data(f->fs, &f->inode, (uint32_t)phys, block_off, (uint8_t*)buf + done, chunk))
                 break;
         }
         done += chunk;
@@ -406,7 +423,7 @@ static int64_t sfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, 
             return (int64_t)done;
         }
 
-        if (sfs_writelink(f->fs, &f->inode, (uint32_t)phys, block_off, (const uint8_t*)buf + done, chunk)) {
+        if (sfs_write_block_data(f->fs, &f->inode, (uint32_t)phys, block_off, (const uint8_t*)buf + done, chunk)) {
             f->inode.mtime = (uint32_t)hal_timer_get_ticks();
             sfs_write_inode(f->fs, f->inum, &f->inode);
             sfs_end_op(f->fs);
@@ -427,25 +444,42 @@ static int64_t sfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, 
 }
 
 static int sfs_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
+    if (!node) return -1;
+    sfs_file_t local_f;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
-    if (!f || f->inode.type != SFS_TYPE_DIR) return -1;
+    if (!f) {
+        if (sfs_temp_load(node, &local_f) != ERR_OK) return -1;
+        f = &local_f;
+    }
+    if (f->inode.type != SFS_TYPE_DIR) return -1;
 
     sfs_read_inode(f->fs, f->inum, &f->inode);
     uint32_t max_entries = f->inode.size / sizeof(sfs_dirent_t);
     if (index >= max_entries) return -1;
 
-    uint32_t entry_block = index / SFS_DIRENTS_PER_BLOCK;
-    uint32_t entry_off = index % SFS_DIRENTS_PER_BLOCK;
+    uint32_t byte_off = index * sizeof(sfs_dirent_t);
+    uint32_t entry_block = byte_off / SFS_BLOCK_SIZE;
+    uint32_t entry_off = byte_off % SFS_BLOCK_SIZE;
     uint32_t file_block_num = entry_block;
 
+    uint8_t tmp[2 * SFS_BLOCK_SIZE];
     int phys = sfs_inode_get_block(f->fs, &f->inode, file_block_num, 0);
     if (phys < 0) return -1;
-
-    uint8_t tmp[SFS_BLOCK_SIZE];
     err_t e = sfs_read_data(f->fs, (uint32_t)phys, tmp);
     if (e) return -1;
 
-    sfs_dirent_t* de = (sfs_dirent_t*)(tmp + entry_off * sizeof(sfs_dirent_t));
+    sfs_dirent_t* de;
+    if (entry_off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
+        /* Cross-block dirent — read next block too */
+        int next_phys = sfs_inode_get_block(f->fs, &f->inode, file_block_num + 1, 0);
+        if (next_phys < 0) return -1;
+        e = sfs_read_data(f->fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE);
+        if (e) return -1;
+        de = (sfs_dirent_t*)(tmp + entry_off);
+    } else {
+        de = (sfs_dirent_t*)(tmp + entry_off);
+    }
+
     if (de->inode == 0) return -1;
 
     vfs_node_t* child = (vfs_node_t*)kmalloc(sizeof(vfs_node_t));
@@ -467,6 +501,7 @@ static int sfs_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
         cf->offset = 0;
         sfs_read_inode(f->fs, cf->inum, &cf->inode);
         child->private_data = cf;
+        child->destructor = sfs_file_destructor;
     }
 
     *out = child;
@@ -474,8 +509,13 @@ static int sfs_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
 }
 
 static int sfs_vfs_stat(vfs_node_t* node, vfs_stat_t* st) {
-    if (!node || !st || !node->private_data) return -1;
+    if (!node || !st) return -1;
+    sfs_file_t local_f;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
+    if (!f) {
+        if (sfs_temp_load(node, &local_f) != ERR_OK) return -1;
+        f = &local_f;
+    }
     st->size  = f->inode.size;
     st->inode = f->inum;
     st->mode  = f->inode.mode | (f->inode.type << 16);
@@ -499,9 +539,21 @@ static void sfs_free_indirect_chain(sfs_fs_t* fs, uint32_t indirect_block) {
 }
 
 static int sfs_vfs_truncate(vfs_node_t* node, uint64_t size) {
-    if (!node || !node->private_data) return -1;
+    if (!node) return -1;
+    int heap_alloced = 0;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
-    if (size >= f->inode.size) return 0;
+    if (!f) {
+        f = kmalloc(sizeof(sfs_file_t));
+        if (!f) return -1;
+        if (sfs_temp_load(node, f) != ERR_OK) { kfree(f); return -1; }
+        node->private_data = f;
+        node->destructor = sfs_file_destructor;
+        heap_alloced = 1;
+    }
+    if (size >= f->inode.size) {
+        if (heap_alloced) { kfree(f); node->private_data = NULL; node->destructor = NULL; }
+        return 0;
+    }
 
     sfs_begin_op(f->fs);
     uint32_t new_blocks = (uint32_t)((size + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE);
@@ -624,28 +676,44 @@ done:
     sfs_write_inode(f->fs, f->inum, &f->inode);
     node->size = f->inode.size;
     sfs_end_op(f->fs);
+    if (heap_alloced) { kfree(f); node->private_data = NULL; node->destructor = NULL; }
     return 0;
 }
 
 static int sfs_vfs_chmod(vfs_node_t* node, uint32_t mode) {
-    if (!node || !node->private_data) return -1;
+    if (!node) return -1;
+    sfs_file_t local_f;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
+    if (!f) {
+        if (sfs_temp_load(node, &local_f) != ERR_OK) return -1;
+        f = &local_f;
+    }
     f->inode.mode = mode & 0xFFFF;
     sfs_write_inode(f->fs, f->inum, &f->inode);
     return 0;
 }
 
 static int sfs_vfs_lock(vfs_node_t* node) {
-    if (!node || !node->private_data) return -1;
+    if (!node) return -1;
+    sfs_file_t local_f;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
+    if (!f) {
+        if (sfs_temp_load(node, &local_f) != ERR_OK) return -1;
+        f = &local_f;
+    }
     f->inode.flags |= SFS_INODE_FLAG_LOCKED;
     sfs_write_inode(f->fs, f->inum, &f->inode);
     return 0;
 }
 
 static int sfs_vfs_unlock(vfs_node_t* node) {
-    if (!node || !node->private_data) return -1;
+    if (!node) return -1;
+    sfs_file_t local_f;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
+    if (!f) {
+        if (sfs_temp_load(node, &local_f) != ERR_OK) return -1;
+        f = &local_f;
+    }
     f->inode.flags &= ~SFS_INODE_FLAG_LOCKED;
     sfs_write_inode(f->fs, f->inum, &f->inode);
     return 0;
@@ -682,17 +750,26 @@ static int sfs_lookup(sfs_fs_t* fs, int dir_inum, const char* name) {
     if (dir_inode.type != SFS_TYPE_DIR) return -1;
 
     uint32_t max_entries = dir_inode.size / sizeof(sfs_dirent_t);
-    uint8_t tmp[SFS_BLOCK_SIZE];
 
     for (uint32_t i = 0; i < max_entries; i++) {
-        uint32_t bi = i / SFS_DIRENTS_PER_BLOCK;
-        uint32_t off = i % SFS_DIRENTS_PER_BLOCK;
-        if (off == 0) {
+        uint32_t byte_off = i * sizeof(sfs_dirent_t);
+        uint32_t bi = byte_off / SFS_BLOCK_SIZE;
+        uint32_t off = byte_off % SFS_BLOCK_SIZE;
+
+        uint8_t tmp[2 * SFS_BLOCK_SIZE];
+        if (off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
+            int phys0 = sfs_inode_get_block(fs, &dir_inode, bi, 0);
+            if (phys0 < 0) return -1;
+            int phys1 = sfs_inode_get_block(fs, &dir_inode, bi + 1, 0);
+            if (phys1 < 0) return -1;
+            if (sfs_read_data(fs, (uint32_t)phys0, tmp) != ERR_OK) return -1;
+            if (sfs_read_data(fs, (uint32_t)phys1, tmp + SFS_BLOCK_SIZE) != ERR_OK) return -1;
+        } else {
             int phys = sfs_inode_get_block(fs, &dir_inode, bi, 0);
             if (phys < 0) return -1;
             if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return -1;
         }
-        sfs_dirent_t* de = (sfs_dirent_t*)tmp + off;
+        sfs_dirent_t* de = (sfs_dirent_t*)(tmp + off);
         if (de->inode == 0) continue;
         if (kstrcmp(de->name, name) == 0) return (int)de->inode;
     }
@@ -734,14 +811,22 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
     uint32_t max_entries = dir_inode.size / sizeof(sfs_dirent_t);
     int found_idx = -1;
 
+    /* Find the entry to remove */
     for (uint32_t i = 0; i < max_entries; i++) {
-        uint32_t file_block = i / SFS_DIRENTS_PER_BLOCK;
-        uint32_t entry_off = i % SFS_DIRENTS_PER_BLOCK;
-        int phys = sfs_inode_get_block(fs, &dir_inode, file_block, 0);
+        uint32_t byte_off = i * sizeof(sfs_dirent_t);
+        uint32_t bi = byte_off / SFS_BLOCK_SIZE;
+        uint32_t off = byte_off % SFS_BLOCK_SIZE;
+
+        uint8_t tmp[2 * SFS_BLOCK_SIZE];
+        int phys = sfs_inode_get_block(fs, &dir_inode, bi, 0);
         if (phys < 0) return ERR_NOENT;
-        uint8_t tmp[SFS_BLOCK_SIZE];
         if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return ERR_IO;
-        sfs_dirent_t* de = (sfs_dirent_t*)tmp + entry_off;
+        if (off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
+            int next_phys = sfs_inode_get_block(fs, &dir_inode, bi + 1, 0);
+            if (next_phys < 0) return ERR_NOENT;
+            if (sfs_read_data(fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE) != ERR_OK) return ERR_IO;
+        }
+        sfs_dirent_t* de = (sfs_dirent_t*)(tmp + off);
         if (de->inode != 0 && kstrcmp(de->name, name) == 0) {
             found_idx = (int)i;
             break;
@@ -749,37 +834,74 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
     }
     if (found_idx < 0) return ERR_NOENT;
 
-    int last_entry = (int)max_entries - 1;
     /* Compact: shift all subsequent entries back by one */
-    for (int i = found_idx; i < last_entry; i++) {
-        uint32_t src_block = (i + 1) / 16;
-        uint32_t src_off   = (i + 1) % 16;
-        uint32_t dst_block = i / 16;
-        uint32_t dst_off   = i % 16;
+    /* We pack entries tightly without padding, so the compact operation
+       shifts raw bytes, handling cross-block boundaries naturally via
+       read-modify-write of each affected block. */
+    uint32_t src_start = (uint32_t)(found_idx + 1) * sizeof(sfs_dirent_t);
+    uint32_t dst_start = (uint32_t)found_idx * sizeof(sfs_dirent_t);
+    uint32_t move_size = (max_entries - (uint32_t)found_idx - 1) * sizeof(sfs_dirent_t);
 
-        uint8_t buf[SFS_BLOCK_SIZE];
-        int phys = sfs_inode_get_block(fs, &dir_inode, src_block, 0);
-        if (phys < 0) break;
-        if (sfs_read_data(fs, (uint32_t)phys, buf)) break;
-        sfs_dirent_t* sde = (sfs_dirent_t*)buf + src_off;
-        if (sde->inode == 0) { sde = NULL; continue; }
+    if (move_size > 0) {
+        uint32_t src_byte = src_start;
+        uint32_t dst_byte = dst_start;
+        uint32_t remaining = move_size;
 
-        if (src_block == dst_block) {
-            kmemcpy(buf + dst_off * sizeof(sfs_dirent_t),
-                    buf + src_off * sizeof(sfs_dirent_t),
-                    sizeof(sfs_dirent_t));
-            kmemset(buf + src_off * sizeof(sfs_dirent_t), 0, sizeof(sfs_dirent_t));
-            sfs_write_meta(fs, (uint32_t)phys, buf);
-        } else {
+        while (remaining > 0) {
+            uint32_t src_block = src_byte / SFS_BLOCK_SIZE;
+            uint32_t src_off = src_byte % SFS_BLOCK_SIZE;
+            uint32_t dst_block = dst_byte / SFS_BLOCK_SIZE;
+            uint32_t dst_off = dst_byte % SFS_BLOCK_SIZE;
+
+            uint32_t chunk = SFS_BLOCK_SIZE - src_off;
+            if (chunk > remaining) chunk = remaining;
+
+            uint8_t sbuf[SFS_BLOCK_SIZE];
+            int sphys = sfs_inode_get_block(fs, &dir_inode, src_block, 0);
+            if (sphys < 0) break;
+            if (sfs_read_data(fs, (uint32_t)sphys, sbuf)) break;
+
             uint8_t dbuf[SFS_BLOCK_SIZE];
             int dphys = sfs_inode_get_block(fs, &dir_inode, dst_block, 0);
             if (dphys < 0) break;
             if (sfs_read_data(fs, (uint32_t)dphys, dbuf)) break;
-            sfs_dirent_t* dde = (sfs_dirent_t*)dbuf + dst_off;
-            kmemcpy(dde, sde, sizeof(sfs_dirent_t));
-            if (sfs_write_meta(fs, (uint32_t)dphys, dbuf)) break;
-            kmemset(buf + src_off * sizeof(sfs_dirent_t), 0, sizeof(sfs_dirent_t));
-            sfs_write_meta(fs, (uint32_t)phys, buf);
+
+            if (sphys == dphys) {
+                /* Same src and dst block — use forward copy for left-shift */
+                if (src_off > dst_off) {
+                    for (uint32_t _k = 0; _k < chunk; _k++)
+                        dbuf[dst_off + _k] = sbuf[src_off + _k];
+                } else {
+                    kmemcpy(dbuf + dst_off, sbuf + src_off, chunk);
+                }
+                if (sfs_write_meta(fs, (uint32_t)dphys, dbuf)) break;
+            } else {
+                /* Cross-block copy */
+                kmemcpy(dbuf + dst_off, sbuf + src_off, chunk);
+                if (sfs_write_meta(fs, (uint32_t)dphys, dbuf)) break;
+                kmemset(sbuf + src_off, 0, chunk);
+                if (sfs_write_meta(fs, (uint32_t)sphys, sbuf)) break;
+            }
+
+            src_byte += chunk;
+            dst_byte += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    /* Clear the last (now-orphaned) dirent slot by zeroing its bytes */
+    uint32_t last_byte = max_entries * sizeof(sfs_dirent_t) - sizeof(sfs_dirent_t);
+    uint32_t last_block = last_byte / SFS_BLOCK_SIZE;
+    uint32_t last_off = last_byte % SFS_BLOCK_SIZE;
+    {
+        uint8_t zbuf[SFS_BLOCK_SIZE];
+        int zphys = sfs_inode_get_block(fs, &dir_inode, last_block, 0);
+        if (zphys >= 0 && sfs_read_data(fs, (uint32_t)zphys, zbuf) == ERR_OK) {
+            uint32_t clear_sz = sizeof(sfs_dirent_t);
+            if (last_off + clear_sz > SFS_BLOCK_SIZE)
+                clear_sz = SFS_BLOCK_SIZE - last_off;
+            kmemset(zbuf + last_off, 0, clear_sz);
+            sfs_write_meta(fs, (uint32_t)zphys, zbuf);
         }
     }
 
@@ -792,18 +914,19 @@ static err_t sfs_remove_dirent(sfs_fs_t* fs, int dir_inum, const char* name) {
 
 static int sfs_vfs_create(vfs_node_t* dir, const char* name, int is_dir) {
     if (!dir || !name) return -1;
+    sfs_file_t dir_local;
     sfs_file_t* f = (sfs_file_t*)dir->private_data;
-    if (!f) { kprintf("[SFS_CREATE] no private_data\n"); return -1; }
-    if (f->inode.type != SFS_TYPE_DIR) {
-        kprintf("[SFS_CREATE] not a dir, type=%u\n", f->inode.type);
-        return -1;
+    if (!f) {
+        if (sfs_temp_load(dir, &dir_local) != ERR_OK) return -1;
+        f = &dir_local;
     }
+    if (f->inode.type != SFS_TYPE_DIR) { kprintf("[CREATE] not a dir\n"); return -1; }
 
-    if (sfs_lookup(f->fs, f->inum, name) >= 0) return -1;
+    if (sfs_lookup(f->fs, f->inum, name) >= 0) { kprintf("[CREATE] exists\n"); return -1; }
     sfs_begin_op(f->fs);
 
     int inum = sfs_alloc_inode(f->fs);
-    if (inum < 0) return -1;
+    if (inum < 0) { kprintf("[CREATE] alloc_inode failed\n"); return -1; }
 
     sfs_inode_t inode;
     kmemset(&inode, 0, sizeof(inode));
@@ -829,8 +952,12 @@ static int sfs_vfs_create(vfs_node_t* dir, const char* name, int is_dir) {
 
 static int sfs_vfs_unlink(vfs_node_t* dir, const char* name) {
     if (!dir || !name) return -1;
+    sfs_file_t dir_local;
     sfs_file_t* f = (sfs_file_t*)dir->private_data;
-    if (!f) return -1;
+    if (!f) {
+        if (sfs_temp_load(dir, &dir_local) != ERR_OK) return -1;
+        f = &dir_local;
+    }
 
     int inum = sfs_lookup(f->fs, f->inum, name);
     if (inum < 0) return -1;
@@ -879,13 +1006,20 @@ static int sfs_remove_dirent_by_inum(sfs_fs_t* fs, int dir_inum, int target_inum
     if (sfs_read_inode(fs, dir_inum, &dir_inode) != ERR_OK) return -1;
     uint32_t max_entries = dir_inode.size / sizeof(sfs_dirent_t);
     for (uint32_t i = 0; i < max_entries; i++) {
-        uint32_t file_block = i / SFS_DIRENTS_PER_BLOCK;
-        uint32_t entry_off = i % SFS_DIRENTS_PER_BLOCK;
-        int phys = sfs_inode_get_block(fs, &dir_inode, file_block, 0);
+        uint32_t byte_off = i * sizeof(sfs_dirent_t);
+        uint32_t bi = byte_off / SFS_BLOCK_SIZE;
+        uint32_t off = byte_off % SFS_BLOCK_SIZE;
+
+        uint8_t tmp[2 * SFS_BLOCK_SIZE];
+        int phys = sfs_inode_get_block(fs, &dir_inode, bi, 0);
         if (phys < 0) return -1;
-        uint8_t tmp[SFS_BLOCK_SIZE];
         if (sfs_read_data(fs, (uint32_t)phys, tmp) != ERR_OK) return -1;
-        sfs_dirent_t* de = (sfs_dirent_t*)tmp + entry_off;
+        if (off + sizeof(sfs_dirent_t) > SFS_BLOCK_SIZE) {
+            int next_phys = sfs_inode_get_block(fs, &dir_inode, bi + 1, 0);
+            if (next_phys < 0) return -1;
+            if (sfs_read_data(fs, (uint32_t)next_phys, tmp + SFS_BLOCK_SIZE) != ERR_OK) return -1;
+        }
+        sfs_dirent_t* de = (sfs_dirent_t*)(tmp + off);
         if (de->inode == (uint32_t)target_inum) {
             de->inode = 0;
             sfs_write_meta(fs, (uint32_t)phys, tmp);
@@ -898,9 +1032,17 @@ static int sfs_remove_dirent_by_inum(sfs_fs_t* fs, int dir_inum, int target_inum
 static int sfs_vfs_rename(vfs_node_t* old_dir, const char* old_name,
                           vfs_node_t* new_dir, const char* new_name) {
     if (!old_dir || !old_name || !new_dir || !new_name) return -1;
+    sfs_file_t old_local, new_local;
     sfs_file_t* old_f = (sfs_file_t*)old_dir->private_data;
+    if (!old_f) {
+        if (sfs_temp_load(old_dir, &old_local) != ERR_OK) return -1;
+        old_f = &old_local;
+    }
     sfs_file_t* new_f = (sfs_file_t*)new_dir->private_data;
-    if (!old_f || !new_f) return -1;
+    if (!new_f) {
+        if (sfs_temp_load(new_dir, &new_local) != ERR_OK) return -1;
+        new_f = &new_local;
+    }
 
     int inum = sfs_lookup(old_f->fs, old_f->inum, old_name);
     if (inum < 0) return -1;
@@ -932,8 +1074,12 @@ static int sfs_vfs_rename(vfs_node_t* old_dir, const char* old_name,
 
 static int sfs_vfs_symlink(vfs_node_t* dir, const char* name, const char* target) {
     if (!dir || !name || !target) return -1;
+    sfs_file_t dir_local;
     sfs_file_t* dir_f = (sfs_file_t*)dir->private_data;
-    if (!dir_f) return -1;
+    if (!dir_f) {
+        if (sfs_temp_load(dir, &dir_local) != ERR_OK) return -1;
+        dir_f = &dir_local;
+    }
 
     if (sfs_lookup(dir_f->fs, dir_f->inum, name) >= 0) return -1;
 
@@ -984,8 +1130,13 @@ static int sfs_vfs_symlink(vfs_node_t* dir, const char* name, const char* target
 }
 
 static int sfs_vfs_readlink(vfs_node_t* node, char* buf, uint64_t size) {
-    if (!node || !buf || !node->private_data) return -1;
+    if (!node || !buf) return -1;
+    sfs_file_t local_f;
     sfs_file_t* f = (sfs_file_t*)node->private_data;
+    if (!f) {
+        if (sfs_temp_load(node, &local_f) != ERR_OK) return -1;
+        f = &local_f;
+    }
     if (f->inode.type != SFS_TYPE_SYMLINK) return -1;
 
     uint32_t to_read = f->inode.size;
@@ -1006,9 +1157,17 @@ static int sfs_vfs_readlink(vfs_node_t* node, char* buf, uint64_t size) {
 
 static int sfs_vfs_link(vfs_node_t* dir, const char* name, vfs_node_t* target) {
     if (!dir || !name || !target) return -1;
+    sfs_file_t dir_local, tgt_local;
     sfs_file_t* dir_f = (sfs_file_t*)dir->private_data;
+    if (!dir_f) {
+        if (sfs_temp_load(dir, &dir_local) != ERR_OK) return -1;
+        dir_f = &dir_local;
+    }
     sfs_file_t* tgt_f = (sfs_file_t*)target->private_data;
-    if (!dir_f || !tgt_f) return -1;
+    if (!tgt_f) {
+        if (sfs_temp_load(target, &tgt_local) != ERR_OK) return -1;
+        tgt_f = &tgt_local;
+    }
 
     if (sfs_lookup(dir_f->fs, dir_f->inum, name) >= 0) return -1;
 
@@ -1133,6 +1292,7 @@ err_t sfs_mount(block_dev_t* bdev) {
     fs->root_node.size = rf->inode.size;
     fs->root_node.fs = &fs->vfs_fs;
     fs->root_node.private_data = rf;
+    fs->root_node.destructor = sfs_file_destructor;
 
     vfs_register_fs(&fs->vfs_fs);
 

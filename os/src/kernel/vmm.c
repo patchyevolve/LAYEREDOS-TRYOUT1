@@ -143,6 +143,10 @@ void vmm_free_user_pages(uint64_t pml4_phys) {
     for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
         if (!(pml4[pml4_idx] & PAGE_PRESENT)) continue;
         uint64_t pdpt_phys = pml4[pml4_idx] & ~0xFFFULL;
+        if (pdpt_phys == pml4_phys) {
+            pml4[pml4_idx] = 0;
+            continue;
+        }
         page_entry_t* pdpt = (page_entry_t*)PHYS_TO_VIRT(pdpt_phys);
         for (int pdpt_idx = 0; pdpt_idx < 512; pdpt_idx++) {
             if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) continue;
@@ -170,8 +174,60 @@ void vmm_free_user_pages(uint64_t pml4_phys) {
             pmm_free_page(pd_phys);
         }
         pmm_free_page(pdpt_phys);
+        pml4[pml4_idx] = 0;
     }
 }
+
+#ifdef VMM_DEBUG
+void vmm_dump_pml4(uint64_t pml4_phys) {
+    page_entry_t* pml4 = (page_entry_t*)PHYS_TO_VIRT(pml4_phys);
+    kprintf("[VMM] PML4 dump at phys=0x%lx:\n", pml4_phys);
+    for (int i = 0; i < 256; i++) {
+        if (!(pml4[i] & PAGE_PRESENT)) continue;
+        uint64_t pdpt_phys = pml4[i] & ~0xFFFULL;
+        kprintf("  pml4[%u]=0x%lx -> pdpt=0x%lx\n", i, pml4[i], pdpt_phys);
+        page_entry_t* pdpt = (page_entry_t*)PHYS_TO_VIRT(pdpt_phys);
+        for (int j = 0; j < 512; j++) {
+            if (!(pdpt[j] & PAGE_PRESENT)) continue;
+            uint64_t pd_phys = pdpt[j] & ~0xFFFULL;
+            kprintf("    pdpt[%u]=0x%lx -> pd=0x%lx\n", j, pdpt[j], pd_phys);
+        }
+    }
+}
+#endif
+
+#ifdef VMM_VALIDATE
+err_t vmm_validate_pagetables(uint64_t pml4_phys) {
+    page_entry_t* pml4 = (page_entry_t*)PHYS_TO_VIRT(pml4_phys);
+    for (int i = 0; i < 256; i++) {
+        if (!(pml4[i] & PAGE_PRESENT)) continue;
+        uint64_t pdpt_phys = pml4[i] & ~0xFFFULL;
+        if (pdpt_phys == pml4_phys) {
+            kprintf("[VMM] VALIDATE: pml4[%d] self-references pml4=0x%lx\n", i, pml4_phys);
+            return ERR_INVAL;
+        }
+        page_entry_t* pdpt = (page_entry_t*)PHYS_TO_VIRT(pdpt_phys);
+        for (int j = 0; j < 512; j++) {
+            if (!(pdpt[j] & PAGE_PRESENT)) continue;
+            uint64_t pd_phys = pdpt[j] & ~0xFFFULL;
+            if (pd_phys == pml4_phys || pd_phys == pdpt_phys) {
+                kprintf("[VMM] VALIDATE: pdpt[%d] points to pml4/pdpt (0x%lx)\n", j, pd_phys);
+                return ERR_INVAL;
+            }
+            page_entry_t* pd = (page_entry_t*)PHYS_TO_VIRT(pd_phys);
+            for (int k = 0; k < 512; k++) {
+                if (!(pd[k] & PAGE_PRESENT)) continue;
+                uint64_t pt_phys = pd[k] & ~0xFFFULL;
+                if (pt_phys == pml4_phys || pt_phys == pdpt_phys || pt_phys == pd_phys) {
+                    kprintf("[VMM] VALIDATE: pd[%d] points to parent table (0x%lx)\n", k, pt_phys);
+                    return ERR_INVAL;
+                }
+            }
+        }
+    }
+    return ERR_OK;
+}
+#endif
 
 err_t vmm_init(void) {
     uint64_t cr3;

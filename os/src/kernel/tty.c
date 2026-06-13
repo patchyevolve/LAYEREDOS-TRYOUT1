@@ -7,12 +7,15 @@
 
 tty_t tty_console;
 
+static int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp);
+
 /* TTY VFS filesystem — wraps the line-discipline operations */
 static vfs_file_ops_t tty_file_ops = {
     .open  = tty_vfs_open,
     .close = tty_vfs_close,
     .read  = tty_vfs_read,
     .write = tty_vfs_write,
+    .ioctl = tty_vfs_ioctl,
 };
 
 static vfs_fs_t tty_fs = {
@@ -73,13 +76,19 @@ void tty_init(void) {
     n->fs    = &tty_fs;
     n->private_data = t;
 
-    /* Wire FDs 0/1/2 to the console TTY */
-    extern vfs_fd_t fd_table[VFS_MAX_FDS];
+    /* Wire FDs 0/1/2 to the console TTY (kernel fd table + init process) */
+    vfs_fd_t* ft = vfs_get_fd_table();
     for (int i = 0; i < 3; i++) {
-        fd_table[i].node   = &tty_console.node;
-        fd_table[i].offset = 0;
-        fd_table[i].flags  = 0;
-        fd_table[i].used   = 1;
+        ft[i].node   = &tty_console.node;
+        ft[i].offset = 0;
+        ft[i].flags  = 0;
+        ft[i].used   = 1;
+    }
+
+    /* Also set up init process fds for user-space programs */
+    process_t* init_proc = process_find(1);
+    if (init_proc) {
+        kmemcpy(init_proc->fds, ft, sizeof(vfs_fd_t) * 3);
     }
 
     kprintf("[TTY] Console terminal initialised\n");
@@ -280,6 +289,15 @@ static int tty_process_canon(char* buf, uint64_t count) {
     }
 }
 
+/* ── Helper: check if calling process is in background ────────────────── */
+static int tty_is_bg(void) {
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    if (!proc) return 0;
+    uint64_t fg = tty_console.fg_pgid;
+    if (fg <= 0) return 0;
+    return (proc->pgid != fg) ? 1 : 0;
+}
+
 /* ── VFS operations ─────────────────────────────────────────────────────── */
 
 int tty_vfs_open(vfs_node_t* node) {
@@ -297,6 +315,16 @@ int64_t tty_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offse
     (void)node; /* always uses tty_console */
 
     tty_t* t = &tty_console;
+
+    /* SIGTTIN: background process reading from TTY */
+    if (tty_is_bg()) {
+        process_t* proc = current_thread ? current_thread->proc : NULL;
+        if (proc) {
+            signal_send(proc->pid, SIGTTIN);
+            signal_process(proc);
+            return 0;
+        }
+    }
 
     if (t->lflag & TTY_ICANON) {
         int ret = tty_process_canon((char*)buf, count);
@@ -331,6 +359,19 @@ int64_t tty_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offse
 int64_t tty_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, uint64_t offset) {
     (void)node;
     (void)offset;
+
+    tty_t* t = &tty_console;
+
+    /* SIGTTOU: background process writing to TTY with TOSTOP */
+    if (tty_is_bg() && (t->lflag & TTY_TOSTOP)) {
+        process_t* proc = current_thread ? current_thread->proc : NULL;
+        if (proc) {
+            signal_send(proc->pid, SIGTTOU);
+            signal_process(proc);
+            return (int64_t)count; /* consume the write silently */
+        }
+    }
+
     const char* p = (const char*)buf;
     for (uint64_t i = 0; i < count; i++) {
         char c = p[i];
@@ -338,6 +379,49 @@ int64_t tty_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, uint64_
         kputchar(c);
     }
     return (int64_t)count;
+}
+
+/* ── TTY ioctl ──────────────────────────────────────────────────────────── */
+
+int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp) {
+    (void)node;
+    tty_t* t = &tty_console;
+
+    switch (request) {
+        case TCGETATTR: {
+            termios_t ti;
+            ti.c_lflag = t->lflag;
+            for (int i = 0; i < TTY_CC_NCCS; i++)
+                ti.c_cc[i] = t->cc[i];
+            if (copy_to_user(argp, &ti, sizeof(ti)) != 0)
+                return -1;
+            return 0;
+        }
+        case TCSETATTR: {
+            termios_t ti;
+            if (copy_from_user(&ti, argp, sizeof(ti)) != 0)
+                return -1;
+            t->lflag = ti.c_lflag;
+            for (int i = 0; i < TTY_CC_NCCS; i++)
+                t->cc[i] = ti.c_cc[i];
+            return 0;
+        }
+        case TIOCGPGRP: {
+            pid_t pgid = (pid_t)t->fg_pgid;
+            if (copy_to_user(argp, &pgid, sizeof(pgid)) != 0)
+                return -1;
+            return 0;
+        }
+        case TIOCSPGRP: {
+            pid_t pgid;
+            if (copy_from_user(&pgid, argp, sizeof(pgid)) != 0)
+                return -1;
+            t->fg_pgid = (uint64_t)pgid;
+            return 0;
+        }
+        default:
+            return -1;
+    }
 }
 
 /* ── Job control ────────────────────────────────────────────────────────── */

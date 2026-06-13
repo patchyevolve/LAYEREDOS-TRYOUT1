@@ -11,10 +11,14 @@ static volatile uint64_t* hpet_regs = NULL;
 static uint64_t hpet_period_fs = 0; /* period in femtoseconds */
 
 /* Map a physical address into the kernel's virtual address space */
-/* Use the last page of kernel virtual space for HPET MMIO */
 #define HPET_VADDR 0xFFFFFFFFFFFFF000ULL
 
 static volatile uint64_t* hpet_map_mmio(uint64_t phys, size_t size) {
+    if (hal_is_qemu_tcg()) {
+        kprintf("[HPET] QEMU TCG detected — skipping MMIO mapping (softmmu cache workaround), using PIT\n");
+        return NULL;
+    }
+
     uint64_t va = HPET_VADDR;
     size_t num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -47,7 +51,6 @@ err_t hpet_init(void) {
     /* Map the HPET MMIO region */
     hpet_regs = hpet_map_mmio(HPET_MMIO_BASE, HPET_MMIO_SIZE);
     if (!hpet_regs) {
-        kprintf("[HPET] Failed to map MMIO at %llx\n", (uint64_t)HPET_MMIO_BASE);
         return ERR_FAULT;
     }
 

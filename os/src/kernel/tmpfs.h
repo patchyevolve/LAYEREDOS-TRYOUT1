@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "vfs.h"
+#include "sync.h"
 
 #define TMPFS_NAME_MAX 60
 
@@ -25,6 +26,7 @@ typedef struct tmpfs_fs {
     vfs_fs_t vfs_fs;
     vfs_node_t root_node;
     tmpfs_file_t* root_dir;
+    spinlock_t lock;
 } tmpfs_fs_t;
 
 err_t tmpfs_mount(vfs_fs_t** out_fs);

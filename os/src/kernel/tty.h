@@ -35,6 +35,20 @@
 #define TTY_DEF_EOF   4   /* Ctrl-D */
 #define TTY_DEF_SUSP  26  /* Ctrl-Z */
 
+/* Termios ioctl constants */
+#define TCGETATTR   0x5401
+#define TCSETATTR   0x5402
+#define TCGETS      TCGETATTR
+#define TCSETS      TCSETATTR
+#define TIOCGPGRP   0x540F
+#define TIOCSPGRP   0x5410
+
+/* Termios struct (minimal — only what we use) */
+typedef struct termios {
+    uint32_t c_lflag;
+    char     c_cc[TTY_CC_NCCS];
+} termios_t;
+
 typedef struct tty {
     /* Raw input ring buffer (filled by ISR) */
     char raw_buf[TTY_BUF_SIZE];

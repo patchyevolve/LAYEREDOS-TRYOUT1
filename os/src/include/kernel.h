@@ -10,6 +10,11 @@ extern uint64_t _data_start, _data_end, _bss_start, _bss_end, _kernel_end;
 void kputchar(char c);
 void kputs(const char* s);
 void kprintf(const char* fmt, ...);
+#ifdef NDEBUG
+#define KDEBUG(...) ((void)0)
+#else
+#define KDEBUG(...) kprintf(__VA_ARGS__)
+#endif
 void kputhex(uint64_t v);
 void kputdec(uint64_t v, int pad);
 

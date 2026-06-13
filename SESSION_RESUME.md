@@ -26,13 +26,26 @@
 ## Test Status
 - `make test` — ALL PASS
 
+## What Was Done (2026-06-09)
+
+### Stage 4 Remaining Items — Three Implemented
+1. **Termios ioctl** — `SYS_IOCTL` (syscall 34) with `TCGETATTR`/`TCSETATTR`/`TIOCSPGRP`/`TIOCGPGRP`
+2. **SIGTTIN/SIGTTOU** — Background processes reading TTY get SIGTTIN; writing with TOSTOP gets SIGTTOU
+3. **`SYS_SETPGID`/`SYS_GETPGID`** — Syscalls 35/36 for user-space process group management
+4. **PTY support** — Not yet implemented
+
+### Files Modified
+- `os/src/kernel/tty.h` — Added termios_t struct, ioctl constants (TCGETATTR/TCSETATTR/TIOCGPGRP/TIOCSPGRP)
+- `os/src/kernel/tty.c` — Added `tty_is_bg()`, SIGTTIN in `tty_vfs_read`, SIGTTOU in `tty_vfs_write` (with TOSTOP), `tty_vfs_ioctl` handler, wired ioctl op into `tty_file_ops`
+- `os/src/kernel/vfs.h` — Added `.ioctl` to `vfs_file_ops_t`, declared `vfs_ioctl()`
+- `os/src/kernel/vfs.c` — Implemented `vfs_ioctl()` dispatcher
+- `os/src/include/syscall_defs.h` — Added `SYS_IOCTL=34`, `SYS_SETPGID=35`, `SYS_GETPGID=36`; bumped `SYSCALL_COUNT` to 37
+- `os/src/kernel/syscall.c` — Implemented `sys_ioctl`, `sys_setpgid`, `sys_getpgid`; added to syscall table; made `copy_from_user`/`copy_to_user` non-static for TTY use; added `tty.h` include
+
 ## Next Steps
 
 ### Stage 4 remaining
-1. **Termios ioctl** — Add `SYS_IOCTL` with `TCGETATTR`/`TCSETATTR`/`TIOCSPGRP`/`TIOCGPGRP`
-2. **SIGTTIN/SIGTTOU** — Generate stop signals when background processes access TTY
-3. **`SYS_SETPGID`/`SYS_GETPGID`** — User-space process group management
-4. **PTY support** — Pseudo-terminal master/slave pair
+1. **PTY support** — Pseudo-terminal master/slave pair
 
 ### Stage 5 — Networking (next major stage)
 - NIC driver (e1000), ARP, IP, UDP/TCP, sockets API

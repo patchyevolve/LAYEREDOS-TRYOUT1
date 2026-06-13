@@ -1,23 +1,51 @@
 # OPERtur/TRY1 — Kernel Project Summary
 
-**Last updated:** June 6, 2026
+**Last updated:** June 9, 2026
 
 ## Project Overview
 
 OPERtur/TRY1 is an OS kernel being developed from scratch. The codebase is in `os/` and the architecture is x86-64.
 
-## Current Session Accomplishments (June 6, 2026)
+## Quick Reference
 
-1. **Fixed `sfs_add_dirent` to write to correct parent directory** (`os/src/kernel/sfs.c`): Previously always wrote to `fs->vfs_fs.root` (the root directory). Changed to create a temporary `vfs_node_t` wrapper around the actual parent directory so subdirectory operations work correctly.
+### Key addresses
+HPET MMIO: 0xFED00000 — NOT MAPPED on QEMU TCG (TCG softmmu cache bug workaround)
+                         `hpet_map_mmio()` returns NULL immediately; fall back to PIT
+APIC base: 0xFEE00000 — NOT MAPPED on QEMU TCG; fall back to legacy PIC
+COM1 (UART): 0x3F8
+Kernel base (higher half): 0xFFFFFFFF80000000
+User space top:            0x0000800000000000
+Signal trampoline:         `SIGNAL_TRAMPOLINE_ADDR` (defined in process.h)
 
-2. **Fixed stale inode cache in `sfs_vfs_readdir`** (`os/src/kernel/sfs.c`): Added `sfs_read_inode(f->fs, f->inum, &f->inode)` at the start of `readdir` to refresh parent directory inode data from disk. Without this, cached `private_data->inode.size` became stale after directory modifications (e.g., creating a file in a subdirectory), causing `vfs_find` to fail when walking paths into subdirectories.
+### Known platform constraints (QEMU TCG)
+- HPET and APIC MMIO must NOT be mapped. `hpet_map_mmio()` and `apic_init()` both short-circuit.
+- Scheduling tick source: PIT (IRQ0) only. APIC timer is not active.
+- Timekeeping: PIT-resolution only (~1 ms). `hal_timer_get_ns()` falls back to PIT tick counter * 1,000,000.
+- `vmm_flush_tlb_page`: plain `invlpg` only. Do not attempt CR3 reload or `wbinvd` as workaround.
+- Any future task that requires HPET precision (T5.7 TCP retransmit timer, T9.1 GDB timing) must account for PIT-only resolution.
+- If/when testing on KVM or bare metal, HPET/APIC paths need to be re-enabled and re-tested.
 
-3. **Production-ready `cmd_ls`** (`os/src/kernel/shell.c`): Uses `readdir` (SFS-compatible) with fallback to children linked list. Root node is now persistent and not freed.
+## Current Session Accomplishments (June 9, 2026)
 
-4. **PMM virtual address fix** (`os/src/kernel/pmm.c`): Changed PMM free list to use kernel virtual addresses (via `PHYS_TO_VIRT`/`VIRT_TO_PHYS`) instead of direct physical addresses. This fixes page faults in syscall handlers that run with user CR3 (which lacks identity mapping in the low half).
+### Stage 4 TTY/PTY Completion
+1. **SYS_IOCTL (syscall 34)** — `vfs_ioctl` dispatch with `TCGETATTR` / `TCSETATTR` / `TIOCGPGRP` / `TIOCSPGRP` for TTY.
+2. **SIGTTIN / SIGTTOU** — TTY read sends SIGTTIN to background process; TTY write sends SIGTTOU when TOSTOP set and process is background.
+3. **SYS_SETPGID / SYS_GETPGID (syscalls 35/36)** — Set/get process group ID with self-or-child permission check.
+4. **PTY pseudo-terminal subsystem** — Created `pty.c`/`pty.h` with 8-slot pool, master-slave VFS file_ops, line discipline (canon/raw, echo, signal chars, termios ioctl), `SYS_PTY_PAIR` (syscall 37), `pty_init()` wired in `main.c`.
+5. **QEMU TCG HPET/APIC workaround** — HPET and APIC MMIO mapping disabled due to QEMU TCG softmmu page-walk cache bug; kernel falls back to PIT/PIC and boots cleanly.
 
-5. **Verified all operations work**: `mkdir`, `writefile`, `cat`, `ls`, `rm`, `rmdir` all work correctly across nested directory structures.
+### Files changed
+- `os/src/kernel/pty.h` — new: PTY data structures and API.
+- `os/src/kernel/pty.c` — new: master/slave VFS ops, line discipline, `pty_pair_create()`, termios ioctls.
+- `os/src/include/syscall_defs.h` — added `SYS_PTY_PAIR=37`, `SYSCALL_COUNT=38`.
+- `os/src/kernel/syscall.c` — added `sys_pty_pair` handler and table entry.
+- `os/src/kernel/main.c` — added `pty_init()` call.
+- `os/src/kernel/tty.c`, `tty.h`, `vfs.c`, `vfs.h` — Stage 4 TTY changes (ioctl, job control, SIGTTIN/SIGTTOU).
+- `os/src/kernel/hpet.c` — `hpet_map_mmio` short-circuits (QEMU TCG workaround).
+- `os/src/kernel/apic.c` — `apic_init` short-circuits (QEMU TCG workaround).
 
-## Status
+## Status (as of June 9, 2026)
 
-The kernel supports a basic shell with file system operations on a simple SFS (Simple File System). The PMM now correctly handles virtual vs physical address translation, and the VFS layer properly supports nested directories.
+- All Stage 3 FS tests pass (`make test`).
+- Stage 4 TTY/PTY complete — terminal ioctl, job control, pseudo-terminals.
+- HPET/APIC disabled on QEMU TCG; kernel uses legacy PIT/PIC and boots to shell cleanly.

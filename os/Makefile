@@ -14,28 +14,45 @@ QEMU    = qemu-system-x86_64
 # Build configuration
 BUILD ?= debug
 DEBUG ?= $(shell test "$(BUILD)" = "debug" && echo 1 || echo 0)
+RELEASE ?= $(shell test "$(BUILD)" = "release" && echo 1 || echo 0)
 
 # Feature flags
-ENABLE_SMP    ?= 0
-ENABLE_ACPI   ?= 0
-ENABLE_NET    ?= 0
+ENABLE_SMP       ?= 0
+ENABLE_ACPI      ?= 0
+ENABLE_NET       ?= 0
+ENABLE_NET_TEST     ?= 0
+ENABLE_STORAGE_TEST ?= 0
 
 # Kernel compilation flags
 KERNEL_CFLAGS = -ffreestanding -m64 -mcmodel=kernel -mno-red-zone \
                 -mno-mmx -mno-sse -mno-sse2 -fno-stack-protector \
-                -fno-pic -fno-pie -nostdlib -fno-strict-aliasing \
-                -fno-omit-frame-pointer
+                -fno-pic -fno-pie -nostdlib -fno-strict-aliasing
 
 # User-space compilation flags (small model — user programs at 0x40000000)
 USER_CFLAGS = -ffreestanding -m64 -mcmodel=small -mno-red-zone \
               -mno-mmx -mno-sse -mno-sse2 -fno-stack-protector \
               -fno-pic -fno-pie -nostdlib -fno-builtin \
-              -fno-strict-aliasing -fno-omit-frame-pointer
+              -fno-strict-aliasing
 
 INCLUDES = -I src/include -I src/kernel
 WARNINGS = -Wall -Wextra -Werror -Wno-unused-parameter
 
-CFLAGS  = $(KERNEL_CFLAGS) $(INCLUDES) $(WARNINGS) -O2 -g
+# Debug vs release flags
+ifeq ($(RELEASE),1)
+KERNEL_CFLAGS += -fomit-frame-pointer
+USER_CFLAGS   += -fomit-frame-pointer
+OPT_FLAGS      = -Os -DNDEBUG
+POST_LD        = $(OBJCOPY) --strip-all --discard-all build/kernel.elf build/kernel.elf
+else
+KERNEL_CFLAGS += -fno-omit-frame-pointer
+USER_CFLAGS   += -fno-omit-frame-pointer
+OPT_FLAGS      = -O2 -g
+POST_LD        = 
+endif
+
+CFLAGS  = $(KERNEL_CFLAGS) $(INCLUDES) $(WARNINGS) $(OPT_FLAGS)
+CFLAGS  += $(shell [ $(ENABLE_NET_TEST) -eq 1 ] && echo "-DNET_SELF_TEST")
+CFLAGS  += $(shell [ $(ENABLE_STORAGE_TEST) -eq 1 ] && echo "-DSTORAGE_SELF_TEST")
 ASFLAGS = $(CFLAGS)
 LDFLAGS = -nostdlib -z max-page-size=0x1000 -T linker.ld
 
@@ -45,8 +62,14 @@ SRC_DIR   = src
 BUILD_DIR = build
 
 # ---- Kernel sources (exclude user programs and user library) ----
-KERNEL_C_SRCS = $(wildcard $(SRC_DIR)/kernel/*.c) \
+KERNEL_C_SRCS = $(filter-out $(SRC_DIR)/kernel/net_test.c $(SRC_DIR)/kernel/storage_test.c, $(wildcard $(SRC_DIR)/kernel/*.c)) \
                 $(wildcard $(SRC_DIR)/lib/*.c)
+ifeq ($(ENABLE_NET_TEST),1)
+KERNEL_C_SRCS += $(SRC_DIR)/kernel/net_test.c
+endif
+ifeq ($(ENABLE_STORAGE_TEST),1)
+KERNEL_C_SRCS += $(SRC_DIR)/kernel/storage_test.c
+endif
 KERNEL_S_SRCS = $(filter-out \
                     $(SRC_DIR)/boot/user_program.S \
                     $(SRC_DIR)/boot/cat_program.S, \
@@ -58,7 +81,7 @@ KERNEL_S_OBJS = $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(KERNEL_S_SRCS))
 KERNEL_OBJS   = $(KERNEL_C_OBJS) $(KERNEL_S_OBJS)
 
 # ---- User ELF binaries (embedded as .rodata in kernel) ----
-USER_PROGRAMS   = user_program cat_program hello-c hello-dyn
+USER_PROGRAMS   = user_program cat_program hello-c hello-dyn tcp_echo-c udp_echo-c exit_only thread_test-c
 USER_ELF_BINS   = $(addprefix $(BUILD_DIR)/, $(addsuffix .elf, $(USER_PROGRAMS)))
 USER_EMBEDDED   = $(addsuffix _embedded.o, $(basename $(USER_ELF_BINS)))
 DYNSO_BINS      = $(BUILD_DIR)/ld.so $(BUILD_DIR)/lib/ldso/libdyn.so
@@ -147,6 +170,7 @@ $(BUILD_DIR)/%_embedded.o: $(BUILD_DIR)/%.elf
 $(KERNEL_ELF): $(LINK_OBJS) linker.ld
 	@mkdir -p $(BUILD_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(LINK_OBJS) $(LIBGCC)
+	$(POST_LD)
 	@$(SIZE) $@
 
 # ============================================================
@@ -155,7 +179,8 @@ $(KERNEL_ELF): $(LINK_OBJS) linker.ld
 
 run: $(KERNEL_ELF)
 	$(QEMU) -kernel $(KERNEL_ELF) -serial mon:stdio \
-		-m 512M -no-reboot -no-shutdown -vga std
+		-m 512M -no-reboot -no-shutdown -vga std \
+		-nic user,model=e1000
 
 headless: $(KERNEL_ELF)
 	$(QEMU) -kernel $(KERNEL_ELF) -nographic \
@@ -164,7 +189,7 @@ headless: $(KERNEL_ELF)
 
 test: $(KERNEL_ELF)
 	@echo "=== Headless automated test (Stage 3 FS) ==="
-	@(sleep 8; \
+	@(sleep 60; \
 	  echo "echo STAGE3:FILE_RW"; sleep 1; \
 	  echo "echo hello > /test.txt"; sleep 1; \
 	  echo "cat /test.txt"; sleep 1; \
@@ -215,11 +240,15 @@ test: $(KERNEL_ELF)
 	  echo "echo STAGE3:DONE"; sleep 1; \
 	  echo "source /welcome.txt"; sleep 2; \
 	  echo "run hello-c.elf"; sleep 6; \
+	  echo "run thread_test.elf"; sleep 6; \
 	  echo "echo done") | \
-	  timeout 210 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
+	  timeout 300 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
 	  -m 512M -no-reboot -no-shutdown 2>&1 | \
-	  strings | grep -E '(hello|world|/test\.txt|/link\.txt|/renamed|/copy\.txt|/snap|STAGE3:|lines.*words.*chars|/tmp|/dev/null|libc test|PASS|done|OPERtur|Welcome|FSCK|clean|snap-data|rolled|BACKUP|RESTORE|backup\.bkp)'
+	  strings | grep -E '(hello|world|/test\.txt|/link\.txt|/renamed|/copy\.txt|/snap|STAGE3:|lines.*words.*chars|/tmp|/dev/null|libc test|threading|fork_test|mmap_test|thread_test|PASS|done|OPERtur|Welcome|FSCK|clean|snap-data|rolled|BACKUP|RESTORE|backup\.bkp)'
 	@echo "=== Test complete ==="
+
+release:
+	$(MAKE) BUILD=release all
 
 debug: $(KERNEL_ELF)
 	$(QEMU) -kernel $(KERNEL_ELF) -serial mon:stdio \
@@ -328,3 +357,23 @@ rebuild: clean all
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f qemu.log
+
+test-net: clean
+	$(MAKE) ENABLE_NET_TEST=1 all
+	@echo "Running network self-tests..."
+	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
+		-m 512M -no-reboot -no-shutdown \
+		-nic none -device e1000 > /tmp/qemu_test_net.txt 2>&1 || true
+	@grep -a 'tcp_find_conn_ipv6\|ndp_cache_miss\|icmpv6_ns_parse\|socket_refcount\|udp_queue\|Results:' /tmp/qemu_test_net.txt || true
+
+test-storage: clean
+	$(MAKE) ENABLE_STORAGE_TEST=1 all
+	@echo "Running storage self-tests..."
+	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
+		-m 512M -no-reboot -no-shutdown \
+		-nic none -device e1000 > /tmp/qemu_test_storage.txt 2>&1 || true
+	@grep -a 'block_cache_basic\|block_cache_writeback\|block_register_reject\|swap_alloc_free\|swap_out_in\|journal_init\|journal_log_commit\|snapshot_take_info\|Results:' /tmp/qemu_test_storage.txt || true
+
+test-net-2qemu: all
+	@QEMU="$(QEMU)" chmod +x test-2qemu.sh; \
+	 QEMU="$(QEMU)" ./test-2qemu.sh

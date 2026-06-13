@@ -5,6 +5,7 @@
 #include "sched.h"
 #include "process.h"
 #include "work.h"
+#include "kmalloc.h"
 
 typedef struct free_page {
     struct free_page* next;
@@ -35,6 +36,8 @@ static void pmm_oom_kill_worker(void* arg) {
 
 static void pmm_oom_kill(void) {
     if (!oom_scheduled) {
+        /* Try heap compaction first — may free enough pages */
+        kmalloc_compact();
         oom_scheduled = 1;
         oom_work_item.func = pmm_oom_kill_worker;
         oom_work_item.data = NULL;
@@ -73,11 +76,30 @@ uint64_t pmm_alloc_page(void) {
     /* 0 is used as OOM sentinel; page 0 is reserved in pmm_init so this is unambiguous */
 
     free_page_t* page = free_list;
+    uint64_t phys = VIRT_TO_PHYS(page);
+    uint64_t idx = phys / PAGE_SIZE;
+
+    /* Validate free-list pointer */
+    if (phys & 0xFFF) {
+        kprintf("[PMM] CRASH: free-list corruption! phys=%lx (misaligned)\n", phys);
+        for (;;) asm("cli; hlt");
+    }
+    if (idx >= total_page_count) {
+        kprintf("[PMM] CRASH: free-list corruption! phys=%lx idx=%lu >= total=%lu\n",
+                phys, idx, total_page_count);
+        for (;;) asm("cli; hlt");
+    }
+
     free_list = page->next;
     free_page_count--;
 
-    uint64_t phys = VIRT_TO_PHYS(page);
-    bitmap_set(phys / PAGE_SIZE);
+    if (bitmap_test(idx)) {
+        kprintf("[PMM] CRASH: page %lx (idx %lu) DOUBLE-ALLOCATED! free_list=%lx\n",
+                phys, idx, (uint64_t)page->next);
+        kprintf("[PMM] free_page_count=%lu total=%lu\n", free_page_count, total_page_count);
+        for (;;) asm("cli; hlt");
+    }
+    bitmap_set(idx);
     hal_restore_irq(flags);
     kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
     return phys;

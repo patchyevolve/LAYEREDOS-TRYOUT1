@@ -139,6 +139,19 @@ void sched_remove_thread(thread_t* t) {
     cpu_flags_t flags = hal_save_irq();
     run_queue_t* q = &run_queues[t->priority];
 
+    /* Guard: if both rq_prev and rq_next are NULL the thread may not be in
+     * the run queue at all (e.g. already dequeued by pick_next()).
+     * Only proceed with removal when the thread is confirmed to be linked
+     * into the queue (non-NULL neighbour) OR is the sole queue head.
+     * Without this guard, a THREAD_RUNNING thread calling sched_block()
+     * immediately after pick_next() would set q->head = NULL and
+     * q->tail = NULL, wiping every other ready thread from the queue. */
+    if (t->rq_prev == NULL && t->rq_next == NULL && q->head != t) {
+        /* Thread is not in this run queue; nothing to remove. */
+        hal_restore_irq(flags);
+        return;
+    }
+
     if (t->rq_prev) t->rq_prev->rq_next = t->rq_next;
     else q->head = t->rq_next;
 
@@ -156,10 +169,14 @@ void sched_remove_thread(thread_t* t) {
 
 static thread_t* pick_next(void) {
     int prio = bitmap_find_highest();
-    if (prio < 0) return idle_thr;
+    if (prio < 0) {
+        return idle_thr;
+    }
 
     run_queue_t* q = &run_queues[prio];
-    if (!q->head) return idle_thr;
+    if (!q->head) {
+        return idle_thr;
+    }
 
     thread_t* t = q->head;
     if (t == idle_thr) return idle_thr;
@@ -295,6 +312,11 @@ void thread_exit(int exit_code) {
     next->state = THREAD_RUNNING;
     next->time_slice_remaining = THREAD_TIME_SLICE;
 
+    uint64_t target_cr3 = next->cr3 ? next->cr3 : kernel_cr3;
+    if (target_cr3) {
+        asm volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
+    }
+
     hal_set_kernel_stack((uint64_t)next->kernel_stack + next->kernel_stack_size);
     switch_context(&old, &current_thread);
     hal_restore_irq(flags);
@@ -324,8 +346,10 @@ void sched_block(wait_queue_t* wq) {
     if (!wq || !current_thread) return;
 
     cpu_flags_t flags = hal_save_irq();
-    if (current_thread->state == THREAD_READY || current_thread->state == THREAD_RUNNING)
+    if (current_thread->state == THREAD_READY || current_thread->state == THREAD_RUNNING) {
+    // sched_block is called with irqs disabled; caller must restore
         sched_remove_thread(current_thread);
+    }
     current_thread->state = THREAD_BLOCKED;
     current_thread->wq_next = wq->waiters;
     wq->waiters = current_thread;

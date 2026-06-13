@@ -98,6 +98,25 @@ int hal_cpu_has_mwait(void) {
     return (ecx >> 3) & 1;
 }
 
+int hal_is_qemu_tcg(void) {
+    static int result = -1;
+    if (result != -1) return result;
+
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(1), "c"(0));
+
+    if (!(ecx & (1U << 31))) { result = 0; return 0; }
+
+    asm volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(0x40000000), "c"(0));
+
+    result = (ebx == 0x54434754 && ecx == 0x43544743 && edx == 0x47435447);
+    return result;
+}
+
 static inline uint64_t read_cr2(void) {
     uint64_t v;
     asm volatile("mov %%cr2, %0" : "=r"(v));
@@ -410,9 +429,73 @@ void interrupt_handler(int_frame_t* frame) {
                     }
                 }
             }
+            /* Dump page table walk for fault address */
+            uint64_t dbg_cr3_val = 0;
+            asm volatile("mov %%cr3, %0" : "=r"(dbg_cr3_val));
+            kprintf("[PF] actual CR3=0x%lx cur_thr=%p cur_thr_cr3=0x%lx\n",
+                    dbg_cr3_val, current_thread,
+                    current_thread ? current_thread->cr3 : 0);
+            if (current_thread && current_thread->proc) {
+                kprintf("[PF] THR_CR3=0x%lx PROC_CR3=0x%lx\n",
+                        current_thread->cr3,
+                        current_thread->proc->cr3);
+            }
+            if (current_thread && current_thread->proc && current_thread->cr3) {
+                uint64_t dbg_cr3 = current_thread->cr3;
+                uint64_t pml4_i = (cr2 >> 39) & 0x1FF;
+                page_entry_t* dbg_pml4 = (page_entry_t*)PHYS_TO_VIRT(dbg_cr3);
+                kprintf("[PF] PML4[%lu]=0x%lx\n", pml4_i, dbg_pml4[pml4_i]);
+                if (dbg_pml4[pml4_i] & PAGE_PRESENT) {
+                    uint64_t dbg_pdpt_p = dbg_pml4[pml4_i] & ~0xFFFULL;
+                    page_entry_t* dbg_pdpt = (page_entry_t*)PHYS_TO_VIRT(dbg_pdpt_p);
+                    uint64_t pdpt_i = (cr2 >> 30) & 0x1FF;
+                    kprintf("[PF] PDPT[%lu]=0x%lx\n", pdpt_i, dbg_pdpt[pdpt_i]);
+                    if (dbg_pdpt[pdpt_i] & PAGE_PRESENT) {
+                        uint64_t dbg_pd_p = dbg_pdpt[pdpt_i] & ~0xFFFULL;
+                        page_entry_t* dbg_pd = (page_entry_t*)PHYS_TO_VIRT(dbg_pd_p);
+                        uint64_t pd_i = (cr2 >> 21) & 0x1FF;
+                        kprintf("[PF] PD[%lu]=0x%lx\n", pd_i, dbg_pd[pd_i]);
+                        if (dbg_pd[pd_i] & PAGE_PRESENT) {
+                            uint64_t dbg_pt_p = dbg_pd[pd_i] & ~0xFFFULL;
+                            page_entry_t* dbg_pt = (page_entry_t*)PHYS_TO_VIRT(dbg_pt_p);
+                            uint64_t pt_i = (cr2 >> 12) & 0x1FF;
+                            kprintf("[PF] PT[%lu]=0x%lx\n", pt_i, dbg_pt[pt_i]);
+                        }
+                    }
+                }
+            }
             kprintf("PAGE FAULT pid=%lu rip=%lx addr=%lx error=%lu -- killing process\n",
                     current_thread && current_thread->proc ? current_thread->proc->pid : 0,
                     fault_rip, cr2, err);
+            /* Also walk using actual CR3 for comparison */
+            {
+                uint64_t acr3;
+                asm volatile("mov %%cr3, %0" : "=r"(acr3));
+                page_entry_t* apml4 = (page_entry_t*)PHYS_TO_VIRT(acr3);
+                uint64_t apml4_i = (cr2 >> 39) & 0x1FF;
+                kprintf("[PF-ACT] CR3=%lx PML4[%lu]=%lx\n", acr3, apml4_i, apml4[apml4_i]);
+                if (apml4[apml4_i] & PAGE_PRESENT) {
+                    page_entry_t* apdpt = (page_entry_t*)PHYS_TO_VIRT(apml4[apml4_i] & ~0xFFFULL);
+                    uint64_t apdpt_i = (cr2 >> 30) & 0x1FF;
+                    kprintf("[PF-ACT] PDPT[%lu]=%lx\n", apdpt_i, apdpt[apdpt_i]);
+                    if (apdpt[apdpt_i] & PAGE_PRESENT) {
+                        page_entry_t* apd = (page_entry_t*)PHYS_TO_VIRT(apdpt[apdpt_i] & ~0xFFFULL);
+                        uint64_t apd_i = (cr2 >> 21) & 0x1FF;
+                        kprintf("[PF-ACT] PD[%lu]=%lx\n", apd_i, apd[apd_i]);
+                        if (apd[apd_i] & PAGE_PRESENT) {
+                            page_entry_t* apt = (page_entry_t*)PHYS_TO_VIRT(apd[apd_i] & ~0xFFFULL);
+                            uint64_t apt_i = (cr2 >> 12) & 0x1FF;
+                            kprintf("[PF-ACT] PT[%lu]=%lx\n", apt_i, apt[apt_i]);
+                        }
+                    }
+                }
+            }
+            kprintf("[PF] rsp=%lx rflags=%lx ss=%lx cs=%lx\n",
+                    frame->rsp, frame->rflags, frame->ss, frame->cs);
+            kprintf("[PF] rax=%lx rbx=%lx rcx=%lx rdx=%lx\n",
+                    frame->rax, frame->rbx, frame->rcx, frame->rdx);
+            kprintf("[PF] rsi=%lx rdi=%lx rbp=%lx r8=%lx\n",
+                    frame->rsi, frame->rdi, frame->rbp, frame->r8);
             if (current_thread && current_thread->proc) {
                 process_exit(current_thread->proc, -11);
                 thread_exit(-11);

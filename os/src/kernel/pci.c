@@ -1,9 +1,11 @@
 #include "kernel.h"
 #include "pci.h"
 #include "hal.h"
+#include "sync.h"
 
 static pci_device_t pci_devices[MAX_PCI_DEVICES];
 static int pci_count = 0;
+static spinlock_t pci_lock;
 
 static void pci_out_config_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
     uint32_t addr = (uint32_t)1 << 31
@@ -15,13 +17,20 @@ static void pci_out_config_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t
 }
 
 uint32_t pci_config_read(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&pci_lock, &_sf);
     pci_out_config_addr(bus, slot, func, offset);
-    return inl(PCI_CONFIG_DATA);
+    uint32_t v = inl(PCI_CONFIG_DATA);
+    spinlock_release(&pci_lock, _sf);
+    return v;
 }
 
 void pci_config_write(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&pci_lock, &_sf);
     pci_out_config_addr(bus, slot, func, offset);
     outl(PCI_CONFIG_DATA, value);
+    spinlock_release(&pci_lock, _sf);
 }
 
 static void pci_read_device(uint8_t bus, uint8_t slot, uint8_t func, pci_device_t* dev) {

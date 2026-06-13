@@ -141,5 +141,32 @@ void kfree(void* ptr) {
     spinlock_release(&kmalloc_lock, _sflags);
 }
 
+/* Compact heap: free any completely empty slab pages back to PMM.
+ * Returns the number of pages freed.  Called before OOM kill. */
+size_t kmalloc_compact(void) {
+    cpu_flags_t _sflags; spinlock_acquire(&kmalloc_lock, &_sflags);
+    size_t freed = 0;
+    for (int i = 0; i < SLAB_COUNT; i++) {
+        slab_page_t** pp = &slabs[i];
+        while (*pp) {
+            slab_page_t* pg = *pp;
+            if (pg->magic != SLAB_MAGIC) { pp = &pg->next; continue; }
+            if (pg->free_count == pg->total && pg->total > 0) {
+                /* Entire slab page is free — return it to PMM */
+                *pp = pg->next;
+                uint64_t phys = VIRT_TO_PHYS((uint64_t)pg);
+                pmm_free_pages(phys, 1);
+                kmalloc_bytes_total -= PAGE_SIZE;
+                freed++;
+            } else {
+                pp = &pg->next;
+            }
+        }
+    }
+    spinlock_release(&kmalloc_lock, _sflags);
+    if (freed) kprintf("[KMALLOC] Compacted %zu pages\n", freed);
+    return freed;
+}
+
 size_t kmalloc_used(void) { return kmalloc_bytes_used; }
 size_t kmalloc_total(void) { return kmalloc_bytes_total; }

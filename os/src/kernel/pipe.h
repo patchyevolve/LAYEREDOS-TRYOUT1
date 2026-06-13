@@ -18,6 +18,7 @@ typedef struct pipe {
     wait_queue_t    writers;
     int             read_closed;
     int             write_closed;
+    int             refcount;  /* number of pipe_create refs (rnode + wnode) */
 } pipe_t;
 
 int pipe_create(int fds[2]);

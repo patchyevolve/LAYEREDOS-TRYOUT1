@@ -1,8 +1,32 @@
 #include "kernel.h"
 #include "vfs.h"
 #include "hal.h"
+#include "process.h"
+#include "sched.h"
+#include "sync.h"
+#include "kmalloc.h"
 
-vfs_fd_t  fd_table[VFS_MAX_FDS];
+/* Kernel fallback fd table (used by kernel threads with no process) */
+static vfs_fd_t kernel_fd_table[VFS_MAX_FDS];
+
+/* Dentry cache for accelerated path resolution */
+#define DENTRY_CACHE_SIZE 64
+typedef struct {
+    vfs_node_t* parent;
+    uint32_t    name_hash;
+    vfs_node_t* child;
+    int         age;
+} dentry_entry_t;
+static dentry_entry_t dentry_cache[DENTRY_CACHE_SIZE];
+static int dentry_cache_age = 0;
+static int dentry_cache_count = 0;
+static spinlock_t vfs_global_lock;
+
+vfs_fd_t* vfs_get_fd_table(void) {
+    if (current_thread && current_thread->proc)
+        return current_thread->proc->fds;
+    return kernel_fd_table;
+}
 static vfs_node_t root_node;
 static vfs_fs_t* mounted_fs = NULL;
 
@@ -41,7 +65,11 @@ err_t vfs_init(void) {
     root_node.flags = 1;
 
     for (int i = 0; i < VFS_MAX_FDS; i++)
-        fd_table[i].used = 0;
+        kernel_fd_table[i].used = 0;
+
+    kmemset(dentry_cache, 0, sizeof(dentry_cache));
+    dentry_cache_age = 0;
+    dentry_cache_count = 0;
 
     kprintf("[VFS] Virtual filesystem initialized\n");
     return ERR_OK;
@@ -78,6 +106,49 @@ err_t vfs_mount(const char* path, vfs_fs_t* fs) {
 
 /* Symlink recursion limit */
 #define VFS_MAX_SYMLINKS 40
+
+static uint32_t dentry_hash(const char* name, int len) {
+    uint32_t h = 5381;
+    for (int i = 0; i < len; i++)
+        h = ((h << 5) + h) + (uint8_t)name[i];
+    return h;
+}
+
+static vfs_node_t* dentry_lookup(vfs_node_t* parent, const char* name, int len) {
+    uint32_t h = dentry_hash(name, len);
+    for (int i = 0; i < DENTRY_CACHE_SIZE; i++) {
+        dentry_entry_t* e = &dentry_cache[i];
+        if (e->child && e->parent == parent && e->name_hash == h) {
+            if (kstrncmp(e->child->name, name, (size_t)len) == 0 &&
+                e->child->name[len] == '\0') {
+                e->age = ++dentry_cache_age;
+                return e->child;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void dentry_add(vfs_node_t* parent, vfs_node_t* child) {
+    int slot = dentry_cache_count < DENTRY_CACHE_SIZE
+               ? dentry_cache_count++
+               : 0;
+    /* Find LRU slot */
+    if (slot == 0 && dentry_cache_count >= DENTRY_CACHE_SIZE) {
+        int oldest = 0;
+        for (int i = 1; i < DENTRY_CACHE_SIZE; i++) {
+            if (dentry_cache[i].age < dentry_cache[oldest].age)
+                oldest = i;
+        }
+        slot = oldest;
+    }
+    dentry_cache[slot].parent    = parent;
+    dentry_cache[slot].name_hash = dentry_hash(child->name, kstrlen(child->name));
+    dentry_cache[slot].child     = child;
+    dentry_cache[slot].age       = ++dentry_cache_age;
+}
+
+
 
 static vfs_node_t* vfs_find_flags(const char* path, int follow) {
     if (!path) return NULL;
@@ -124,28 +195,33 @@ static vfs_node_t* vfs_find_flags(const char* path, int follow) {
                 int len = (int)(p - start);
                 if (len == 0) break;
 
-                vfs_node_t* found = NULL;
-                uint32_t idx = 0;
-                while (1) {
-                    vfs_node_t* child = NULL;
-                    if (cur->fs && cur->fs->ops && cur->fs->ops->readdir) {
-                        int r = cur->fs->ops->readdir(cur, idx, &child);
-                        if (r != 0 || !child) break;
-                    } else {
-                        break;
+                vfs_node_t* found = dentry_lookup(cur, start, len);
+                if (!found) {
+                    uint32_t idx = 0;
+                    while (1) {
+                        vfs_node_t* child = NULL;
+                        if (cur->fs && cur->fs->ops && cur->fs->ops->readdir) {
+                            int r = cur->fs->ops->readdir(cur, idx, &child);
+                            if (r != 0 || !child) break;
+                        } else {
+                            break;
+                        }
+                        int match = 1;
+                        for (int i = 0; i < len; i++) {
+                            if (child->name[i] != start[i]) { match = 0; break; }
+                        }
+                        if (match && child->name[len] == '\0') {
+                            found = child;
+                            dentry_add(cur, child);
+                            break;
+                        }
+                        idx++;
                     }
-                    int match = 1;
-                    for (int i = 0; i < len; i++) {
-                        if (child->name[i] != start[i]) { match = 0; break; }
-                    }
-                    if (match && child->name[len] == '\0') {
-                        found = child;
-                        break;
-                    }
-                    idx++;
                 }
 
-                if (!found) return NULL;
+                if (!found) {
+                    return NULL;
+                }
 
                 /* Check if we should follow symlinks during path walk */
                 if (follow && (found->flags & VFS_FLAG_SYMLINK)) {
@@ -283,29 +359,39 @@ int vfs_open(const char* path, int flags) {
     if (flags & O_CREAT) {
         vfs_stat_t st;
         if (vfs_stat(path, &st) != 0) {
-            if (vfs_create(path, 0) < 0) return -1;
+            int cr = vfs_create(path, 0);
+            if (cr < 0) { kprintf("[VFS_OPEN] create '%s' failed\n", path); return -1; }
         }
     }
 
     vfs_node_t* node = vfs_find(path);
-    if (!node) return -1;
+    if (!node) { kprintf("[VFS_OPEN] vfs_find '%s' failed\n", path); return -1; }
 
     /* Check write permission when opening for write */
     if ((flags & (O_WRONLY | O_RDWR)) && node->fs && node->fs->ops && node->fs->ops->stat) {
         vfs_stat_t st;
         if (node->fs->ops->stat(node, &st) == 0) {
             /* mode=0 means unset (backward compat); reject if explicitly read-only */
-            if (st.mode != 0 && (st.mode & 0200) == 0)
+            if (st.mode != 0 && (st.mode & 0200) == 0) {
+                kprintf("[VFS_OPEN] '%s' not writable (mode=%o)\n", path, st.mode);
                 return -1;
+            }
             /* Advisory write lock check */
-            if (st.fs_flags & VFS_FS_FLAG_LOCKED)
+            if (st.fs_flags & VFS_FS_FLAG_LOCKED) {
+                kprintf("[VFS_OPEN] '%s' locked\n", path);
                 return -1;
+            }
         }
     }
 
     int fd = -1;
-    for (int i = 0; i < VFS_MAX_FDS; i++) {
-        if (!fd_table[i].used) { fd = i; break; }
+    {
+        cpu_flags_t _sf;
+        spinlock_acquire(&vfs_global_lock, &_sf);
+        for (int i = 0; i < VFS_MAX_FDS; i++) {
+            if (!vfs_get_fd_table()[i].used) { fd = i; break; }
+        }
+        spinlock_release(&vfs_global_lock, _sf);
     }
     if (fd < 0) return -1;
 
@@ -314,32 +400,60 @@ int vfs_open(const char* path, int flags) {
         node->fs->ops->truncate(node, 0);
 
     if (node->fs && node->fs->ops && node->fs->ops->open)
-        node->fs->ops->open(node);
+        if (node->fs->ops->open(node) != 0) {
+            kprintf("[VFS_OPEN] ops->open '%s' failed\n", path);
+            return -1;
+        }
 
-    fd_table[fd].node   = node;
-    fd_table[fd].offset = 0;
-    fd_table[fd].flags  = flags;
-    fd_table[fd].used   = 1;
+    {
+        cpu_flags_t _sf;
+        spinlock_acquire(&vfs_global_lock, &_sf);
+        vfs_get_fd_table()[fd].node   = node;
+        vfs_get_fd_table()[fd].offset = 0;
+        vfs_get_fd_table()[fd].flags  = flags;
+        vfs_get_fd_table()[fd].used   = 1;
+        __sync_fetch_and_add(&node->refcount, 1);
+        spinlock_release(&vfs_global_lock, _sf);
+    }
     return fd;
 }
 
 int vfs_close(int fd) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used)
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
         return -1;
+    }
 
-    vfs_node_t* node = fd_table[fd].node;
+    vfs_node_t* node = vfs_get_fd_table()[fd].node;
+    vfs_get_fd_table()[fd].used = 0;
+    spinlock_release(&vfs_global_lock, _sf);
+
+    /* Notify the file system that the fd is being closed (signals EOF etc.).
+     * This is called on EVERY close, not just the last reference, so pipe
+     * can set write_closed/read_closed even when a child process drops
+     * its inherited copy.  The node itself is only freed on last ref.
+     */
     if (node->fs && node->fs->ops && node->fs->ops->close)
         node->fs->ops->close(node);
 
-    fd_table[fd].used = 0;
+    if (__sync_fetch_and_sub(&node->refcount, 1) == 1) {
+        if (node->dynamic) {
+            if (node->destructor)
+                node->destructor(node->private_data);
+            kfree(node);
+        }
+    }
+
     return 0;
 }
 
 int64_t vfs_read(int fd, void* buf, uint64_t count) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used)
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
         return -1;
 
-    vfs_fd_t* f = &fd_table[fd];
+    vfs_fd_t* f = &vfs_get_fd_table()[fd];
     vfs_node_t* node = f->node;
 
     if (node->fs && node->fs->ops && node->fs->ops->read) {
@@ -351,10 +465,10 @@ int64_t vfs_read(int fd, void* buf, uint64_t count) {
 }
 
 int64_t vfs_write(int fd, const void* buf, uint64_t count) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used)
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
         return -1;
 
-    vfs_fd_t* f = &fd_table[fd];
+    vfs_fd_t* f = &vfs_get_fd_table()[fd];
     vfs_node_t* node = f->node;
 
     if (node->fs && node->fs->ops && node->fs->ops->write) {
@@ -371,10 +485,10 @@ int64_t vfs_write(int fd, const void* buf, uint64_t count) {
 }
 
 int64_t vfs_lseek(int fd, int64_t offset, int whence) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used)
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
         return -1;
 
-    vfs_fd_t* f = &fd_table[fd];
+    vfs_fd_t* f = &vfs_get_fd_table()[fd];
     vfs_node_t* node = f->node;
 
     switch (whence) {
@@ -430,13 +544,21 @@ int vfs_rmdir(const char* path) {
     vfs_node_t* node = vfs_find(path);
     if (!node) return -1;
     if (!(node->flags & 1)) return -1;
+
+    /* Check directory is empty */
+    if (node->fs && node->fs->ops && node->fs->ops->readdir) {
+        vfs_node_t* child = NULL;
+        if (node->fs->ops->readdir(node, 0, &child) == 0)
+            return -1;
+    }
+
     return vfs_unlink(path);
 }
 
 int vfs_ftruncate(int fd, uint64_t size) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !fd_table[fd].used)
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
         return -1;
-    vfs_node_t* node = fd_table[fd].node;
+    vfs_node_t* node = vfs_get_fd_table()[fd].node;
     if (node->fs && node->fs->ops && node->fs->ops->truncate)
         return node->fs->ops->truncate(node, size);
     return -1;
@@ -587,5 +709,14 @@ int vfs_readlink(const char* path, char* buf, uint64_t size) {
     if (!node) return -1;
     if (node->fs && node->fs->ops && node->fs->ops->readlink)
         return node->fs->ops->readlink(node, buf, size);
+    return -1;
+}
+
+int vfs_ioctl(int fd, uint64_t request, void* argp) {
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
+        return -1;
+    vfs_node_t* node = vfs_get_fd_table()[fd].node;
+    if (node->fs && node->fs->ops && node->fs->ops->ioctl)
+        return node->fs->ops->ioctl(node, request, argp);
     return -1;
 }

@@ -5,7 +5,7 @@
 
 #define VFS_MAX_NAME   64
 #define VFS_MAX_FILES  64
-#define VFS_MAX_FDS    32
+#define VFS_MAX_FDS    128
 #define VFS_SEEK_SET   0
 #define VFS_SEEK_CUR   1
 #define VFS_SEEK_END   2
@@ -17,6 +17,7 @@
 #define O_CREAT   0100
 #define O_TRUNC   01000
 #define O_APPEND  02000
+#define O_NONBLOCK 04000
 
 /* FS flags returned by stat */
 #define VFS_FS_FLAG_LOCKED 1
@@ -37,6 +38,9 @@ typedef struct vfs_node {
     vfs_node_t* next;
     vfs_fs_t*   fs;
     void*       private_data;
+    int         refcount;
+    int         dynamic;    /* non-zero → vfs_close kfrees node when refcount hits 0 */
+    void        (*destructor)(void* private_data); /* called before kfree when dynamic */
 } vfs_node_t;
 
 typedef struct vfs_stat {
@@ -67,6 +71,7 @@ typedef struct vfs_file_ops {
     int     (*unlock)(vfs_node_t* node);
     int     (*symlink)(vfs_node_t* dir, const char* name, const char* target);
     int     (*readlink)(vfs_node_t* node, char* buf, uint64_t size);
+    int     (*ioctl)(vfs_node_t* node, uint64_t request, void* argp);
 } vfs_file_ops_t;
 
 typedef struct vfs_fs {
@@ -105,6 +110,7 @@ int  vfs_lock(const char* path);
 int  vfs_unlock(const char* path);
 int  vfs_symlink(const char* target, const char* linkpath);
 int  vfs_readlink(const char* path, char* buf, uint64_t size);
-extern vfs_fd_t fd_table[VFS_MAX_FDS];
+int  vfs_ioctl(int fd, uint64_t request, void* argp);
+vfs_fd_t* vfs_get_fd_table(void);
 
 #endif

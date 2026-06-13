@@ -4,12 +4,13 @@
 #include "sched.h"
 #include "signal.h"
 #include "sync.h"
+#include "vfs.h"
 
 struct int_frame;
 
 #define MAX_PROCESSES 256
 #define PROCESS_NAME_MAX 64
-#define MAX_FDS 32
+#define MAX_FDS 128
 
 typedef uint64_t pid_t;
 
@@ -51,14 +52,15 @@ typedef struct process_t {
     // Working directory
     char cwd[256];
 
-    // File descriptors (placeholder)
-    void* fds[MAX_FDS];
+    // File descriptors (per-process fd table)
+    vfs_fd_t fds[MAX_FDS];
 } process_t;
 
 err_t process_init(void);
 process_t* process_create(const char* name, pid_t ppid);
 err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len);
 err_t process_exit(process_t* proc, int exit_code);
+void process_reap(process_t* proc);
 process_t* process_find(pid_t pid);
 pid_t process_get_current_pid(void);
 void signal_send(pid_t pid, int sig);

@@ -43,6 +43,9 @@ thread_trampoline:
 .global user_thread_entry
 .type user_thread_entry, @function
 user_thread_entry:
+    /* Save user RIP in r15 for debugging */
+    movq 8(%rsp), %r15
+
     popq %rax
     popq %rbx
     popq %rcx
@@ -60,35 +63,6 @@ user_thread_entry:
     popq %r15
 
     addq $16, %rsp
-
-    movw $0x3FD, %dx
-1:  inb %dx, %al
-    testb $0x20, %al
-    jz 1b
-    movw $0x3F8, %dx
-    movb $'[', %al
-    outb %al, %dx
-    movw $0x3FD, %dx
-2:  inb %dx, %al
-    testb $0x20, %al
-    jz 2b
-    movw $0x3F8, %dx
-    movb $'U', %al
-    outb %al, %dx
-    movw $0x3FD, %dx
-3:  inb %dx, %al
-    testb $0x20, %al
-    jz 3b
-    movw $0x3F8, %dx
-    movb $']', %al
-    outb %al, %dx
-    movw $0x3FD, %dx
-4:  inb %dx, %al
-    testb $0x20, %al
-    jz 4b
-    movw $0x3F8, %dx
-    movb $'\n', %al
-    outb %al, %dx
 
     iretq
 

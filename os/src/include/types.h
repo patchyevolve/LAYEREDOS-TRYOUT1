@@ -39,6 +39,7 @@ typedef enum { ERR_OK = 0,
     ERR_DEADLOCK  = -18,
     ERR_CAP       = -19,
     ERR_BADFD     = -20,
+    ERR_NOTCONN   = -21,
 } err_t;
 
 #define KERNEL_PHYS_BASE   0x100000

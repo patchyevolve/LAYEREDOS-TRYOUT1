@@ -5,10 +5,11 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 ## Core boot and hardware
 - ✅ Stable boot path and higher-half mapping
 - ✅ GDT, IDT, TSS, and interrupt stubs
-- ✅ PIC/APIC interrupt routing (xAPIC enabled, LINT0=ExtINT for PIC passthrough, APIC timer active)
+- 🟡 PIC/APIC interrupt routing (xAPIC MMIO mapping skipped on QEMU TCG via `hal_is_qemu_tcg()` detection — falls back to legacy PIC. APIC timer active on KVM/bare metal; on TCG, PIT used for scheduling tick)
 - ✅ UART/serial console
-- ✅ PIT and HPET timer (HPET 100 MHz detected, nanosecond precision timekeeping, APIC timer for scheduling)
+- 🟡 PIT and HPET timer (HPET MMIO mapping skipped on QEMU TCG via `hal_is_qemu_tcg()` detection — falls back to PIT for scheduling tick. HPET ns-resolution timekeeping available on KVM/bare metal)
 - ✅ Basic CPU feature detection (SMAP, MWAIT via CPUID)
+- ✅ QEMU TCG boot stability (HPET/APIC MMIO mapping skipped as workaround for TCG softmmu cache issue; kernel boots to shell cleanly)
 - ✅ Panic path with useful debug output (stack trace, register dump)
 - ✅ Watchdog / health checking
 
@@ -46,20 +47,20 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Kernel worker threads (kworker processes system work queue at THREAD_DEF_PRIO)
 
 ## Syscall and userspace
-- ✅ Syscall gateway (int 0x80, 34 syscalls: SYS_MMAP/SYS_MUNMAP/SYS_MPROTECT added)
+- ✅ Syscall gateway (int 0x80, 38 syscalls 0–37: IOCTL=34, GETPGID=35, SETPGID=36, PTY_PAIR=37 added)
 - ✅ Syscall argument validation (user-range + mapped + SMAP checks)
 - ❌ Userspace ABI stability (no formal ABI)
-- 🟡 Userspace C library (two tiny embedded programs, getcwd/chdir/dup2 wrappers needed)
+- ✅ Userspace C library (full libc: stdio/printf, stdlib/malloc, string, unistd syscall wrappers, signal, errno, crt0)
 - ✅ ELF loading (ELF64, PT_LOAD segments, PT_INTERP, NX support)
 - ✅ Dynamic linker/loader (ld.so: ET_DYN PIE loaded by kernel via PT_INTERP, ELF parsing, symbol resolution, RELA/PLT relocations, shared library loading via mmap, aux-vector setup, init/fini arrays)
 - ✅ Standard file descriptor table (32 FD slots, pre-allocated 0/1/2)
-- 🟡 Standard input/output/error wiring (fd 0/1/2 reserved, sys_read/sys_write for UART)
+- ✅ Standard input/output/error wiring (fd 0/1/2 wired to TTY via VFS; dup2 supported)
 - ✅ Minimal init process (pid 1, runs shell)
 - ✅ Basic service launcher (/etc/rc startup script sourced by shell at boot)
 
 ## Storage and filesystem
 - ✅ PCI bus enumeration (config space, bus scanning, bridge recursion)
-- ✅ ATA/AHCI/NVMe driver (ATA PIO, identify, read/write sectors, LBA48)
+- ✅ ATA/AHCI/NVMe driver (ATA PIO IRQ-driven + AHCI DMA + NVMe admin/I/O queues; all three registered as block devices)
 - ✅ IRQ-based block I/O — ATA PIO uses `sched_block`/`sched_wake` on per-drive wait queues; IRQ handlers for IRQs 14/15; timeout watchdog
 - ✅ Block device abstraction layer (register, find, read, write)
 - ✅ Sector cache — LRU write-back cache (64 entries, dirty tracking, eviction flushes to device)
@@ -79,6 +80,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ chmod (shell built-in, octal mode, e.g. 0644)
 - ✅ touch (shell built-in, multi-arg support)
 - ✅ Multi-mount VFS (mount table, prefix matching, per-FS path dispatch)
+- ✅ Cross-block dirent handling (SFS_BLOCK_SIZE=512 × sizeof(sfs_dirent_t)=68 → entries span block boundaries; readdir/lookup/remove use byte-offset block math with 2×SFS_BLOCK_SIZE buffer for reassembly)
 - ✅ tmpfs (RAM-backed filesystem mounted at /tmp, all VFS ops)
 - ✅ devfs (device filesystem mounted at /dev: null, zero, random, full)
 - ✅ Journaling/WAL — crash recovery via write-ahead log (DATA+COMMIT entries, recover replays committed transactions)
@@ -86,7 +88,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ File locking (advisory, lock/unlock shell commands, SFS inode flag)
 
 ## Terminal and shell
-- 🟡 Real TTY/terminal layer (kernel/tty.c + kernel/tty.h: line discipline, canonical/raw mode, echo, signal generation. Ctrl-C SIGINT, Ctrl-Z SIGTSTP, Ctrl-\ SIGQUIT, Ctrl-D EOF. ISR feeds TTY raw buffer; ISR-level signal detection delivers signals to fg pgid immediately via work queue. Process groups with `pgid` field. Shell `cmd_run`/`cmd_fg` set `fg_pgid`. /dev/ttyS0 in devfs. No termios ioctl, no PTY, no SIGTTIN/SIGTTOU.)
+- ✅ Real TTY/terminal layer (kernel/tty.c + kernel/tty.h: line discipline, canonical/raw mode, echo, signal generation. Ctrl-C SIGINT, Ctrl-Z SIGTSTP, Ctrl-\ SIGQUIT, Ctrl-D EOF, Ctrl-U/K/W kill. ISR feeds TTY raw buffer; ISR-level signal detection delivers signals to fg pgid via work queue. Termios ioctl, PTY subsystem, SIGTTIN/SIGTTOU job control all implemented.)
 - ✅ Line editing (readline-style: arrows, home/end, backspace/del, Ctrl-U/K/W/A/E/C)
 - ✅ Command history (64-entry circular, up/down arrows)
 - ✅ Tab completion (commands + aliases + VFS paths)
@@ -102,21 +104,28 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Basic text tools (head, tail, wc, grep)
 
 ## Networking
-- ❌ Network stack
-- ❌ NIC driver support
-- ❌ Ethernet frame handling
-- ❌ ARP
-- ❌ IPv4
-- ❌ IPv6
-- ❌ ICMP
-- ❌ UDP
-- ❌ TCP
-- ❌ DNS resolver
-- ❌ Sockets API
+- ✅ NIC driver support (E1000: PCI 0x8086:0x100E detection, BAR0 MMIO, descriptor rings, send/poll, IRQ 11)
+- ✅ Ethernet frame handling (eth.c/eth.h: frame encode/decode, EtherType dispatch, handler registration for ARP/IPv4/IPv6, wired into E1000 IRQ handler via eth_rx_poll)
+- ✅ ARP (cache, packet construction, resolution, IPv4→MAC)
+- ✅ NDP (neighbor solicitation/advertisement, cache, link-local address resolution)
+- ✅ IPv4 (packet routing, send/recv, address assignment, broadcast handling)
+- ✅ IPv6 (packet routing, send/recv, link-local EUI-64, solicited-node multicast)
+- ✅ ICMPv4 (echo reply/ping)
+- ✅ ICMPv6 (echo reply, NS/NA, RS/RA)
+- ✅ IGMPv2 (IPv4 multicast group management, membership reports/queries)
+- ✅ MLDv1 (IPv6 multicast listener discovery, group reports/queries)
+- ✅ E1000 MTA (multicast table array programming for IPv4/IPv6 multicast groups)
+- ✅ UDP (sendto/recvfrom, checksum validation, dual-stack, endpoint datagram queue)
+- ✅ TCP (full state machine: CLOSED/LISTEN/SYN_SENT/SYN_RECEIVED/ESTABLISHED/FIN_WAIT1/FIN_WAIT2/CLOSE_WAIT/CLOSING/LAST_ACK/TIME_WAIT, retransmission, RTO, RST generation for both IPv4/IPv6, ACK tracking, snd_una/snd_wnd, TIME_WAIT 2MSL timer, TCP_NODELAY/Nagle, SO_RCVTIMEO/SO_SNDTIMEO, poll, IPv4-mapped IPv6)
+- ✅ DNS resolver (kernel-level dns_resolve, A/AAAA queries, response parsing, configurable resolver)
+- ✅ DHCP client (kernel-level DORA, option parsing, lease management)
+- ✅ SLAAC (RS/RA exchange, prefix parsing, EUI-64 global address formation)
+- ✅ NTP client (kernel-level NTPv4, request/response, wall clock, clock_gettime syscall)
+- ✅ Sockets API (socket/bind/connect/listen/accept/send/recv/sendto/recvfrom/close, fd dispatch, AF_INET/AF_INET6, IPV6_V6ONLY, IP_ADD/DROP_MEMBERSHIP, setsockopt/getsockopt, error propagation via kernel_err_to_posix)
+- ✅ poll() syscall (POLLIN/POLLOUT/POLLERR, implemented for TCP and UDP sockets)
+- ✅ Socket-level multicast (IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP, IPV6_JOIN_GROUP/IPV6_LEAVE_GROUP)
 - ❌ TLS support
 - ❌ Network namespaces or isolation
-- ❌ DHCP client
-- ❌ NTP client
 
 ## Security and isolation
 - ❌ Capability system
@@ -149,7 +158,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Atomic file update semantics (rename overwrites target atomically)
 - ✅ Crash recovery (journaling/WAL + fsck with repair)
 - ✅ Snapshot/rollback (point-in-time full-device snapshots with rollback via snap take/rollback commands)
-- ❌ Backup/restore support
+- ✅ Backup/restore support (full recursive archive format, save/restore shell commands via backup.c)
 
 ## GUI-capable foundation
 - ❌ Framebuffer driver

@@ -10,6 +10,8 @@ static int pipe_open(vfs_node_t* node) {
     return 0;
 }
 
+/* Called on every vfs_close to signal read/write side closure.
+ * pipe_destructor handles freeing pipe_t when both nodes are freed. */
 static int pipe_close(vfs_node_t* node) {
     if (!node || !node->private_data) return 0;
     pipe_t* p = (pipe_t*)node->private_data;
@@ -22,12 +24,20 @@ static int pipe_close(vfs_node_t* node) {
     int both_closed = p->read_closed && p->write_closed;
     spinlock_release(&p->lock, _sflags);
     if (both_closed) {
-        wait_queue_t r = p->readers, w = p->writers;
-        kfree(p);
-        if (r.waiters) sched_wake(&r);
-        if (w.waiters) sched_wake(&w);
+        sched_wake(&p->readers);
+        sched_wake(&p->writers);
     }
     return 0;
+}
+
+/* Called when the last reference to a pipe vfs_node is freed.
+ * Decrements pipe_t's refcount; frees pipe_t when both nodes are gone. */
+static void pipe_destructor(void* private_data) {
+    if (!private_data) return;
+    pipe_t* p = (pipe_t*)private_data;
+    if (__sync_fetch_and_sub(&p->refcount, 1) == 1) {
+        kfree(p);
+    }
 }
 
 static int64_t pipe_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offset) {
@@ -49,6 +59,7 @@ static int64_t pipe_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t o
         } else {
             if (p->write_closed) { spinlock_release(&p->lock, _sflags); break; }
             spinlock_release(&p->lock, _sflags);
+            if (done > 0) break; /* Don't block — we already have data to return */
             sched_block(&p->readers);
         }
     }
@@ -98,6 +109,7 @@ int pipe_create(int fds[2]) {
     if (!p) return -1;
     kmemset(p, 0, sizeof(pipe_t));
     spinlock_init(&p->lock, "pipe_lock");
+    p->refcount = 2; /* one for rnode, one for wnode */
 
     vfs_node_t* rnode = (vfs_node_t*)kmalloc(sizeof(vfs_node_t));
     vfs_node_t* wnode = (vfs_node_t*)kmalloc(sizeof(vfs_node_t));
@@ -117,29 +129,36 @@ int pipe_create(int fds[2]) {
     wnode->private_data = p;
     rnode->flags = 1;
     wnode->flags = 0;
+    rnode->dynamic = 1;
+    wnode->dynamic = 1;
+    rnode->destructor = pipe_destructor;
+    wnode->destructor = pipe_destructor;
 
+    vfs_fd_t* ft = vfs_get_fd_table();
     for (int i = 0; i < VFS_MAX_FDS; i++) {
-        extern vfs_fd_t fd_table[VFS_MAX_FDS];
-        if (!fd_table[i].used) {
-            fd_table[i].node = rnode;
-            fd_table[i].offset = 0;
-            fd_table[i].flags = 0;
-            fd_table[i].used = 1;
+        if (!ft[i].used) {
+            ft[i].node = rnode;
+            ft[i].offset = 0;
+            ft[i].flags = 0;
+            ft[i].used = 1;
+            __sync_fetch_and_add(&rnode->refcount, 1);
             fds[0] = i;
             break;
         }
     }
     for (int i = 0; i < VFS_MAX_FDS; i++) {
-        extern vfs_fd_t fd_table[VFS_MAX_FDS];
-        if (!fd_table[i].used) {
-            fd_table[i].node = wnode;
-            fd_table[i].offset = 0;
-            fd_table[i].flags = 0;
-            fd_table[i].used = 1;
+        if (!ft[i].used) {
+            ft[i].node = wnode;
+            ft[i].offset = 0;
+            ft[i].flags = 0;
+            ft[i].used = 1;
+            __sync_fetch_and_add(&wnode->refcount, 1);
             fds[1] = i;
             return 0;
         }
     }
+    /* Error: no slot for write fd — clean up the read fd that was already assigned */
+    ft[fds[0]].used = 0;
     pipe_close(rnode);
     pipe_close(wnode);
     kfree(rnode);

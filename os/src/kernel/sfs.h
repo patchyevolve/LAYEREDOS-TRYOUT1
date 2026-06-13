@@ -9,7 +9,7 @@
 #define SFS_MAGIC        0x53465301
 #define SFS_BLOCK_SIZE   512
 #define SFS_MAX_INODES   1024
-#define SFS_NAME_MAX     28
+#define SFS_NAME_MAX     64
 #define SFS_DIRECT_BLOCKS 12
 
 #define SFS_TYPE_FREE    0
@@ -23,8 +23,10 @@
 #define SFS_DIRENTS_PER_BLOCK (SFS_BLOCK_SIZE / sizeof(sfs_dirent_t))
 #define SFS_INDIRECT_PTRS     (SFS_BLOCK_SIZE / 4)
 #define SFS_DINDIRECT_PTRS    (SFS_INDIRECT_PTRS * SFS_INDIRECT_PTRS)
+#define SFS_TINDIRECT_PTRS    (SFS_INDIRECT_PTRS * SFS_INDIRECT_PTRS * SFS_INDIRECT_PTRS)
 #define SFS_INDIRECT_START    SFS_DIRECT_BLOCKS
 #define SFS_DINDIRECT_START   (SFS_INDIRECT_START + SFS_INDIRECT_PTRS)
+#define SFS_TINDIRECT_START   (SFS_DINDIRECT_START + SFS_DINDIRECT_PTRS)
 
 typedef struct sfs_superblock {
     uint32_t magic;
@@ -46,6 +48,7 @@ typedef struct sfs_inode {
     uint32_t direct[SFS_DIRECT_BLOCKS];
     uint32_t indirect;
     uint32_t double_indirect;
+    uint32_t triple_indirect;
     uint32_t atime;
     uint32_t mtime;
     uint32_t ctime;
@@ -55,7 +58,7 @@ typedef struct sfs_inode {
 
 typedef struct sfs_dirent {
     uint32_t inode;
-    char     name[28];
+    char     name[64];
 } __attribute__((packed)) sfs_dirent_t;
 
 typedef struct sfs_fs {
@@ -64,6 +67,7 @@ typedef struct sfs_fs {
     vfs_fs_t      vfs_fs;
     vfs_node_t    root_node;
     mutex_t       bmap_lock;
+    spinlock_t    fs_lock;
     uint32_t      journal_start;
     int           journal_seq;
     int           journal_active;

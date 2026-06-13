@@ -98,11 +98,28 @@ process_t* process_create(const char* name, pid_t ppid) {
     }
     hal_restore_irq(irq_flags);
 
+    /* Stamp PML4 with pid so process_exit can detect stale reuse */
+    new_pml4[255] = (uint64_t)proc->pid;
+
     proc->cr3 = pml4_phys;
     proc->mmap_brk = 0x40000000;
 
     list_add_tail(&process_list, &proc->process_node);
     spinlock_release(&process_lock, _sflags);
+
+    /* Inherit fd table from parent process (lock released, use process_find) */
+    if (ppid > 0) {
+        process_t* parent = process_find(ppid);
+        if (parent) {
+            kmemcpy(proc->fds, parent->fds, sizeof(proc->fds));
+            /* Bump refcount on every inherited fd so the shared vfs_node_t
+             * does not get freed when the parent (or child) closes its copy. */
+            for (int i = 0; i < MAX_FDS; i++) {
+                if (proc->fds[i].used && proc->fds[i].node)
+                    __sync_fetch_and_add(&proc->fds[i].node->refcount, 1);
+            }
+        }
+    }
 
     return proc;
 }
@@ -175,7 +192,28 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
             interp_base = interp_load_at; /* for EXEC the base is the linked address itself */
     }
 
-    /* Step 4: Set up user stack */
+    /* Step 4: Set heap base (brk) to just after the ELF's last mapped page */
+    {
+        uint64_t max_addr = 0x40000000; /* safe fallback */
+        const elf64_hdr_t* eh = (const elf64_hdr_t*)elf_data;
+        if (elf_len >= sizeof(elf64_hdr_t) && eh->magic == ELF_MAGIC) {
+            uint64_t base_offset = 0;
+            if (eh->type == ELF_DYN)
+                base_offset = 0x40000000; /* conservative: DYN loads at 0x40000000..0x60000000 */
+            const elf64_phdr_t* ph = (const elf64_phdr_t*)((uint64_t)elf_data + eh->phoff);
+            for (uint16_t i = 0; i < eh->phnum; i++) {
+                if (ph[i].type == PT_LOAD) {
+                    uint64_t end = ph[i].vaddr + base_offset + ph[i].memsz;
+                    if (end > max_addr) max_addr = end;
+                }
+            }
+        }
+        /* Page-align and leave a 64KB gap */
+        proc->mmap_brk = (max_addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
+        if (proc->mmap_brk <= max_addr) proc->mmap_brk = max_addr + 0x10000;
+    }
+
+    /* Step 5: Set up user stack */
     uint64_t stack_page = pmm_alloc_page();
     if (!stack_page) return ERR_NOMEM;
     kmemset((void*)PHYS_TO_VIRT(stack_page), 0, PAGE_SIZE);
@@ -325,9 +363,6 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
 
     sched_add_thread(tcb);
 
-    kprintf("[PROCESS] Exec'd %s (pid %d, entry=%llx, stack=%llx)%s\n",
-            proc->name, proc->pid, proc->entry_point, user_stack,
-            has_interp ? " [interp]" : "");
     return ERR_OK;
 }
 
@@ -355,10 +390,20 @@ err_t process_exit(process_t* proc, int exit_code) {
     }
     spinlock_release(&process_lock, _sflags);
 
+    /* Close all open file descriptors via vfs_close (uses refcounting) */
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (proc->fds[i].used) {
+            vfs_close(i);
+        }
+    }
+
     /* Wake any waitpid waiters */
     sched_wake(&proc->exit_waiters);
 
-    /* Free all user pages and page tables — only if no other threads */
+    /* Free resources: user pages and slot.  If we are the last thread
+     * in the process (thread_count <= 0) then free everything.
+     * NOTE: the slot (proc->pid) stays valid for waitpid to collect
+     * the exit status — it is cleared by process_reap() instead. */
     if (proc->cr3 && proc->thread_count <= 0) {
         /* Save kernel CR3 on first call */
         if (!kernel_cr3) {
@@ -373,6 +418,25 @@ err_t process_exit(process_t* proc, int exit_code) {
         if (saved_cr3 != kernel_cr3)
             asm volatile("mov %0, %%cr3" : : "r"(kernel_cr3) : "memory");
 
+        /* Validate PML4 belongs to this process before freeing */
+        {
+            page_entry_t* pml4v = (page_entry_t*)PHYS_TO_VIRT(proc->cr3);
+            uint64_t stamp = pml4v[255];
+            if (stamp != (uint64_t)proc->pid) {
+                kprintf("[EXIT] WARN pid %d (%s) PML4=0x%lx stamp=%lu != pid=%d — "
+                        "page reused, skipping free\n",
+                        proc->pid, proc->name, proc->cr3, stamp, proc->pid);
+                proc->cr3 = 0;
+                if (saved_cr3 != kernel_cr3)
+                    asm volatile("mov %0, %%cr3" : : "r"(kernel_cr3) : "memory");
+                return ERR_OK;
+            }
+            /* Clear PID stamp so vmm_free_user_pages doesn't misinterpret
+             * pml4[255] as a present page-table entry and try to read
+             * physical page 0 (BIOS IVT) as a PDPT */
+            pml4v[255] = 0;
+        }
+
         vmm_free_user_pages(proc->cr3);
         pmm_free_page(proc->cr3);
         proc->cr3 = 0;
@@ -381,15 +445,20 @@ err_t process_exit(process_t* proc, int exit_code) {
          * the process's now-freed PML4 (e.g., clone threads sharing CR3) */
     }
 
-    /* Remove from process list and recycle slot */
-    spinlock_acquire(&process_lock, &_sflags);
+    return ERR_OK;
+}
+
+/* Reap a zombie process: free the pid slot.  Called from sys_waitpid
+ * after the exit status has been collected.  The child's pages have
+ * already been freed by process_exit, so this just clears the pid. */
+void process_reap(process_t* proc) {
+    if (!proc) return;
+    cpu_flags_t _sflags; spinlock_acquire(&process_lock, &_sflags);
     proc->process_node.prev->next = proc->process_node.next;
     proc->process_node.next->prev = proc->process_node.prev;
     list_init(&proc->process_node);
     proc->pid = 0;  /* frees the slot in process_table */
     spinlock_release(&process_lock, _sflags);
-
-    return ERR_OK;
 }
 
 process_t* process_find(pid_t pid) {

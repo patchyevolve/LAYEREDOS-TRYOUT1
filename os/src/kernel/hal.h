@@ -41,6 +41,7 @@ void hal_set_kernel_stack(uint64_t rsp0);
 void hal_enable_irqs(void);
 uint64_t hal_get_kernel_stack(void);
 int  hal_smap_enabled(void);
+int  hal_is_qemu_tcg(void);
 
 extern uint64_t isr_vectors[256];
 
@@ -113,6 +114,14 @@ static inline uint8_t inb(uint16_t port) {
 
 static inline void outb(uint16_t port, uint8_t v) {
     asm volatile("outb %0, %1" : : "a"(v), "dN"(port));
+}
+
+static inline void hal_udelay(uint32_t us) {
+    uint64_t start = hal_timer_get_ns();
+    uint64_t target = start + (uint64_t)us * 1000;
+    while (hal_timer_get_ns() < target) {
+        for (volatile int i = 0; i < 100; i++);
+    }
 }
 
 static inline uint32_t inl(uint16_t port) {

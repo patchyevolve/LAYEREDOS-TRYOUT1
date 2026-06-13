@@ -5,7 +5,8 @@
 #include "block.h"
 
 #define JOURNAL_MAGIC     0x4A524E4C
-#define JOURNAL_BLOCKS    64
+#define JOURNAL_BLOCKS    256
+#define JOURNAL_CHECKSUM_SEED 0xDEADBEEF
 
 #define JENT_DESC  1
 #define JENT_DATA  2

@@ -10,12 +10,6 @@ uint32_t apic_id = 0;
 
 static volatile uint32_t* apic_mmio = NULL;
 
-/* Map a physical address into kernel virtual space at a given VA */
-static err_t mmio_map_page(uint64_t phys, uint64_t virt) {
-    return vmm_map_page(vmm_get_kernel_pml4(), virt, phys,
-                        PAGE_PRESENT | PAGE_WRITE | PAGE_NX);
-}
-
 /* Read MSR */
 static uint64_t read_msr(uint32_t msr) {
     uint32_t lo, hi;
@@ -63,11 +57,15 @@ err_t apic_init(void) {
 
     kprintf("[APIC] Base MSR=%llx, phys=%llx\n", apic_base_msr, apic_base_phys);
 
-    /* Map APIC MMIO region (one page is sufficient)
-     * Use virtual address at 0xFFFFFFFFFFFFE000 (one page below HPET at 0xFFFFFFFFFFFFF000) */
+    if (hal_is_qemu_tcg()) {
+        kprintf("[APIC] QEMU TCG detected — skipping MMIO mapping (softmmu cache workaround), using legacy PIC\n");
+        return ERR_NOENT;
+    }
+
     #define APIC_VADDR 0xFFFFFFFFFFFFE000ULL
 
-    err_t err = mmio_map_page(apic_base_phys, APIC_VADDR);
+    err_t err = vmm_map_page(vmm_get_kernel_pml4(), APIC_VADDR, apic_base_phys,
+                             PAGE_PRESENT | PAGE_WRITE | PAGE_NX);
     if (err != ERR_OK) {
         kprintf("[APIC] Failed to map MMIO at %llx\n", apic_base_phys);
         return err;

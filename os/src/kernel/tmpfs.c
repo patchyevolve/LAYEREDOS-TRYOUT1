@@ -64,10 +64,17 @@ static int tmpfs_vfs_close(vfs_node_t* node) {
     return 0;
 }
 
+static tmpfs_fs_t* tmpfs_from_node(vfs_node_t* node) {
+    return (tmpfs_fs_t*)node->fs;
+}
+
+
 static int64_t tmpfs_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offset) {
     tmpfs_file_t* f = (tmpfs_file_t*)node->private_data;
     if (!f || f->type != TMPFS_TYPE_FILE) return -1;
-    if (offset >= f->size) return 0;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(node)->lock, &_sflags);
+    if (offset >= f->size) { spinlock_release(&tmpfs_from_node(node)->lock, _sflags); return 0; }
     if (offset + count > f->size)
         count = f->size - offset;
     uint64_t done = 0;
@@ -81,18 +88,21 @@ static int64_t tmpfs_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint6
         kmemcpy((uint8_t*)buf + done, src, chunk);
         done += chunk;
     }
+    spinlock_release(&tmpfs_from_node(node)->lock, _sflags);
     return (int64_t)done;
 }
 
 static int64_t tmpfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, uint64_t offset) {
     tmpfs_file_t* f = (tmpfs_file_t*)node->private_data;
     if (!f || f->type != TMPFS_TYPE_FILE) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(node)->lock, &_sflags);
 
     uint64_t end = offset + count;
     uint32_t need_blocks = (uint32_t)((end + PAGE_SIZE - 1) / PAGE_SIZE);
     if (need_blocks > f->nblocks) {
         uintptr_t* new_blocks = kmalloc((size_t)need_blocks * sizeof(uintptr_t));
-        if (!new_blocks) return -1;
+        if (!new_blocks) { spinlock_release(&tmpfs_from_node(node)->lock, _sflags); return -1; }
         kmemcpy(new_blocks, f->blocks, (size_t)f->nblocks * sizeof(uintptr_t));
         kmemset(new_blocks + f->nblocks, 0, (size_t)(need_blocks - f->nblocks) * sizeof(uintptr_t));
         if (f->blocks) kfree(f->blocks);
@@ -120,20 +130,23 @@ static int64_t tmpfs_vfs_write(vfs_node_t* node, const void* buf, uint64_t count
     if (end > f->size)
         f->size = (uint32_t)end;
     node->size = f->size;
+    spinlock_release(&tmpfs_from_node(node)->lock, _sflags);
     return (int64_t)done;
 }
 
 static int tmpfs_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out) {
     tmpfs_file_t* f = (tmpfs_file_t*)node->private_data;
     if (!f || f->type != TMPFS_TYPE_DIR) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(node)->lock, &_sflags);
 
     tmpfs_dirent_t* d = f->entries;
     uint32_t i = 0;
     while (d && i < index) { d = d->next; i++; }
-    if (!d) return -1;
+    if (!d) { spinlock_release(&tmpfs_from_node(node)->lock, _sflags); return -1; }
 
     vfs_node_t* child = kmalloc(sizeof(vfs_node_t));
-    if (!child) return -1;
+    if (!child) { spinlock_release(&tmpfs_from_node(node)->lock, _sflags); return -1; }
     kmemset(child, 0, sizeof(vfs_node_t));
     kstrncpy(child->name, d->name, VFS_MAX_NAME - 1);
     child->size = d->file->size;
@@ -141,31 +154,38 @@ static int tmpfs_vfs_readdir(vfs_node_t* node, uint32_t index, vfs_node_t** out)
     child->fs = node->fs;
     child->private_data = d->file;
     *out = child;
+    spinlock_release(&tmpfs_from_node(node)->lock, _sflags);
     return 0;
 }
 
 static int tmpfs_vfs_create(vfs_node_t* dir, const char* name, int is_dir) {
     tmpfs_file_t* parent = (tmpfs_file_t*)dir->private_data;
     if (!parent) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(dir)->lock, &_sflags);
 
-    if (tmpfs_lookup(parent, name)) return -1;
+    if (tmpfs_lookup(parent, name)) { spinlock_release(&tmpfs_from_node(dir)->lock, _sflags); return -1; }
 
     tmpfs_file_t* f = tmpfs_create_file(is_dir ? TMPFS_TYPE_DIR : TMPFS_TYPE_FILE);
-    if (!f) return -1;
+    if (!f) { spinlock_release(&tmpfs_from_node(dir)->lock, _sflags); return -1; }
 
     if (tmpfs_add_dirent(parent, name, f) < 0) {
         kfree(f);
+        spinlock_release(&tmpfs_from_node(dir)->lock, _sflags);
         return -1;
     }
+    spinlock_release(&tmpfs_from_node(dir)->lock, _sflags);
     return 0;
 }
 
 static int tmpfs_vfs_unlink(vfs_node_t* dir, const char* name) {
     tmpfs_file_t* parent = (tmpfs_file_t*)dir->private_data;
     if (!parent) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(dir)->lock, &_sflags);
 
     tmpfs_dirent_t* d = tmpfs_lookup(parent, name);
-    if (!d) return -1;
+    if (!d) { spinlock_release(&tmpfs_from_node(dir)->lock, _sflags); return -1; }
 
     tmpfs_file_t* f = d->file;
     if (f->nlink > 1) {
@@ -177,12 +197,15 @@ static int tmpfs_vfs_unlink(vfs_node_t* dir, const char* name) {
         kfree(f);
     }
     tmpfs_remove_dirent(parent, name);
+    spinlock_release(&tmpfs_from_node(dir)->lock, _sflags);
     return 0;
 }
 
 static int tmpfs_vfs_stat(vfs_node_t* node, vfs_stat_t* st) {
     tmpfs_file_t* f = (tmpfs_file_t*)node->private_data;
     if (!f) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(node)->lock, &_sflags);
     st->size  = f->size;
     st->inode = (uint64_t)(uintptr_t)f;
     st->mode  = (f->type == TMPFS_TYPE_DIR) ? (0644 | (1 << 16)) : 0644;
@@ -191,12 +214,15 @@ static int tmpfs_vfs_stat(vfs_node_t* node, vfs_stat_t* st) {
     st->mtime = 0;
     st->ctime = 0;
     st->fs_flags = 0;
+    spinlock_release(&tmpfs_from_node(node)->lock, _sflags);
     return 0;
 }
 
 static int tmpfs_vfs_truncate(vfs_node_t* node, uint64_t size) {
     tmpfs_file_t* f = (tmpfs_file_t*)node->private_data;
     if (!f || f->type != TMPFS_TYPE_FILE) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(node)->lock, &_sflags);
 
     uint32_t new_blocks = (uint32_t)((size + PAGE_SIZE - 1) / PAGE_SIZE);
     while (f->nblocks > new_blocks) {
@@ -205,6 +231,7 @@ static int tmpfs_vfs_truncate(vfs_node_t* node, uint64_t size) {
     }
     f->size = (uint32_t)size;
     node->size = f->size;
+    spinlock_release(&tmpfs_from_node(node)->lock, _sflags);
     return 0;
 }
 
@@ -229,40 +256,96 @@ static int tmpfs_vfs_rename(vfs_node_t* old_dir, const char* old_name,
     tmpfs_file_t* new_parent = (tmpfs_file_t*)new_dir->private_data;
     if (!old_parent || !new_parent) return -1;
 
-    tmpfs_dirent_t* d = tmpfs_lookup(old_parent, old_name);
-    if (!d) return -1;
-
-    /* If target exists, unlink it first (atomically replace) */
-    tmpfs_dirent_t* t = tmpfs_lookup(new_parent, new_name);
-    if (t) {
-        if (t->file == d->file) return 0;
-        tmpfs_file_t* tf = t->file;
-        if (tf->nlink > 1) {
-            tf->nlink--;
-        } else {
-            for (uint32_t i = 0; i < tf->nblocks; i++)
-                if (tf->blocks[i]) pmm_free_page(tf->blocks[i]);
-            if (tf->blocks) kfree(tf->blocks);
-            kfree(tf);
+    /* Lock both filesystems — if same, just one lock */
+    tmpfs_fs_t* old_fs = tmpfs_from_node(old_dir);
+    tmpfs_fs_t* new_fs = tmpfs_from_node(new_dir);
+    if (old_fs == new_fs) {
+        cpu_flags_t _sflags;
+        spinlock_acquire(&old_fs->lock, &_sflags);
+        tmpfs_dirent_t* d = tmpfs_lookup(old_parent, old_name);
+        if (!d) { spinlock_release(&old_fs->lock, _sflags); return -1; }
+        tmpfs_dirent_t* t = tmpfs_lookup(new_parent, new_name);
+        if (t) {
+            if (t->file == d->file) { spinlock_release(&old_fs->lock, _sflags); return 0; }
+            tmpfs_file_t* tf = t->file;
+            if (tf->nlink > 1) { tf->nlink--; }
+            else {
+                for (uint32_t i = 0; i < tf->nblocks; i++)
+                    if (tf->blocks[i]) pmm_free_page(tf->blocks[i]);
+                if (tf->blocks) kfree(tf->blocks);
+                kfree(tf);
+            }
+            tmpfs_remove_dirent(new_parent, new_name);
         }
-        tmpfs_remove_dirent(new_parent, new_name);
+        tmpfs_add_dirent(new_parent, new_name, d->file);
+        if (old_parent != new_parent || kstrcmp(old_name, new_name) != 0)
+            tmpfs_remove_dirent(old_parent, old_name);
+        spinlock_release(&old_fs->lock, _sflags);
+        return 0;
     }
 
-    tmpfs_add_dirent(new_parent, new_name, d->file);
-    if (old_parent != new_parent || kstrcmp(old_name, new_name) != 0)
+    /* Cross-filesystem rename: lock both (order by address to prevent deadlock) */
+    if ((uintptr_t)old_fs < (uintptr_t)new_fs) {
+        cpu_flags_t _s1; spinlock_acquire(&old_fs->lock, &_s1);
+        cpu_flags_t _s2; spinlock_acquire(&new_fs->lock, &_s2);
+        tmpfs_dirent_t* d = tmpfs_lookup(old_parent, old_name);
+        if (!d) { spinlock_release(&new_fs->lock, _s2); spinlock_release(&old_fs->lock, _s1); return -1; }
+        tmpfs_dirent_t* t = tmpfs_lookup(new_parent, new_name);
+        if (t) {
+            if (t->file == d->file) { spinlock_release(&new_fs->lock, _s2); spinlock_release(&old_fs->lock, _s1); return 0; }
+            tmpfs_file_t* tf = t->file;
+            if (tf->nlink > 1) { tf->nlink--; }
+            else {
+                for (uint32_t i = 0; i < tf->nblocks; i++)
+                    if (tf->blocks[i]) pmm_free_page(tf->blocks[i]);
+                if (tf->blocks) kfree(tf->blocks);
+                kfree(tf);
+            }
+            tmpfs_remove_dirent(new_parent, new_name);
+        }
+        tmpfs_add_dirent(new_parent, new_name, d->file);
         tmpfs_remove_dirent(old_parent, old_name);
-    return 0;
+        spinlock_release(&new_fs->lock, _s2);
+        spinlock_release(&old_fs->lock, _s1);
+        return 0;
+    } else {
+        cpu_flags_t _s1; spinlock_acquire(&new_fs->lock, &_s1);
+        cpu_flags_t _s2; spinlock_acquire(&old_fs->lock, &_s2);
+        tmpfs_dirent_t* d = tmpfs_lookup(old_parent, old_name);
+        if (!d) { spinlock_release(&old_fs->lock, _s2); spinlock_release(&new_fs->lock, _s1); return -1; }
+        tmpfs_dirent_t* t = tmpfs_lookup(new_parent, new_name);
+        if (t) {
+            if (t->file == d->file) { spinlock_release(&old_fs->lock, _s2); spinlock_release(&new_fs->lock, _s1); return 0; }
+            tmpfs_file_t* tf = t->file;
+            if (tf->nlink > 1) { tf->nlink--; }
+            else {
+                for (uint32_t i = 0; i < tf->nblocks; i++)
+                    if (tf->blocks[i]) pmm_free_page(tf->blocks[i]);
+                if (tf->blocks) kfree(tf->blocks);
+                kfree(tf);
+            }
+            tmpfs_remove_dirent(new_parent, new_name);
+        }
+        tmpfs_add_dirent(new_parent, new_name, d->file);
+        tmpfs_remove_dirent(old_parent, old_name);
+        spinlock_release(&old_fs->lock, _s2);
+        spinlock_release(&new_fs->lock, _s1);
+        return 0;
+    }
 }
 
 static int tmpfs_vfs_link(vfs_node_t* dir, const char* name, vfs_node_t* target) {
     tmpfs_file_t* parent = (tmpfs_file_t*)dir->private_data;
     tmpfs_file_t* tgt = (tmpfs_file_t*)target->private_data;
     if (!parent || !tgt) return -1;
+    cpu_flags_t _sflags;
+    spinlock_acquire(&tmpfs_from_node(dir)->lock, &_sflags);
 
-    if (tmpfs_lookup(parent, name)) return -1;
+    if (tmpfs_lookup(parent, name)) { spinlock_release(&tmpfs_from_node(dir)->lock, _sflags); return -1; }
 
-    if (tmpfs_add_dirent(parent, name, tgt) < 0) return -1;
+    if (tmpfs_add_dirent(parent, name, tgt) < 0) { spinlock_release(&tmpfs_from_node(dir)->lock, _sflags); return -1; }
     tgt->nlink++;
+    spinlock_release(&tmpfs_from_node(dir)->lock, _sflags);
     return 0;
 }
 
@@ -290,6 +373,7 @@ err_t tmpfs_mount(vfs_fs_t** out_fs) {
 
     fs->root_dir = tmpfs_create_file(TMPFS_TYPE_DIR);
     if (!fs->root_dir) { kfree(fs); return ERR_NOMEM; }
+    spinlock_init(&fs->lock, "tmpfs");
 
     kstrncpy(fs->vfs_fs.name, "tmpfs", sizeof(fs->vfs_fs.name) - 1);
     fs->vfs_fs.root = &fs->root_node;

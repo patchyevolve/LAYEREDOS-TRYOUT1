@@ -45,6 +45,24 @@ static err_t elf_map_segment(process_t* proc, const elf64_phdr_t* ph,
     uint64_t last_page  = ((seg_end + PAGE_SIZE - 1) & PAGE_MASK);
 
     for (uint64_t page = first_page; page < last_page; page += PAGE_SIZE) {
+        page_entry_t* existing_pte = vmm_walk_pagetable(cr3, page);
+        if (existing_pte && (*existing_pte & PAGE_PRESENT)) {
+            /* Page already mapped by a previous segment (e.g. .rodata shares
+             * a page with .bss).  Reuse it — don't allocate a new page. */
+            if (pgfl & PAGE_WRITE)
+                *existing_pte |= PAGE_WRITE;
+            /* Zero-fill the BSS portion (seg_start+filesz .. seg_end) */
+            uint64_t z_start = max_u64(page, seg_start + filesz);
+            uint64_t z_end   = min_u64(page + PAGE_SIZE, seg_end);
+            if (z_start < z_end) {
+                uint64_t page_off = z_start - page;
+                uint64_t phys     = *existing_pte & ~0xFFFULL;
+                kmemset((void*)(PHYS_TO_VIRT(phys) + page_off), 0, z_end - z_start);
+            }
+            vmm_flush_tlb_page(page);
+            continue;
+        }
+
         uint64_t phys = pmm_alloc_page();
         if (!phys) return ERR_NOMEM;
 
@@ -84,6 +102,7 @@ err_t elf_load(process_t* proc, const void* elf_data, size_t elf_len) {
     if (hdr->type != ELF_EXEC && hdr->type != ELF_DYN)
         return ERR_INVAL;
 
+    if (hdr->phentsize != sizeof(elf64_phdr_t)) return ERR_INVAL;
     if ((uint64_t)hdr->phnum > ~0ULL / (uint64_t)hdr->phentsize) return ERR_INVAL;
     if (hdr->phoff + (uint64_t)hdr->phnum * hdr->phentsize > elf_len)
         return ERR_INVAL;
@@ -98,6 +117,10 @@ err_t elf_load(process_t* proc, const void* elf_data, size_t elf_len) {
     const elf64_phdr_t* ph = (const elf64_phdr_t*)((uint64_t)elf_data + hdr->phoff);
     for (uint16_t i = 0; i < hdr->phnum; i++) {
         if (ph->type == PT_LOAD) {
+            if (ph->vaddr + ph->memsz > 0x00007FFFFFFFFFFFULL)
+                return ERR_INVAL;
+            if (ph->offset + ph->filesz > elf_len)
+                return ERR_INVAL;
             err_t e = elf_map_segment(proc, ph, proc->cr3, elf_data, base_offset);
             if (e) return e;
         }
@@ -120,6 +143,7 @@ err_t elf_load_fixed(process_t* proc, const void* elf_data, size_t elf_len, uint
     if (hdr->type != ELF_EXEC && hdr->type != ELF_DYN)
         return ERR_INVAL;
 
+    if (hdr->phentsize != sizeof(elf64_phdr_t)) return ERR_INVAL;
     if ((uint64_t)hdr->phnum > ~0ULL / (uint64_t)hdr->phentsize) return ERR_INVAL;
     if (hdr->phoff + (uint64_t)hdr->phnum * hdr->phentsize > elf_len)
         return ERR_INVAL;
@@ -127,6 +151,10 @@ err_t elf_load_fixed(process_t* proc, const void* elf_data, size_t elf_len, uint
     const elf64_phdr_t* ph = (const elf64_phdr_t*)((uint64_t)elf_data + hdr->phoff);
     for (uint16_t i = 0; i < hdr->phnum; i++) {
         if (ph->type == PT_LOAD) {
+            if (ph->vaddr + ph->memsz > 0x00007FFFFFFFFFFFULL)
+                return ERR_INVAL;
+            if (ph->offset + ph->filesz > elf_len)
+                return ERR_INVAL;
             err_t e = elf_map_segment(proc, ph, proc->cr3, elf_data, base);
             if (e) return e;
         }

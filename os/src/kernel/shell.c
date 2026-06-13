@@ -28,6 +28,8 @@
 #include "sync.h"
 #include "eventbus.h"
 #include "vfs.h"
+#include "nic.h"
+#include "eth.h"
 #include "ramdisk.h"
 #include "keyboard.h"
 #include "ata.h"
@@ -40,6 +42,10 @@
 #include "fsck.h"
 #include "snap.h"
 #include "backup.h"
+#include "nic.h"
+#include "e1000.h"
+#include "eth.h"
+#include "arp.h"
 
 extern char _binary_build_user_program_elf_start[];
 extern char _binary_build_user_program_elf_end[];
@@ -1014,6 +1020,7 @@ static void cmd_run(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     while (!proc->exited && !(proc->flags & PROC_FLAG_STOPPED))
         sched_block(&proc->exit_waiters);
     tty_set_fg_pgid(old_fg);
+    process_reap(proc);
 
     kfree(buf);
 }
@@ -1709,21 +1716,30 @@ static void cmd_format(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
 
 static void cmd_snap(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     (void)in; (void)out;
-    if (argc < 2) { kprintf("Usage: snap take|rollback|info\n"); return; }
+    if (argc < 2) { kprintf("Usage: snap take [desc] | rollback <idx> | list\n"); return; }
     block_dev_t* bdev = block_find("ramdisk");
     if (!bdev) { kprintf("snap: no ramdisk\n"); return; }
     if (kstrcmp(args[1], "take") == 0) {
-        err_t e = snapshot_take(bdev);
-        kprintf("snap: %s\n", e ? "failed" : "ok");
+        const char* desc = (argc > 2) ? args[2] : "";
+        err_t e = snapshot_take(bdev, desc);
+        kprintf("snap: %s (%d)\n", e ? "failed" : "ok", e);
     } else if (kstrcmp(args[1], "rollback") == 0) {
-        if (!snapshot_exists()) { kprintf("snap: no snapshot\n"); return; }
-        err_t e = snapshot_rollback(bdev);
+        if (argc < 3) { kprintf("Usage: snap rollback <idx>\n"); return; }
+        int idx = 0;
+        { const char* p = args[2]; while (*p) { idx = idx * 10 + (*p - '0'); p++; } }
+        if (idx < 0 || idx >= snapshot_count()) { kprintf("snap: invalid index\n"); return; }
+        err_t e = snapshot_rollback(bdev, idx);
         kprintf("snap: %s (%d)\n", e ? "rollback failed" : "rolled back", e);
-    } else if (kstrcmp(args[1], "info") == 0) {
-        if (snapshot_exists())
-            kprintf("snap: snapshot exists\n");
-        else
-            kprintf("snap: no snapshot\n");
+    } else if (kstrcmp(args[1], "list") == 0) {
+        int n = snapshot_count();
+        if (n == 0) { kprintf("snap: no snapshots\n"); return; }
+        for (int i = 0; i < SNAP_MAX; i++) {
+            snap_info_t info;
+            if (snapshot_info(i, &info) == 0) {
+                kprintf("  [%d] %u blocks, ticks=%llu '%s'\n",
+                        i, info.blocks, info.timestamp, info.desc);
+            }
+        }
     } else {
         kprintf("snap: unknown subcommand '%s'\n", args[1]);
     }
@@ -1880,6 +1896,111 @@ static void cmd_type(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * Network commands
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static void cmd_nicstat(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)args; (void)argc; (void)in;
+    if (!nic.present) {
+        cmd_puts(out, "NIC: not present\n");
+        return;
+    }
+    cmd_printf(out, "NIC: present\n");
+    cmd_printf(out, "MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+               nic.mac[0], nic.mac[1], nic.mac[2],
+               nic.mac[3], nic.mac[4], nic.mac[5]);
+    cmd_printf(out, "IRQ: %d\n", nic.irq);
+}
+
+static void cmd_eth_test(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)args; (void)argc; (void)in;
+    if (!nic.present) {
+        cmd_puts(out, "ETH: NIC not present\n");
+        return;
+    }
+    static const uint8_t test_payload[] = "OPERtur Ethernet Test Frame";
+    uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    err_t e = eth_send(broadcast, ETHERTYPE_LOOP, test_payload, sizeof(test_payload));
+    if (e == ERR_OK) {
+        cmd_printf(out, "ETH: Broadcast sent OK (%zu bytes payload)\n", sizeof(test_payload));
+    } else {
+        cmd_printf(out, "ETH: Send failed: %d\n", e);
+    }
+    eth_rx_poll();
+    cmd_printf(out, "ETH: RX poll complete\n");
+}
+
+static const ipv4_addr_t GATEWAY_IP = { .bytes = {10, 0, 2, 2} };
+
+static void cmd_nicdebug(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)args; (void)argc; (void)in;
+    if (!nic.present) {
+        cmd_puts(out, "NIC not present\n");
+        return;
+    }
+    /* Read hardware registers */
+    uint32_t status = nic_reg_read(E1000_STATUS);
+    uint32_t ctrl   = nic_reg_read(E1000_CTRL);
+    uint32_t rctl   = nic_reg_read(E1000_RCTL);
+    uint32_t tctl   = nic_reg_read(E1000_TCTL);
+    uint32_t rdh    = nic_reg_read(E1000_RDH);
+    uint32_t rdt    = nic_reg_read(E1000_RDT);
+    uint32_t tdh    = nic_reg_read(E1000_TDH);
+    uint32_t tdt    = nic_reg_read(E1000_TDT);
+    uint32_t tpt    = nic_reg_read(E1000_TPT);
+    uint32_t gprc   = nic_reg_read(E1000_GPRC);
+    uint32_t tpr    = nic_reg_read(E1000_TPR);
+
+    cmd_printf(out, "STATUS=0x%04x (LU=%d FD=%d SPEED=%d)\n",
+               status, !!(status & E1000_STATUS_LU), !!(status & E1000_STATUS_FD),
+               (status & E1000_STATUS_SPEED_MASK) >> 6);
+    cmd_printf(out, "CTRL=0x%08x RCTL=0x%08x TCTL=0x%08x\n", ctrl, rctl, tctl);
+    cmd_printf(out, "RDH=%u RDT=%u TDH=%u TDT=%u\n", rdh, rdt, tdh, tdt);
+    cmd_printf(out, "TPT=%u GPRC=%u TPR=%u\n", tpt, gprc, tpr);
+
+    /* Send ARP request and poll */
+    uint8_t mac[6];
+    int ret = arp_resolve(GATEWAY_IP, mac, 3000);
+    cmd_printf(out, "ARP resolve: %d\n", ret);
+
+    /* Check registers after */
+    tpt = nic_reg_read(E1000_TPT);
+    tdh = nic_reg_read(E1000_TDH);
+    tdt = nic_reg_read(E1000_TDT);
+    rdh = nic_reg_read(E1000_RDH);
+    rdt = nic_reg_read(E1000_RDT);
+    gprc = nic_reg_read(E1000_GPRC);
+    cmd_printf(out, "TPT=%u TDH=%u TDT=%u  RDH=%u RDT=%u GPRC=%u\n",
+               tpt, tdh, tdt, rdh, rdt, gprc);
+}
+
+static void cmd_arp_test(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)args; (void)argc; (void)in;
+    if (!nic.present) {
+        cmd_puts(out, "ARP: NIC not present\n");
+        return;
+    }
+    ipv4_addr_t target = GATEWAY_IP;
+    if (argc > 1) {
+        int a,b,c,d;
+        if (kvsnprintf(NULL, 0, args[1], NULL) == 0) {}
+        a = 10; b = 0; c = 2; d = 2;
+        target = ipv4_from_bytes(a, b, c, d);
+    }
+    cmd_printf(out, "ARP: Resolving %d.%d.%d.%d...\n",
+               target.bytes[0], target.bytes[1], target.bytes[2], target.bytes[3]);
+    uint8_t mac[6];
+    int ret = arp_resolve(target, mac, 3000);
+    if (ret == ERR_OK) {
+        cmd_printf(out, "ARP: %d.%d.%d.%d = %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   target.bytes[0], target.bytes[1], target.bytes[2], target.bytes[3],
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        cmd_printf(out, "ARP: Resolve failed: %d\n", ret);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Command table
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -1949,6 +2070,10 @@ static shell_cmd_t commands[] = {
     {"fsck",      cmd_fsck,      "Check SFS integrity [-r to repair]"},
     {"format",    cmd_format,    "Format+remount SFS on ramdisk"},
     {"mount",     cmd_mount,     "List block devices"},
+    {"nicstat",   cmd_nicstat,   "Show NIC status"},
+    {"nicdebug",  cmd_nicdebug,  "NIC hardware debug"},
+    {"eth_test",  cmd_eth_test,  "Send Ethernet broadcast frame"},
+    {"arp_test",  cmd_arp_test,  "Resolve IP via ARP [ip]"},
     /* Danger zone */
     {"reboot",    cmd_reboot,    "Reboot system"},
     {"poweroff",  cmd_poweroff,  "Power off system"},
@@ -2238,6 +2363,12 @@ void shell_run(void) {
         eventbus_dispatch();
         if (need_reschedule) schedule();
 
+        eth_rx_poll();
+
+        if (!hal_uart_data_available()) {
+            thread_sleep(10);
+            continue;
+        }
         int c = hal_uart_getchar();
         if (c < 0) { thread_yield(); continue; }
 

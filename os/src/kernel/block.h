@@ -24,6 +24,7 @@ err_t block_read(block_dev_t* dev, uint64_t lba, uint8_t count, void* buf);
 err_t block_write(block_dev_t* dev, uint64_t lba, uint8_t count, const void* buf);
 err_t block_sync(void);
 err_t block_sync_dev(block_dev_t* dev);
+err_t block_flush(block_dev_t* dev, uint64_t lba, uint8_t count);
 void block_cache_stats(void);
 int   block_register(block_dev_t* dev);
 int   block_count(void);
