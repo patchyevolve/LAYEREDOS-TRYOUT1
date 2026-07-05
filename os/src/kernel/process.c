@@ -13,7 +13,7 @@
 #define ASLR_STACK_PAGES 0x100
 #define ASLR_STACK_BASE  0x60000000ULL
 
-static uint64_t aslr_rand(void) {
+uint64_t aslr_rand(void) {
     uint32_t lo, hi;
     asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
     uint64_t rdtsc_val = ((uint64_t)hi << 32) | lo;
@@ -74,6 +74,9 @@ process_t* process_create(const char* name, pid_t ppid) {
     proc->flags = 0;
     kmemset(proc->signal_actions, 0, sizeof(proc->signal_actions));
     spinlock_init(&proc->signal_lock, "signal_lock");
+    spinlock_init(&proc->vma_lock, "vma_lock");
+    wait_queue_init(&proc->exit_waiters);
+    proc->fork_limit = -1;
     proc->cwd[0] = '/';
     proc->cwd[1] = 0;
 
@@ -350,8 +353,7 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
     tcb->kernel_stack_size = THREAD_STACK_SIZE;
     tcb->user_code_page = 0;
     tcb->user_stack_page = stack_page;
-    tcb->join_queue.waiters = NULL;
-    tcb->join_queue.count = 0;
+    wait_queue_init(&tcb->join_queue);
     tcb->proc = proc;
     kstrncpy(tcb->name, proc->name, THREAD_NAME_MAX - 1);
 

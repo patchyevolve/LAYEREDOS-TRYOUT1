@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "sync.h"
 #include "hal.h"
+#include "lockdep.h"
 
 void spinlock_init(spinlock_t* lock, const char* name) {
     lock->lock = 0;
@@ -10,6 +11,9 @@ void spinlock_init(spinlock_t* lock, const char* name) {
 
 void spinlock_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
     cpu_flags_t flags = hal_save_irq();
+    if (current_thread && lock->lock && lock->holder == current_thread->id)
+        kpanic("RECURSIVE SPINLOCK: '%s' held by thread %x (lock=%p)",
+               lock->name ? lock->name : "?", current_thread->id, (void*)lock);
     while (__sync_lock_test_and_set(&lock->lock, 1)) {
         while (lock->lock)
             asm volatile("pause");
@@ -17,6 +21,18 @@ void spinlock_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
     lock->holder = current_thread ? current_thread->id : 0;
     __sync_synchronize();
     *out_flags = flags;
+}
+
+int spinlock_try_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
+    cpu_flags_t flags = hal_save_irq();
+    if (__sync_lock_test_and_set(&lock->lock, 1)) {
+        hal_restore_irq(flags);
+        return 0;
+    }
+    lock->holder = current_thread ? current_thread->id : 0;
+    __sync_synchronize();
+    *out_flags = flags;
+    return 1;
 }
 
 void spinlock_release(spinlock_t* lock, cpu_flags_t flags) {
@@ -29,8 +45,7 @@ void spinlock_release(spinlock_t* lock, cpu_flags_t flags) {
 void mutex_init(mutex_t* m) {
     m->locked = 0;
     m->owner_tid = 0;
-    m->wait_queue.waiters = NULL;
-    m->wait_queue.count = 0;
+    wait_queue_init(&m->wait_queue);
     m->orig_priority = 0;
 }
 
@@ -93,8 +108,7 @@ err_t mutex_unlock(mutex_t* m) {
 
 void condvar_init(condvar_t* cv) {
     kmemset(cv, 0, sizeof(condvar_t));
-    cv->wait_queue.waiters = NULL;
-    cv->wait_queue.count = 0;
+    wait_queue_init(&cv->wait_queue);
 }
 
 void condvar_wait(condvar_t* cv, mutex_t* m) {
@@ -109,4 +123,101 @@ void condvar_signal(condvar_t* cv) {
 
 void condvar_broadcast(condvar_t* cv) {
     sched_wake(&cv->wait_queue);
+}
+
+/* ============================================================
+ * Read-Write Lock
+ * ============================================================ */
+void rwlock_init(rwlock_t* rw, const char* name) {
+    spinlock_init(&rw->internal, name);
+    rw->state = 0;
+}
+
+void rwlock_read_acquire(rwlock_t* rw, cpu_flags_t* out_flags) {
+    cpu_flags_t flags;
+    for (;;) {
+        spinlock_acquire(&rw->internal, &flags);
+        if (rw->state >= 0) {
+            rw->state++;
+            spinlock_release(&rw->internal, flags);
+            lockdep_acquire((void*)rw, rw->internal.name, 1);
+            *out_flags = hal_save_irq();
+            return;
+        }
+        spinlock_release(&rw->internal, flags);
+        cpu_relax();
+    }
+}
+
+void rwlock_read_release(rwlock_t* rw, cpu_flags_t flags) {
+    lockdep_release((void*)rw);
+    cpu_flags_t tmp;
+    spinlock_acquire(&rw->internal, &tmp);
+    rw->state--;
+    spinlock_release(&rw->internal, tmp);
+    hal_restore_irq(flags);
+}
+
+void rwlock_write_acquire(rwlock_t* rw, cpu_flags_t* out_flags) {
+    cpu_flags_t flags;
+    for (;;) {
+        spinlock_acquire(&rw->internal, &flags);
+        if (rw->state == 0) {
+            rw->state = -1;
+            spinlock_release(&rw->internal, flags);
+            lockdep_acquire((void*)rw, rw->internal.name, 0);
+            *out_flags = hal_save_irq();
+            return;
+        }
+        spinlock_release(&rw->internal, flags);
+        cpu_relax();
+    }
+}
+
+void rwlock_write_release(rwlock_t* rw, cpu_flags_t flags) {
+    lockdep_release((void*)rw);
+    cpu_flags_t tmp;
+    spinlock_acquire(&rw->internal, &tmp);
+    rw->state = 0;
+    spinlock_release(&rw->internal, tmp);
+    hal_restore_irq(flags);
+}
+
+/* ============================================================
+ * Sequence Lock
+ * ============================================================ */
+void seqlock_init(seqlock_t* sql, const char* name) {
+    sql->sequence = 0;
+    spinlock_init(&sql->lock, name);
+}
+
+uint64_t seqlock_read_begin(seqlock_t* sql) {
+    uint64_t seq;
+    for (;;) {
+        seq = sql->sequence;
+        if (!(seq & 1))
+            break;
+        cpu_relax();
+    }
+    smp_rmb();
+    return seq;
+}
+
+int seqlock_read_retry(seqlock_t* sql, uint64_t start) {
+    smp_rmb();
+    return sql->sequence != start;
+}
+
+void seqlock_write_acquire(seqlock_t* sql, cpu_flags_t* out_flags) {
+    spinlock_acquire(&sql->lock, out_flags);
+    sql->sequence++;
+    smp_wmb();
+    lockdep_acquire((void*)sql, sql->lock.name, 0);
+}
+
+void seqlock_write_release(seqlock_t* sql, cpu_flags_t flags) {
+    lockdep_release((void*)sql);
+    sql->sequence++;
+    smp_wmb();
+    spinlock_release(&sql->lock, flags);
 }
