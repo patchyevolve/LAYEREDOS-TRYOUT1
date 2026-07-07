@@ -9,11 +9,12 @@
 #include "hal.h"
 #include "sched.h"
 #include "sync.h"
+#include "net_ns.h"
 
-static int tcp_initialized = 0;
-static tcp_conn_t tcp_conns[TCP_MAX_CONN];
-static uint16_t tcp_ephemeral_port = 49152;
-static spinlock_t tcp_lock;
+#define tcp_initialized (get_current_ns()->tcp_initialized)
+#define tcp_conns (get_current_ns()->tcp_conns)
+#define tcp_ephemeral_port (get_current_ns()->tcp_ephemeral_port)
+#define tcp_lock (get_current_ns()->tcp_lock)
 
 static uint16_t tcp_htons(uint16_t v) { return __builtin_bswap16(v); }
 static uint32_t tcp_htonl(uint32_t v) { return __builtin_bswap32(v); }
@@ -136,13 +137,15 @@ static void tcp_handle_common(int af, const void* src_ip,
 
     if (len < TCP_HDR_LEN) { spinlock_release(&tcp_lock, flags); return; }
     const tcp_hdr_t* hdr = (const tcp_hdr_t*)data;
+    uint32_t hdr_len = (hdr->offset >> 4) * 4;
+    if (hdr_len < TCP_HDR_LEN || hdr_len > len) { spinlock_release(&tcp_lock, flags); return; }
     uint16_t dst_port = tcp_htons(hdr->dst_port);
     uint16_t src_port = tcp_htons(hdr->src_port);
     uint32_t seq = tcp_htonl(hdr->seq);
     uint32_t ack = tcp_htonl(hdr->ack);
     uint8_t tcp_flags = hdr->flags;
-    uint32_t payload_len = len - TCP_HDR_LEN;
-    const uint8_t* payload = data + TCP_HDR_LEN;
+    uint32_t payload_len = len - hdr_len;
+    const uint8_t* payload = data + hdr_len;
     uint16_t window = tcp_htons(hdr->window);
 
     KDEBUG("[TCP RX] flags=0x%02x sport=%u dport=%u seq=%u ack=%u len=%u\n",
@@ -595,10 +598,10 @@ int tcp_close(tcp_conn_t* conn) {
     if (conn->state == TCP_ESTABLISHED || conn->state == TCP_CLOSE_WAIT) {
         conn->state = conn->state == TCP_ESTABLISHED ?
                       TCP_FIN_WAIT1 : TCP_LAST_ACK;
-        tcp_send_pkt(conn, TCP_FIN | TCP_ACK, NULL, 0);
         conn->snd_nxt++;
         conn->fin_rto_remaining = 1000;
         spinlock_release(&tcp_lock, flags);
+        tcp_send_pkt(conn, TCP_FIN | TCP_ACK, NULL, 0);
         return ERR_OK;
     }
 
@@ -681,7 +684,7 @@ void tcp_init(void) {
     if (tcp_initialized) return;
 
     spinlock_init(&tcp_lock, "tcp");
-    kmemset(tcp_conns, 0, sizeof(tcp_conns));
+    tcp_ephemeral_port = 49152;
     ipv4_register_handler(IPV4_PROTO_TCP, tcp_ipv4_handler);
     ipv6_register_handler(IPV6_NEXT_TCP, tcp_ipv6_handler);
     kprintf("[TCP] Initialized\n");
@@ -788,8 +791,10 @@ int tcp_conn_connect(tcp_conn_t* c, const void* dst_ip,
     c->iss = iss;
     c->snd_nxt = iss;
 
+    spinlock_release(&tcp_lock, flags);
     int e = tcp_send_pkt(c, TCP_SYN, NULL, 0);
-    if (e != ERR_OK) { c->used = 0; spinlock_release(&tcp_lock, flags); return e; }
+    spinlock_acquire(&tcp_lock, &flags);
+    if (e != ERR_OK || !c->used) { c->used = 0; spinlock_release(&tcp_lock, flags); return e; }
     c->snd_nxt++;
 
     spinlock_release(&tcp_lock, flags);
@@ -821,9 +826,13 @@ int tcp_conn_connect(tcp_conn_t* c, const void* dst_ip,
         if (c->state == TCP_SYN_SENT && i > 0 && (i % retry_interval) == 0) {
             kprintf("[TCP] SYN retry #%d\n", i / retry_interval);
             c->snd_nxt = c->iss;
+            spinlock_release(&tcp_lock, flags);
             tcp_send_pkt(c, TCP_SYN, NULL, 0);
+            spinlock_acquire(&tcp_lock, &flags);
+            if (!c->used) { spinlock_release(&tcp_lock, flags); return ERR_AGAIN; }
             c->snd_nxt = c->iss + 1;
         }
+        if (!c->used) { spinlock_release(&tcp_lock, flags); return ERR_AGAIN; }
         if (c->state == TCP_CLOSED) {
             c->used = 0;
             spinlock_release(&tcp_lock, flags);

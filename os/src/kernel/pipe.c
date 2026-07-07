@@ -109,6 +109,8 @@ int pipe_create(int fds[2]) {
     if (!p) return -1;
     kmemset(p, 0, sizeof(pipe_t));
     spinlock_init(&p->lock, "pipe_lock");
+    wait_queue_init(&p->readers);
+    wait_queue_init(&p->writers);
     p->refcount = 2; /* one for rnode, one for wnode */
 
     vfs_node_t* rnode = (vfs_node_t*)kmalloc(sizeof(vfs_node_t));
@@ -135,6 +137,8 @@ int pipe_create(int fds[2]) {
     wnode->destructor = pipe_destructor;
 
     vfs_fd_t* ft = vfs_get_fd_table();
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
     for (int i = 0; i < VFS_MAX_FDS; i++) {
         if (!ft[i].used) {
             ft[i].node = rnode;
@@ -154,11 +158,13 @@ int pipe_create(int fds[2]) {
             ft[i].used = 1;
             __sync_fetch_and_add(&wnode->refcount, 1);
             fds[1] = i;
+            spinlock_release(&vfs_global_lock, _sf);
             return 0;
         }
     }
     /* Error: no slot for write fd — clean up the read fd that was already assigned */
     ft[fds[0]].used = 0;
+    spinlock_release(&vfs_global_lock, _sf);
     pipe_close(rnode);
     pipe_close(wnode);
     kfree(rnode);

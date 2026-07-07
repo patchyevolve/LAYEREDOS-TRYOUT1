@@ -11,6 +11,7 @@ static int swap_initialized = 0;
 static spinlock_t swap_lock;
 
 err_t swap_init(void) {
+    spinlock_init(&swap_lock, "swap_lock");
     /* Allocate physical pages for swap backing store.
      * Use 4 pages = 16KB = 4 swap slots for now. */
     swap_nslots = 4;

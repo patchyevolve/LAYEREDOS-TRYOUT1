@@ -14,6 +14,7 @@ static unix_named_t unix_named_table[UNIX_MAX_NAMED];
 static spinlock_t unix_named_lock;
 
 void unix_init(void) {
+    spinlock_init(&unix_named_lock, "unix_named_lock");
     kmemset(unix_named_table, 0, sizeof(unix_named_table));
     unix_initialized = 1;
 }
@@ -89,6 +90,7 @@ static int unix_create_connected_pair(socket_t** out_a, socket_t** out_b) {
     unix_pair_t* pair = (unix_pair_t*)kmalloc(sizeof(unix_pair_t));
     if (!pair) return ERR_NOMEM;
     kmemset(pair, 0, sizeof(unix_pair_t));
+    spinlock_init(&pair->lock, "unix_pair_lock");
     pair->refcount = 2;
     pair->cred[0].uid = uid;
     pair->cred[0].gid = gid;
@@ -232,6 +234,7 @@ int unix_sock_listen(socket_t* s, int backlog) {
     unix_listener_t* lst = (unix_listener_t*)kmalloc(sizeof(unix_listener_t));
     if (!lst) return ERR_NOMEM;
     kmemset(lst, 0, sizeof(unix_listener_t));
+    spinlock_init(&lst->lock, "unix_listener_lock");
     path_copy(lst->path, bound_path);
     lst->backlog = backlog;
     lst->q_count = 0;

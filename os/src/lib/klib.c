@@ -38,13 +38,22 @@ static void vga_update_cursor(void) {
     outb(0x3D5, (uint8_t)(pos & 0xFF));
 }
 
+/* Optional kmsg buffer; linked when kmsg.c is compiled in */
+extern void kmsg_putchar(char c) __attribute__((weak));
+
 void kputchar(char c) {
+    unsigned long _kflags;
+    asm volatile("pushfq; popq %0; cli" : "=r"(_kflags));
     if (c == '\n') {
         while (!(inb(UART_LSR) & 0x20));
         outb(UART_THR, '\r');
     }
     while (!(inb(UART_LSR) & 0x20));
     outb(UART_THR, c);
+    if (_kflags & 0x200) asm volatile("sti");
+
+    /* Buffer into kmsg ring if available */
+    if (kmsg_putchar) kmsg_putchar(c);
 
     if (c == '\n') { vga_col = 0; vga_row++; }
     else if (c == '\r') { vga_col = 0; }
@@ -282,6 +291,11 @@ static void kdump_stack(void) {
     kprintf("=========================\n");
 }
 
+/* Optional panic recovery hooks */
+extern void kmsg_dump(void) __attribute__((weak));
+extern void emergency_sync(void) __attribute__((weak));
+extern void panic_reboot(void) __attribute__((weak));
+
 void kpanic(const char* msg, ...) {
     __builtin_va_list ap;
     __builtin_va_start(ap, msg);
@@ -300,6 +314,12 @@ void kpanic(const char* msg, ...) {
     __builtin_va_end(ap);
     kdump_stack();
     kprintf("\n==========================\n");
+
+    /* Panic recovery: dump recent log, sync filesystems, reboot */
+    if (kmsg_dump) kmsg_dump();
+    if (emergency_sync) emergency_sync();
+    if (panic_reboot) panic_reboot();
+
     for (;;) { asm volatile("cli; hlt"); }
 }
 

@@ -1,0 +1,94 @@
+c[?7l[2J[0mSeaBIOS (version 1.17.0-10.fc44)
+
+
+iPXE (https://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+1EFCBCE0+1EF0BCE0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from ROM..BOOTING
+[HAL] TSC calibrated: 3140329 kHz
+[HAL] Layer 1 initialized: GDT, IDT, PIC, UART, Timer
+[BOOT] Step 1/16: Layer 1 (HAL) - GDT, IDT, UART, Timer, PIC
+[BOOT] Detected memory: 512 MB
+[BOOT] Step 2/16: Layer 4 (PMM) - Physical Memory Manager
+[PMM] Total memory: 512 MB (131072 pages)
+[PMM] Free: 130073 pages (508 MB)
+[BOOT] Step 3/16: Layer 4 (VMM) - Virtual Memory Manager
+[VMM] Layer 4 initialized: kernel PML4 at 0x7000
+[VMM] Kernel occupies 0x100000 - 0x5DD000
+[VMM] Kernel text+rodata read-only: 0xFFFFFFFFC0104000 - 0xFFFFFFFFC0207000
+[BOOT] Step 4/16: Kernel Heap - Slab Allocator
+[BOOT] Step 5/16: HPET Timer
+[HPET] Detected: 3 timers, 32-bit, period=10000000 fs (100000000 Hz), leg_route=0
+[HPET] Configuring timer 0 for periodic mode
+[HPET] Timer initialized at 100000000 Hz, comparator=100000
+[BOOT] Step 6/16: Swap - Page Backing Store
+[SWAP] Initialized: 4 slots, backing at phys 0x1000
+[BOOT] Step 7/16: APIC Interrupt Controller
+[APIC] Base MSR=0xFEE00900, phys=0xFEE00000
+[APIC] Local APIC ID=0, version=20, max_lvt=5
+[APIC] Calibrated: 68872 ticks/ms, init_count=68872 for 1000 Hz
+[APIC] Timer initialized for 1000 Hz (init_count=68872)
+[APIC] Legacy PIC reconfigured: PIT unmasked, LINT0=ExtINT, LINT1=NMI
+[BOOT] Step 8/16: Syscall Interface
+[SYSCALL] int 0x80 handler registered, 90 syscalls
+[BOOT] Step 9/16: Layer 2 (SCHED) - Scheduler & Threading
+[SCHED] Kernel CR3 = 0x0x7000
+[SCHED] Layer 2 initialized: 256 priority levels
+[BOOT] Step 10/16: Layer 3 (PROCESS) - Process Manager
+[PROCESS] Process manager initialized, init pid = 1
+[BOOT] Step 11/16: Work Queue & Deferred Tasks
+[WORK] System work queue initialized
+[BOOT] Step 12/16: I/O Subsystem - Keyboard, ATA, PCI, VFS, Ramdisk
+[KEYBOARD] PS/2 keyboard driver initialized on IRQ1
+[ATA] Drive 2:  (0 sectors, 0 MB)
+[PCI] Enumerated 4 devices
+  0x0:0x0.0  0x8086:0x1237  class=0x6 subclass=0x0 irq=0
+  0x0:0x1.0  0x8086:0x7000  class=0x6 subclass=0x1 irq=0
+  0x0:0x2.0  0x1234:0x1111  class=0x3 subclass=0x0 irq=0
+  0x0:0x3.0  0x8086:0x100E  class=0x2 subclass=0x0 irq=11
+[VFS] Virtual filesystem initialized
+[TTY] Console terminal initialised
+[PTY] Pseudo-terminal subsystem initialized (8 slots)
+[RAMDISK] Initialized
+[BOOT] Step 13/16: Block Device Layer & SFS Filesystem
+[RAMDISK_BLK] 2048 KB writable block device at 0xFFFFFFFFC04DD000
+[ATA_BLK] Registered drive 2 as 'ata2' (0 blocks)
+[AHCI] No AHCI controller found
+[NVMe] No NVMe controller found
+[E1000] RCTL=0x0x400801E
+[E1000] STATS: TPT=0 GPRC=0 TPR=0
+[E1000] Found Intel 82540EM at 00:03.0
+[E1000] MAC = 0x52:0x54:0x0:0x12:0x34:0x56
+[E1000] RX=32 desc, TX=32 desc, IRQ=11
+[ETH] Ethernet layer initialized
+[ETH] Registered handler for EtherType 0x0x806
+[ARP] Initialized (cache 16 entries)
+[NDP] Initialized (cache 16 entries)
+[NDP] Link-local: 0xFE80:0x0:0x0:0x0:0x5054:0xFF:0xFE12:0x3456
+[ROUTE] Initialized
+[ETH] Registered handler for EtherType 0x0x800
+[IPv4] Initialized, IP=0.0.0.0
+[IGMP] Initialized
+[ETH] Registered handler for EtherType 0x0x86DD
+[IPv6] Initialized, LL=0xFE80:0x0:0x0:0x0:0x5054:0xFF:0xFE12:0x3456
+[ICMP] Initialized
+[ICMPv6] Initialized
+[UDP] Initialized
+[TCP] Initialized
+[NET] Socket layer initialized
+[DNS] Resolver initialized (8.8.8.8:53)
+[DHCP] Starting DHCP configuration...
+PAGE FAULT at 0x8000, rip=0xFFFFFFFFC0141900, error=2 (KERNEL)
+
+====== KERNEL PANIC ======
+  Message: Page fault (kernel mode)
+====== STACK TRACE ======
+  [0] 0xFFFFFFFFC010DB39
+  [1] 0xFFFFFFFFC0141D41
+  [2] 0xFFFFFFFFC0108B51
+  [3] 0xFFFFFFFFC0112F9E
+  [4] 0x000000000010017D
+=========================
+
+==========================

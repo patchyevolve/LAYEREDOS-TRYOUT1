@@ -5,21 +5,17 @@
 #include "route.h"
 #include "nic.h"
 #include "igmp.h"
+#include "net_ns.h"
 
 #define IPV4_TTL_DEFAULT 64
 #define IPV4_ID_INIT     0x4000
-#define IPV4_DISPATCH_SLOTS 8
 
-/* Our IPv4 address (configurable via DHCP in Phase 10) */
-static ipv4_addr_t OUR_IPV4 = { .bytes = {0, 0, 0, 0} };
+static int ipv4_handler_registered = 0;
 
-static int ipv4_initialized = 0;
-static uint16_t ipv4_next_id = IPV4_ID_INIT;
-
-static struct {
-    uint8_t         protocol;
-    ipv4_handler_t  handler;
-} ipv4_dispatch[IPV4_DISPATCH_SLOTS];
+#define OUR_IPV4 (get_current_ns()->our_ipv4)
+#define ipv4_initialized (get_current_ns()->ipv4_initialized)
+#define ipv4_next_id (get_current_ns()->ipv4_next_id)
+#define ipv4_dispatch (get_current_ns()->ipv4_dispatch)
 
 static uint16_t ipv4_checksum(const void* hdr, int len) {
     uint32_t sum = 0;
@@ -67,14 +63,12 @@ int ipv4_send_from(ipv4_addr_t src, ipv4_addr_t dst, uint8_t protocol,
 
     kmemcpy(buf + IPV4_HDR_LEN, data, len);
 
-    /* Broadcast destination — use broadcast MAC directly */
     ipv4_addr_t bcast = ipv4_from_bytes(255, 255, 255, 255);
     if (ipv4_addr_equal(dst, bcast)) {
         uint8_t bmac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
         return eth_send(bmac, ETHERTYPE_IPV4, buf, IPV4_HDR_LEN + len);
     }
 
-    /* Route lookup */
     ipv4_addr_t next_hop;
     int e = route_lookup_v4(dst, &next_hop);
     if (e != ERR_OK) {
@@ -83,7 +77,6 @@ int ipv4_send_from(ipv4_addr_t src, ipv4_addr_t dst, uint8_t protocol,
         return e;
     }
 
-    /* ARP resolve next-hop MAC */
     uint8_t next_mac[6];
     e = arp_resolve(next_hop, next_mac, 2000);
     if (e != ERR_OK) {
@@ -109,12 +102,24 @@ int ipv4_send(ipv4_addr_t dst, uint8_t protocol,
 
 void ipv4_set_addr(ipv4_addr_t addr) {
     OUR_IPV4 = addr;
+    get_current_ns()->ipv4_prefix_len = 24;
     kprintf("[IPv4] Address set to %d.%d.%d.%d\n",
             addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3]);
 }
 
+void ipv4_set_addr_prefix(ipv4_addr_t addr, int prefix_len) {
+    OUR_IPV4 = addr;
+    get_current_ns()->ipv4_prefix_len = prefix_len;
+    kprintf("[IPv4] Address set to %d.%d.%d.%d/%d\n",
+            addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3], prefix_len);
+}
+
 ipv4_addr_t ipv4_get_addr(void) {
     return OUR_IPV4;
+}
+
+int ipv4_get_prefix_len(void) {
+    return get_current_ns()->ipv4_prefix_len;
 }
 
 static void ipv4_dispatch_pkt(uint8_t protocol, ipv4_addr_t src,
@@ -148,7 +153,6 @@ static void ipv4_eth_handler(const uint8_t* src_mac, uint16_t type,
     kmemcpy(src.bytes, hdr->src, 4);
     kmemcpy(dst.bytes, hdr->dst, 4);
 
-    /* Accept broadcast, our unicast, and multicast (224.0.0.0/4) */
     int is_mcast = (dst.bytes[0] & 0xF0) == 0xE0;
     ipv4_addr_t bcast = ipv4_from_bytes(255, 255, 255, 255);
     if (!is_mcast && !ipv4_addr_equal(dst, OUR_IPV4) && !ipv4_addr_equal(dst, bcast)) return;
@@ -163,12 +167,15 @@ static void ipv4_eth_handler(const uint8_t* src_mac, uint16_t type,
 void ipv4_init(void) {
     if (ipv4_initialized) return;
 
-    kmemset(ipv4_dispatch, 0, sizeof(ipv4_dispatch));
+    ipv4_next_id = IPV4_ID_INIT;
 
-    err_t e = eth_register(ETHERTYPE_IPV4, ipv4_eth_handler);
-    if (e != ERR_OK) {
-        kprintf("[IPv4] Failed to register handler: %d\n", e);
-        return;
+    if (!ipv4_handler_registered) {
+        err_t e = eth_register(ETHERTYPE_IPV4, ipv4_eth_handler);
+        if (e != ERR_OK) {
+            kprintf("[IPv4] Failed to register handler: %d\n", e);
+            return;
+        }
+        ipv4_handler_registered = 1;
     }
 
     kprintf("[IPv4] Initialized, IP=%d.%d.%d.%d\n",

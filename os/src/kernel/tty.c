@@ -47,6 +47,9 @@ void tty_init(void) {
     tty_t* t = &tty_console;
 
     spinlock_init(&t->raw_lock, "tty_raw");
+    spinlock_init(&t->state_lock, "tty_state");
+    wait_queue_init(&t->raw_waitq);
+    wait_queue_init(&t->canon_waitq);
 
     /* Initialize termios defaults */
     t->lflag = TTY_ECHO | TTY_ICANON | TTY_ISIG | TTY_ECHOE;
@@ -100,6 +103,8 @@ void tty_input_push(char c) {
     tty_t* t = &tty_console;
 
     /* ISR context: check for immediate signal delivery to foreground pg */
+    cpu_flags_t _sf;
+    spinlock_acquire(&t->state_lock, &_sf);
     if ((t->lflag & TTY_ISIG) && t->fg_pgid > 0) {
         int sig = 0;
         if (c == t->cc[TTY_VINTR])  sig = SIGINT;
@@ -107,12 +112,14 @@ void tty_input_push(char c) {
         else if (c == t->cc[TTY_VSUSP]) sig = SIGTSTP;
         if (sig) {
             t->sig_pending = sig;
+            spinlock_release(&t->state_lock, _sf);
             /* Schedule work only if the previous item completed */
             if (t->sig_work.state == 2)
                 work_queue_schedule(&system_wq, &t->sig_work);
             return; /* consume the byte — don't push to buffer */
         }
     }
+    spinlock_release(&t->state_lock, _sf);
 
     /* Normal path: push into raw ring buffer */
     cpu_flags_t _sflags;
@@ -155,14 +162,17 @@ static char tty_read_raw_byte(void) {
 /* ── Internal: send signal to foreground process group ──────────────────── */
 
 static void tty_signal_fg(int sig) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&tty_console.state_lock, &_sf);
     uint64_t pgid = tty_console.fg_pgid;
+    spinlock_release(&tty_console.state_lock, _sf);
     if (pgid <= 0) return;
     signal_send_pgid((pid_t)pgid, sig);
 }
 
 /* ── Line discipline processing (returns when a line is ready) ──────────── */
 
-static int tty_process_canon(char* buf, uint64_t count) {
+static int tty_process_canon(char* buf, uint64_t count, uint32_t lflag, const char* cc) {
     tty_t* t = &tty_console;
     int nread = 0;
 
@@ -207,32 +217,32 @@ static int tty_process_canon(char* buf, uint64_t count) {
         char c = tty_read_raw_byte();
 
         /* Check for signal characters */
-        if (t->lflag & TTY_ISIG) {
-            if (c == t->cc[TTY_VINTR]) {
-                if (t->lflag & TTY_ECHO) kprintf("^C\n");
+        if (lflag & TTY_ISIG) {
+            if (c == cc[TTY_VINTR]) {
+                if (lflag & TTY_ECHO) kprintf("^C\n");
                 tty_signal_fg(SIGINT);
                 return -1; /* read interrupted */
             }
-            if (c == t->cc[TTY_VQUIT]) {
-                if (t->lflag & TTY_ECHO) kprintf("^\\\n");
+            if (c == cc[TTY_VQUIT]) {
+                if (lflag & TTY_ECHO) kprintf("^\\\n");
                 tty_signal_fg(SIGQUIT);
                 return -1;
             }
-            if (c == t->cc[TTY_VSUSP]) {
-                if (t->lflag & TTY_ECHO) kprintf("^Z\n");
+            if (c == cc[TTY_VSUSP]) {
+                if (lflag & TTY_ECHO) kprintf("^Z\n");
                 tty_signal_fg(SIGTSTP);
                 return -1;
             }
         }
 
         /* Canonical mode processing */
-        if (t->lflag & TTY_ICANON) {
+        if (lflag & TTY_ICANON) {
             if ((c == '\b' || c == 127) && t->line_pos > 0) {
                 /* Backspace / erase */
                 t->line_pos--;
-                if (t->lflag & TTY_ECHOE) {
+                if (lflag & TTY_ECHOE) {
                     kprintf("\b \b");
-                } else if (t->lflag & TTY_ECHO) {
+                } else if (lflag & TTY_ECHO) {
                     kprintf("\b \b");
                 }
                 continue;
@@ -247,13 +257,13 @@ static int tty_process_canon(char* buf, uint64_t count) {
                     t->line_pos++;
                 }
                 t->line_count++;
-                if (t->lflag & TTY_ECHO) kputchar('\n');
+                if (lflag & TTY_ECHO) kputchar('\n');
 
                 /* A line is ready — next loop iteration will copy it */
                 continue;
             }
 
-            if (c == t->cc[TTY_VEOF]) {
+            if (c == cc[TTY_VEOF]) {
                 /* Ctrl-D: return EOF condition */
                 if (t->line_pos > 0) {
                     /* If there's partial line data, flush it as if newline */
@@ -269,7 +279,7 @@ static int tty_process_canon(char* buf, uint64_t count) {
             /* Regular character */
             if (t->line_pos < (int)sizeof(t->line_buf) - 1) {
                 t->line_buf[t->line_pos++] = c;
-                if (t->lflag & TTY_ECHO) {
+                if (lflag & TTY_ECHO) {
                     if (c < 32 && c != '\t') {
                         kprintf("^%c", (char)('A' + c - 1));
                     } else {
@@ -282,7 +292,7 @@ static int tty_process_canon(char* buf, uint64_t count) {
             /* Raw mode: return bytes immediately */
             if (nread < (int)count) {
                 buf[nread++] = c;
-                if (t->lflag & TTY_ECHO) kputchar(c);
+                if (lflag & TTY_ECHO) kputchar(c);
             }
             if (nread > 0) return nread;
         }
@@ -293,7 +303,10 @@ static int tty_process_canon(char* buf, uint64_t count) {
 static int tty_is_bg(void) {
     process_t* proc = current_thread ? current_thread->proc : NULL;
     if (!proc) return 0;
+    cpu_flags_t _sf;
+    spinlock_acquire(&tty_console.state_lock, &_sf);
     uint64_t fg = tty_console.fg_pgid;
+    spinlock_release(&tty_console.state_lock, _sf);
     if (fg <= 0) return 0;
     return (proc->pgid != fg) ? 1 : 0;
 }
@@ -315,6 +328,13 @@ int64_t tty_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offse
     (void)node; /* always uses tty_console */
 
     tty_t* t = &tty_console;
+    cpu_flags_t _sf;
+    uint32_t lflag;
+    char cc[TTY_CC_NCCS];
+    spinlock_acquire(&t->state_lock, &_sf);
+    lflag = t->lflag;
+    kmemcpy(cc, t->cc, TTY_CC_NCCS);
+    spinlock_release(&t->state_lock, _sf);
 
     /* SIGTTIN: background process reading from TTY */
     if (tty_is_bg()) {
@@ -326,8 +346,8 @@ int64_t tty_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offse
         }
     }
 
-    if (t->lflag & TTY_ICANON) {
-        int ret = tty_process_canon((char*)buf, count);
+    if (lflag & TTY_ICANON) {
+        int ret = tty_process_canon((char*)buf, count, lflag, cc);
         if (ret < 0) return 0; /* signal interrupted → return 0 bytes */
         return ret;
     }
@@ -336,22 +356,22 @@ int64_t tty_vfs_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offse
     int nread = 0;
     while (nread < (int)count) {
         char c = tty_read_raw_byte();
-        if (t->lflag & TTY_ISIG) {
-            if (c == t->cc[TTY_VINTR]) {
+        if (lflag & TTY_ISIG) {
+            if (c == cc[TTY_VINTR]) {
                 tty_signal_fg(SIGINT);
                 return nread > 0 ? nread : 0;
             }
-            if (c == t->cc[TTY_VSUSP]) {
+            if (c == cc[TTY_VSUSP]) {
                 tty_signal_fg(SIGTSTP);
                 return nread > 0 ? nread : 0;
             }
-            if (c == t->cc[TTY_VQUIT]) {
+            if (c == cc[TTY_VQUIT]) {
                 tty_signal_fg(SIGQUIT);
                 return nread > 0 ? nread : 0;
             }
         }
         ((char*)buf)[nread++] = c;
-        if (t->lflag & TTY_ECHO) kputchar(c);
+        if (lflag & TTY_ECHO) kputchar(c);
     }
     return nread;
 }
@@ -362,8 +382,13 @@ int64_t tty_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, uint64_
 
     tty_t* t = &tty_console;
 
+    cpu_flags_t _sf;
+    spinlock_acquire(&t->state_lock, &_sf);
+    uint32_t lflag = t->lflag;
+    spinlock_release(&t->state_lock, _sf);
+
     /* SIGTTOU: background process writing to TTY with TOSTOP */
-    if (tty_is_bg() && (t->lflag & TTY_TOSTOP)) {
+    if (tty_is_bg() && (lflag & TTY_TOSTOP)) {
         process_t* proc = current_thread ? current_thread->proc : NULL;
         if (proc) {
             signal_send(proc->pid, SIGTTOU);
@@ -386,13 +411,16 @@ int64_t tty_vfs_write(vfs_node_t* node, const void* buf, uint64_t count, uint64_
 int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp) {
     (void)node;
     tty_t* t = &tty_console;
+    cpu_flags_t _sf;
 
     switch (request) {
         case TCGETATTR: {
             termios_t ti;
+            spinlock_acquire(&t->state_lock, &_sf);
             ti.c_lflag = t->lflag;
             for (int i = 0; i < TTY_CC_NCCS; i++)
                 ti.c_cc[i] = t->cc[i];
+            spinlock_release(&t->state_lock, _sf);
             if (copy_to_user(argp, &ti, sizeof(ti)) != 0)
                 return -1;
             return 0;
@@ -401,13 +429,17 @@ int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp) {
             termios_t ti;
             if (copy_from_user(&ti, argp, sizeof(ti)) != 0)
                 return -1;
+            spinlock_acquire(&t->state_lock, &_sf);
             t->lflag = ti.c_lflag;
             for (int i = 0; i < TTY_CC_NCCS; i++)
                 t->cc[i] = ti.c_cc[i];
+            spinlock_release(&t->state_lock, _sf);
             return 0;
         }
         case TIOCGPGRP: {
+            spinlock_acquire(&t->state_lock, &_sf);
             pid_t pgid = (pid_t)t->fg_pgid;
+            spinlock_release(&t->state_lock, _sf);
             if (copy_to_user(argp, &pgid, sizeof(pgid)) != 0)
                 return -1;
             return 0;
@@ -416,7 +448,9 @@ int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp) {
             pid_t pgid;
             if (copy_from_user(&pgid, argp, sizeof(pgid)) != 0)
                 return -1;
+            spinlock_acquire(&t->state_lock, &_sf);
             t->fg_pgid = (uint64_t)pgid;
+            spinlock_release(&t->state_lock, _sf);
             return 0;
         }
         default:
@@ -427,9 +461,16 @@ int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp) {
 /* ── Job control ────────────────────────────────────────────────────────── */
 
 uint64_t tty_get_fg_pgid(void) {
-    return tty_console.fg_pgid;
+    cpu_flags_t _sf;
+    spinlock_acquire(&tty_console.state_lock, &_sf);
+    uint64_t pg = tty_console.fg_pgid;
+    spinlock_release(&tty_console.state_lock, _sf);
+    return pg;
 }
 
 void tty_set_fg_pgid(uint64_t pgid) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&tty_console.state_lock, &_sf);
     tty_console.fg_pgid = pgid;
+    spinlock_release(&tty_console.state_lock, _sf);
 }

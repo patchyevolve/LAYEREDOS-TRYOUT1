@@ -63,6 +63,43 @@
 
 #define SYS_FCNTL         53
 
-#define SYSCALL_COUNT 54
+#define SYS_CAPGET         54
+#define SYS_CAPSET         55
+#define SYS_AUDIT_READ     56
+#define SYS_GETUID         57
+#define SYS_GETEUID        58
+#define SYS_GETGID         59
+#define SYS_GETEGID        60
+#define SYS_SETUID         61
+#define SYS_SETGID         62
+#define SYS_GETRANDOM      63
+#define SYS_SET_SSF        64
+#define SYS_SOCKETPAIR      65
+#define SYS_PRCTL           66
+#define SYS_SECURE_BOOT      67
+#define SYS_UNSHARE          68
+#define SYS_VETH_PAIR        69
+#define SYS_NETCONFIG         70
+#define SYS_VETH_MOVE         71
+#define SYS_CHMOD             72
+#define SYS_LINK              73
+#define SYS_SYMLINK           74
+#define SYS_READLINK          75
+#define SYS_RMDIR             76
+#define SYS_FTRUNCATE         77
+#define SYS_DUP               78
+#define SYS_ACCESS            79
+#define SYS_UNAME             80
+#define SYS_NANOSLEEP         81
+#define SYS_SYNC              82
+#define SYS_FSYNC             83
+#define SYS_FCHMOD            84
+#define SYS_FSTAT             85
+#define SYS_LSTAT             86
+#define SYS_MOUNT             87
+#define SYS_UMOUNT            88
+#define SYS_SCHED_SETAFFINITY 89
+
+#define SYSCALL_COUNT 90
 
 #endif

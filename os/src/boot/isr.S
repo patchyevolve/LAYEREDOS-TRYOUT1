@@ -69,6 +69,31 @@ ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
 
+ISR_NOERR 48
+ISR_NOERR 49
+ISR_NOERR 50
+ISR_NOERR 51
+ISR_NOERR 52
+ISR_NOERR 53
+ISR_NOERR 54
+ISR_NOERR 55
+ISR_NOERR 56
+ISR_NOERR 57
+ISR_NOERR 58
+ISR_NOERR 59
+ISR_NOERR 60
+ISR_NOERR 61
+ISR_NOERR 62
+ISR_NOERR 63
+ISR_NOERR 64
+ISR_NOERR 65
+ISR_NOERR 66
+ISR_NOERR 67
+ISR_NOERR 68
+ISR_NOERR 69
+ISR_NOERR 70
+ISR_NOERR 71
+
 ISR_NOERR 128
 
 .extern interrupt_handler
@@ -100,10 +125,9 @@ isr_common_handler:
     movl boot_complete(%rip), %eax
     testl %eax, %eax
     jz 1f
-    movl need_reschedule(%rip), %eax
+    call sched_isr_check
     testl %eax, %eax
     jz 1f
-    movl $0, need_reschedule(%rip)
     call schedule
 
 1:
@@ -137,5 +161,8 @@ isr_vectors:
 .quad isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
 .quad isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
 .quad isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47
-.zero 8 * 80
+.quad isr48, isr49, isr50, isr51, isr52, isr53, isr54, isr55
+.quad isr56, isr57, isr58, isr59, isr60, isr61, isr62, isr63
+.quad isr64, isr65, isr66, isr67, isr68, isr69, isr70, isr71
+.zero 8 * 56
 .quad isr128

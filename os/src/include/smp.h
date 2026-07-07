@@ -13,6 +13,15 @@ extern int smp_flags;
 extern int smp_ipi_works;   /* 0 = cross-CPU IPIs not reliable (KVM), 1 = working */
 extern volatile int ap_ready_count;
 
+/* CPU state tracking for hotplug */
+typedef enum {
+    CPU_STATE_OFFLINE = 0,
+    CPU_STATE_ONLINE,
+    CPU_STATE_GOING_DOWN
+} cpu_state_t;
+extern cpu_state_t cpu_state[MAX_CPUS];
+extern volatile int ap_ipi_test_counter;
+
 typedef struct {
     uint32_t reserved0;
     uint64_t rsp[3];
@@ -58,7 +67,8 @@ typedef struct {
     tss64_t tss;
 
     /* Per-CPU stacks */
-    uint8_t ist_stack0[8192] __attribute__((aligned(16)));
+    uint8_t ist_stack0[8192] __attribute__((aligned(16)));  /* IST1: #DF */
+    uint8_t ist_stack1[8192] __attribute__((aligned(16)));  /* IST2: #PF */
     uint8_t user_stack0[16384] __attribute__((aligned(16)));
 
     /* Per-CPU PMM cache (atomic flag avoids sync.h include) */
@@ -93,10 +103,13 @@ static inline per_cpu_data_t* smp_this_cpu(void) {
 #define IPI_VEC_RESCHEDULE   0x41
 #define IPI_VEC_TLB_SHOOTDOWN 0x42
 #define IPI_VEC_PANIC        0x43
+#define IPI_VEC_OFFLINE      0x44
 
 /* IPI helpers */
 void smp_send_reschedule(int cpu);
 void smp_test_ipi(void);
+void smp_test_cross_cpu_ipi(void);
+void smp_test_ap_preemption(void);
 
 /* TLB shootdown */
 void smp_tlb_shootdown(uint64_t start, uint64_t end);
@@ -105,6 +118,16 @@ void smp_handle_tlb_shootdown(void);
 
 /* AP entry point (called by trampoline on APs) */
 void ap_entry(per_cpu_data_t* pcp);
+
+/* Hotplug IPI handler — marks CPU as offline and parks it */
+void smp_handle_offline(void);
+
+/* CPU hotplug */
+err_t smp_cpu_offline(int cpu);
+err_t smp_cpu_online(int cpu);
+
+/* TSS diagnostic */
+uint64_t smp_get_tss_ist(int cpu, int ist_idx);
 
 /* Trampoline symbols (physical addresses in .trampoline section) */
 extern char _trampoline_start[], _trampoline_end[];

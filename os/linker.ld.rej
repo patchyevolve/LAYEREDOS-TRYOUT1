@@ -1,0 +1,14 @@
+diff a/os/linker.ld b/os/linker.ld	(rejected hunks)
+@@ -22,6 +22,12 @@ SECTIONS {
+         *(.note.pvh)
+     }
+ 
++    .trampoline : {
++        _trampoline_start = .;
++        *(.trampoline)
++        _trampoline_end = .;
++    }
++
+     . += KERNEL_VMA_BASE;
+ 
+     .text : AT(ADDR(.text) - KERNEL_VMA_BASE) {

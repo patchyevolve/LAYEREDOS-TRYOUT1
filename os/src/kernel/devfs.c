@@ -142,6 +142,8 @@ static int devfs_vfs_stat(vfs_node_t* node, vfs_stat_t* st) {
     st->mtime = 0;
     st->ctime = 0;
     st->fs_flags = 0;
+    st->uid  = node->uid;
+    st->gid  = node->gid;
     return 0;
 }
 

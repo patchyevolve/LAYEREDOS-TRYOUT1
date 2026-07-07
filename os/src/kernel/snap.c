@@ -19,7 +19,7 @@ typedef struct {
 } snap_entry_t;
 
 static snap_entry_t snapshots[SNAP_MAX];
-static spinlock_t snap_lock;
+static spinlock_t snap_lock = { .name = "snap_lock" };
 
 int snapshot_count(void) {
     int n = 0;

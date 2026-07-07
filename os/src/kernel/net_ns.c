@@ -44,13 +44,13 @@ net_ns_t* net_ns_alloc(void) {
 }
 
 void net_ns_retain(net_ns_t* ns) {
-    if (ns) ns->refcount++;
+    if (ns) __sync_fetch_and_add(&ns->refcount, 1);
 }
 
 void net_ns_release(net_ns_t* ns) {
     if (!ns || ns == &init_net_ns) return;
-    ns->refcount--;
-    if (ns->refcount <= 0) {
+    int old = __sync_fetch_and_sub(&ns->refcount, 1);
+    if (old <= 1) {
         free_arrays(ns);
         kfree(ns);
     }

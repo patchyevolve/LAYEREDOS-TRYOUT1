@@ -63,11 +63,12 @@ typedef struct tty {
     int line_count;   /* number of completed lines */
     wait_queue_t canon_waitq;
 
-    /* Termios-like settings */
+    /* Termios-like settings (protected by state_lock) */
+    spinlock_t state_lock;
     uint32_t lflag;
     char cc[TTY_CC_NCCS];
 
-    /* Job control */
+    /* Job control (protected by state_lock) */
     uint64_t fg_pgid;
     uint64_t session;
 

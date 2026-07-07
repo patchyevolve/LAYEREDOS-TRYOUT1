@@ -131,6 +131,9 @@ static pty_t* pty_alloc(void) {
             p->id = i;
             spinlock_init(&p->m_lock, "pty_m");
             spinlock_init(&p->s_raw_lock, "pty_s_raw");
+            wait_queue_init(&p->m_waitq);
+            wait_queue_init(&p->s_raw_waitq);
+            wait_queue_init(&p->canon_waitq);
             p->lflag = TTY_ECHO | TTY_ICANON | TTY_ISIG | TTY_ECHOE;
             p->cc[TTY_VINTR]  = TTY_DEF_INTR;
             p->cc[TTY_VQUIT]  = TTY_DEF_QUIT;

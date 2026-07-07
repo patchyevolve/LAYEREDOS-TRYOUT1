@@ -29,5 +29,6 @@ typedef struct __attribute__((packed)) {
 err_t arp_init(void);
 int   arp_resolve(ipv4_addr_t ip, uint8_t* mac, int timeout_ms);
 void  arp_set(ipv4_addr_t ip, const uint8_t* mac);
+int   arp_del(ipv4_addr_t ip);
 
 #endif

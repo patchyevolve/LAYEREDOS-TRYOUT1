@@ -43,28 +43,10 @@ thread_trampoline:
 .global user_thread_entry
 .type user_thread_entry, @function
 user_thread_entry:
-    /* Save user RIP in r15 for debugging */
-    movq 8(%rsp), %r15
-
-    popq %rax
-    popq %rbx
-    popq %rcx
-    popq %rdx
-    popq %rsi
-    popq %rdi
-    popq %rbp
-    popq %r8
-    popq %r9
-    popq %r10
-    popq %r11
-    popq %r12
-    popq %r13
-    popq %r14
-    popq %r15
-
-    addq $16, %rsp
-
-    iretq
+    xorq %rdi, %rdi
+    call thread_exit
+    cli
+    hlt
 
 .global fork_child_entry
 .type fork_child_entry, @function

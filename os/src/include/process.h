@@ -52,6 +52,23 @@ typedef struct process_t {
     // Working directory
     char cwd[256];
 
+    // Virtual memory areas (mmap tracking)
+    void* vmas;  /* singly-linked VMA list (vma_t) */
+    spinlock_t vma_lock;
+
+    // Network namespace
+    struct net_ns* net_ns;
+
+    // Security & capabilities
+    uint64_t caps;                    /* capability bitmask (see security.h) */
+    uint64_t uid, gid, euid, egid;    /* user/group identity */
+    int no_new_privs;
+    uint64_t syscall_mask[4];         /* 256-bit syscall filter mask */
+
+    // Fork tracking
+    int64_t fork_count;   /* number of forks this process has done */
+    int64_t fork_limit;   /* -1 = unlimited (default), >=0 = hard limit */
+
     // File descriptors (per-process fd table)
     vfs_fd_t fds[MAX_FDS];
 } process_t;
@@ -63,6 +80,7 @@ err_t process_exit(process_t* proc, int exit_code);
 void process_reap(process_t* proc);
 process_t* process_find(pid_t pid);
 pid_t process_get_current_pid(void);
+uint64_t aslr_rand(void);
 void signal_send(pid_t pid, int sig);
 void signal_process(process_t* proc);
 void signal_send_pgid(pid_t pgid, int sig);

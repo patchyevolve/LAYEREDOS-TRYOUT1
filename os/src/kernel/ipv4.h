@@ -22,6 +22,7 @@ typedef struct __attribute__((packed)) {
 } ipv4_hdr_t;
 
 #define IPV4_HDR_LEN 20
+#define IPV4_DISPATCH_SLOTS 8
 
 typedef void (*ipv4_handler_t)(ipv4_addr_t src, ipv4_addr_t dst,
                                 uint8_t protocol,
@@ -34,6 +35,8 @@ int  ipv4_send_from(ipv4_addr_t src, ipv4_addr_t dst, uint8_t protocol,
                     const uint8_t* data, uint32_t len);
 int  ipv4_register_handler(uint8_t protocol, ipv4_handler_t handler);
 void ipv4_set_addr(ipv4_addr_t addr);
+void ipv4_set_addr_prefix(ipv4_addr_t addr, int prefix_len);
 ipv4_addr_t ipv4_get_addr(void);
+int  ipv4_get_prefix_len(void);
 
 #endif

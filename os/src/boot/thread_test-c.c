@@ -145,6 +145,44 @@ static int fcntl_test(void) {
     return 0;
 }
 
+static int file_mmap_test(void) {
+    write(STDOUT_FILENO, "--- file_mmap_test ---\n", 24);
+    int fd = open("/hello-c.elf", 0);
+    if (fd < 0) {
+        write(STDOUT_FILENO, "FAIL: open /hello-c.elf\n", 25);
+        return 1;
+    }
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz <= 0) {
+        write(STDOUT_FILENO, "FAIL: lseek end\n", 17);
+        close(fd);
+        return 1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    size_t page_sz = (sz + 4095) & ~4095;
+    void* p = mmap(NULL, page_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) {
+        write(STDOUT_FILENO, "FAIL: file mmap\n", 17);
+        close(fd);
+        return 1;
+    }
+    unsigned char* data = (unsigned char*)p;
+    if (data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F') {
+        write(STDOUT_FILENO, "FAIL: mmap ELF magic mismatch\n", 31);
+        munmap(p, page_sz);
+        close(fd);
+        return 1;
+    }
+    if (munmap(p, page_sz) < 0) {
+        write(STDOUT_FILENO, "FAIL: file munmap\n", 19);
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    write(STDOUT_FILENO, "file_mmap_test: PASS\n", 22);
+    return 0;
+}
+
 static int clone_test(void) {
     write(STDOUT_FILENO, "--- clone_test ---\n", 20);
     if (pipe(thread_pipe) < 0) {
@@ -208,6 +246,110 @@ static int dup2_test(void) {
     return 0;
 }
 
+static int netns_test(void) {
+    write(STDOUT_FILENO, "--- netns_test ---\n", 20);
+
+    netconfig_req_t nr;
+    memset(&nr, 0, sizeof(nr));
+    int idx = veth_pair(&nr);
+    if (idx < 0) {
+        write(STDOUT_FILENO, "veth_pair: FAIL\n", 17);
+        return 1;
+    }
+    write(STDOUT_FILENO, "veth_pair: PASS\n", 17);
+
+    int ret = unshare(CLONE_NEWNET);
+    if (ret < 0) {
+        write(STDOUT_FILENO, "unshare: FAIL\n", 15);
+        return 1;
+    }
+    write(STDOUT_FILENO, "unshare: PASS\n", 15);
+
+    /* veth_pair should also work in the new namespace */
+    memset(&nr, 0, sizeof(nr));
+    int idx2 = veth_pair(&nr);
+    if (idx2 < 0) {
+        write(STDOUT_FILENO, "veth_pair(2): FAIL\n", 20);
+        return 1;
+    }
+    write(STDOUT_FILENO, "veth_pair(2): PASS\n", 20);
+
+    /* test netconfig GET_IPV4 in empty namespace */
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_GET_IPV4;
+    if (netconfig(&nr) < 0) {
+        write(STDOUT_FILENO, "netconfig GET_IPV4: FAIL\n", 26);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig GET_IPV4: PASS\n", 26);
+
+    /* test netconfig SET_IPV4 */
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_SET_IPV4;
+    nr.addr4 = ipv4_from_bytes(192, 168, 99, 1);
+    nr.prefix_len = 24;
+    if (netconfig(&nr) < 0) {
+        write(STDOUT_FILENO, "netconfig SET_IPV4: FAIL\n", 26);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig SET_IPV4: PASS\n", 26);
+
+    /* verify back */
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_GET_IPV4;
+    if (netconfig(&nr) < 0 || nr.addr4.bytes[2] != 99) {
+        write(STDOUT_FILENO, "netconfig GET_IPV4 verify: FAIL\n", 33);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig GET_IPV4 verify: PASS\n", 33);
+
+    /* test route_add/del */
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_ADD_ROUTE_V4;
+    nr.addr4 = ipv4_from_bytes(10, 0, 0, 0);
+    nr.prefix_len = 8;
+    nr.gw4 = ipv4_from_bytes(192, 168, 99, 2);
+    if (netconfig(&nr) < 0) {
+        write(STDOUT_FILENO, "netconfig ADD_ROUTE: FAIL\n", 27);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig ADD_ROUTE: PASS\n", 27);
+
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_DEL_ROUTE_V4;
+    nr.addr4 = ipv4_from_bytes(10, 0, 0, 0);
+    nr.prefix_len = 8;
+    if (netconfig(&nr) < 0) {
+        write(STDOUT_FILENO, "netconfig DEL_ROUTE: FAIL\n", 27);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig DEL_ROUTE: PASS\n", 27);
+
+    /* test arp set/del */
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_SET_ARP;
+    nr.addr4 = ipv4_from_bytes(192, 168, 99, 2);
+    nr.mac[0] = 0x52; nr.mac[1] = 0x54; nr.mac[2] = 0x00;
+    nr.mac[3] = 0x12; nr.mac[4] = 0x34; nr.mac[5] = 0x99;
+    if (netconfig(&nr) < 0) {
+        write(STDOUT_FILENO, "netconfig SET_ARP: FAIL\n", 25);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig SET_ARP: PASS\n", 25);
+
+    memset(&nr, 0, sizeof(nr));
+    nr.op = NETCONFIG_DEL_ARP;
+    nr.addr4 = ipv4_from_bytes(192, 168, 99, 2);
+    if (netconfig(&nr) < 0) {
+        write(STDOUT_FILENO, "netconfig DEL_ARP: FAIL\n", 25);
+        return 1;
+    }
+    write(STDOUT_FILENO, "netconfig DEL_ARP: PASS\n", 25);
+
+    write(STDOUT_FILENO, "netns_test: PASS\n", 18);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     write(STDOUT_FILENO, "=== threading/libc syscall test ===\n", 36);
@@ -220,6 +362,8 @@ int main(int argc, char** argv) {
     fail |= mprotect_test();
     fail |= fcntl_test();
     fail |= clone_test();
+    fail |= file_mmap_test();
+    fail |= netns_test();
     if (fail)
         write(STDOUT_FILENO, "SOME TESTS FAILED\n", 19);
     else

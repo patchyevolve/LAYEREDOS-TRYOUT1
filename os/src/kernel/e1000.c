@@ -243,14 +243,18 @@ static err_t e1000_init_nic(pci_device_t* dev) {
 /* ── NIC abstraction ────────────────────────────────────────────────────── */
 nic_t nic;
 
-static inline void e1000_tx_lock_acquire(void) {
+static inline cpu_flags_t e1000_tx_lock_acquire(void) {
+    cpu_flags_t _eflags;
+    asm volatile("pushfq; popq %0; cli" : "=r"(_eflags));
     while (__sync_lock_test_and_set(&e1000_tx_lock, 1)) {
-        hal_udelay(1);
+        asm volatile("sti; pause; cli");
     }
+    return _eflags;
 }
 
-static inline void e1000_tx_lock_release(void) {
+static inline void e1000_tx_lock_release(cpu_flags_t flags) {
     __sync_lock_release(&e1000_tx_lock);
+    if (flags & 0x200) asm volatile("sti");
 }
 
 static err_t e1000_send(const struct nic* nic, const uint8_t* frame, uint32_t len) {
@@ -278,7 +282,7 @@ static err_t e1000_send(const struct nic* nic, const uint8_t* frame, uint32_t le
     }
 
     /* Critical section: claim descriptor, copy data, advance head */
-    e1000_tx_lock_acquire();
+    cpu_flags_t _txfl = e1000_tx_lock_acquire();
 
     /* Re-check head in case another thread advanced it */
     tx_next = e1000_tx_head % E1000_NUM_TX_DESC;
@@ -303,7 +307,7 @@ static err_t e1000_send(const struct nic* nic, const uint8_t* frame, uint32_t le
     e1000_tx_head++;
     e1000_reg_write(E1000_TDT, e1000_tx_head % E1000_NUM_TX_DESC);
 
-    e1000_tx_lock_release();
+    e1000_tx_lock_release(_txfl);
     return ERR_OK;
 }
 
@@ -378,45 +382,17 @@ void nic_reg_write(uint32_t off, uint32_t val) {
     e1000_reg_write(off, val);
 }
 void nic_dump_rx_ring(void) {
-    if (!e1000_present) { kprintf("[E1000] RX: not present\n"); return; }
+    if (!e1000_present) return;
     int rdh = e1000_reg_read(E1000_RDH);
     int rdt = e1000_reg_read(E1000_RDT);
-    uint32_t rdbal = e1000_reg_read(E1000_RDBAL);
-    uint32_t rdbah = e1000_reg_read(E1000_RDBAH);
-    kprintf("[E1000] RX ring: RDH=%d RDT=%d cur=%d base=%x:%x ring_virt=%p\n",
-            rdh, rdt, e1000_rx_cur, rdbah, rdbal, (void*)e1000_rx_ring);
-    /* Flush cache then read each descriptor's status to see QEMU writes */
-    for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
-        __asm__ volatile("clflush %0" : "+m" (e1000_rx_ring[i].status));
-    }
-    __sync_synchronize();
-    for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
-        uint8_t s = e1000_rx_ring[i].status;
-        if (s || i < 4) {
-            kprintf("  [%d] addr=%p status=0x%02x len=%u err=0x%02x\n",
-                    i, (void*)(uint64_t)e1000_rx_ring[i].addr,
-                    s, e1000_rx_ring[i].length, e1000_rx_ring[i].errors);
-        }
-    }
-    /* Dump first 16 bytes of buffer 0 to see if hardware wrote data there */
-    kprintf("[E1000] RX buf[0] first 16 bytes: ");
-    for (int i = 0; i < 16 && i < 2048; i++) {
-        kprintf("%02x ", e1000_rx_bufs[0][i]);
-    }
-    kprintf("\n");
+    (void)rdh; (void)rdt;
+    KDEBUG("[E1000] RX ring: RDH=%d RDT=%d cur=%d\n", rdh, rdt, e1000_rx_cur);
 }
 void nic_dump_tx_ring(void) {
-    if (!e1000_present) { kprintf("[E1000] TX: not present\n"); return; }
-    int tdh = e1000_reg_read(E1000_TDH);
-    int tdt = e1000_reg_read(E1000_TDT);
-    kprintf("[E1000] TX ring: TDH=%d TDT=%d head=%d tail=%d\n",
-            tdh, tdt, e1000_tx_head, e1000_tx_tail);
-    for (int i = 0; i < 4; i++) {
-        kprintf("  [%d] addr=%p status=0x%02x cmd=0x%02x len=%u\n",
-                i, (void*)(uint64_t)e1000_tx_ring[i].addr,
-                e1000_tx_ring[i].status, e1000_tx_ring[i].cmd,
-                e1000_tx_ring[i].length);
-    }
+    if (!e1000_present) return;
+    KDEBUG("[E1000] TX ring: TDH=%d TDT=%d head=%d tail=%d\n",
+            e1000_reg_read(E1000_TDH), e1000_reg_read(E1000_TDT),
+            e1000_tx_head, e1000_tx_tail);
 }
 
 /* ── Multicast Table Array programming ──────────────────────────────────── */

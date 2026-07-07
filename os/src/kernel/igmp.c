@@ -3,8 +3,9 @@
 #include "ipv4.h"
 #include "e1000.h"
 #include "route.h"
+#include "net_ns.h"
+#include "sync.h"
 
-#define IGMP_MAX_GROUPS 8
 #define IGMP_HDR_SIZE   8
 
 typedef struct __attribute__((packed)) {
@@ -14,9 +15,10 @@ typedef struct __attribute__((packed)) {
     uint32_t group;
 } igmp_hdr_t;
 
-static int igmp_initialized = 0;
-static uint32_t igmp_groups[IGMP_MAX_GROUPS];
-static int      igmp_group_used[IGMP_MAX_GROUPS];
+#define igmp_initialized (get_current_ns()->igmp_initialized)
+#define igmp_groups (get_current_ns()->igmp_groups)
+#define igmp_group_used (get_current_ns()->igmp_group_used)
+#define igmp_lock (get_current_ns()->igmp_lock)
 
 static uint16_t igmp_checksum(const void* data, uint32_t len) {
     uint32_t sum = 0;
@@ -29,7 +31,6 @@ static uint16_t igmp_checksum(const void* data, uint32_t len) {
     return __builtin_bswap16(~sum & 0xFFFF);
 }
 
-/* Convert IPv4 mcast addr to Ethernet MAC (01:00:5E + lower 23 bits) */
 static void igmp_mac_from_ipv4(uint32_t ip, uint8_t* mac) {
     mac[0] = 0x01;
     mac[1] = 0x00;
@@ -54,7 +55,6 @@ static void igmp_send_report(uint32_t group) {
     }};
     ipv4_send(dst, 2, buf, IGMP_HDR_SIZE);
 
-    /* Program MTA for hardware filtering */
     uint8_t mac[6];
     igmp_mac_from_ipv4(group, mac);
     e1000_mta_set(mac);
@@ -76,50 +76,66 @@ static void igmp_send_leave(uint32_t group) {
 int igmp_mcast_join(uint32_t group_addr) {
     if ((group_addr & 0xF0000000) != 0xE0000000)
         return ERR_INVAL;
-    if (igmp_mcast_is_member(group_addr))
-        return ERR_OK;
 
+    cpu_flags_t flags;
+    spinlock_acquire(&igmp_lock, &flags);
+    for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
+        if (igmp_group_used[i] && igmp_groups[i] == group_addr) {
+            spinlock_release(&igmp_lock, flags);
+            return ERR_OK;
+        }
+    }
     for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
         if (!igmp_group_used[i]) {
             igmp_groups[i] = group_addr;
             igmp_group_used[i] = 1;
-            kprintf("[IGMP] Joined group %d.%d.%d.%d (0x%x)\n",
-                    (uint8_t)(group_addr>>24), (uint8_t)(group_addr>>16),
-                    (uint8_t)(group_addr>>8), (uint8_t)group_addr, group_addr);
+            spinlock_release(&igmp_lock, flags);
             igmp_send_report(group_addr);
             return ERR_OK;
         }
     }
+    spinlock_release(&igmp_lock, flags);
     return ERR_NOSPACE;
 }
 
 int igmp_mcast_leave(uint32_t group_addr) {
+    cpu_flags_t flags;
+    spinlock_acquire(&igmp_lock, &flags);
     for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
         if (igmp_group_used[i] && igmp_groups[i] == group_addr) {
             igmp_group_used[i] = 0;
+            spinlock_release(&igmp_lock, flags);
             igmp_send_leave(group_addr);
-            kprintf("[IGMP] Left group %d.%d.%d.%d\n",
-                    (uint8_t)(group_addr>>24), (uint8_t)(group_addr>>16),
-                    (uint8_t)(group_addr>>8), (uint8_t)group_addr);
             return ERR_OK;
         }
     }
+    spinlock_release(&igmp_lock, flags);
     return ERR_NOENT;
 }
 
 int igmp_mcast_is_member(uint32_t group_addr) {
+    cpu_flags_t flags;
+    spinlock_acquire(&igmp_lock, &flags);
     for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
-        if (igmp_group_used[i] && igmp_groups[i] == group_addr)
+        if (igmp_group_used[i] && igmp_groups[i] == group_addr) {
+            spinlock_release(&igmp_lock, flags);
             return 1;
+        }
     }
+    spinlock_release(&igmp_lock, flags);
     return 0;
 }
 
 static void igmp_report_all(void) {
+    cpu_flags_t flags;
+    spinlock_acquire(&igmp_lock, &flags);
     for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
-        if (igmp_group_used[i])
-            igmp_send_report(igmp_groups[i]);
+        if (igmp_group_used[i]) {
+            uint32_t g = igmp_groups[i];
+            igmp_send_report(g);
+        }
     }
+    spinlock_release(&igmp_lock, flags);
 }
 
 static void igmp_handler(ipv4_addr_t src, ipv4_addr_t dst,
@@ -142,10 +158,9 @@ static void igmp_handler(ipv4_addr_t src, ipv4_addr_t dst,
 
 void igmp_init(void) {
     if (igmp_initialized) return;
-    kmemset(igmp_groups, 0, sizeof(igmp_groups));
-    kmemset(igmp_group_used, 0, sizeof(igmp_group_used));
 
+    spinlock_init(&igmp_lock, "igmp_lock");
+    igmp_initialized = 1;
     ipv4_register_handler(2, igmp_handler);
     kprintf("[IGMP] Initialized\n");
-    igmp_initialized = 1;
 }

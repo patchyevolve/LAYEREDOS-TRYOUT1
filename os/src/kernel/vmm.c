@@ -2,6 +2,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "hal.h"
+#include "smp.h"
 
 #define PML4_INDEX(v)  (((v) >> 39) & 0x1FF)
 #define PDPT_INDEX(v)  (((v) >> 30) & 0x1FF)
@@ -98,6 +99,8 @@ err_t vmm_unmap_page(uint64_t pml4_phys, uint64_t virt) {
 
 void vmm_flush_tlb_page(uint64_t virt) {
     asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+    /* On SMP, also trigger remote TLB flush */
+    smp_tlb_shootdown_safe(virt, virt + PAGE_SIZE);
 }
 
 err_t vmm_duplicate_user_pages(uint64_t dst_pml4, uint64_t src_pml4) {
@@ -106,6 +109,10 @@ err_t vmm_duplicate_user_pages(uint64_t dst_pml4, uint64_t src_pml4) {
     for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
         if (!(src_entries[pml4_idx] & PAGE_PRESENT)) continue;
         uint64_t src_pdpt_phys = src_entries[pml4_idx] & ~0xFFFULL;
+        /* Skip self-reference (PML4 entry pointing to PML4 itself)
+         * and PID stamp at index 255 (bit 0 set makes it look present). */
+        if (src_pdpt_phys == src_pml4) continue;
+        if (pml4_idx == 255) continue;
         page_entry_t* src_pdpt = (page_entry_t*)PHYS_TO_VIRT(src_pdpt_phys);
         for (int pdpt_idx = 0; pdpt_idx < 512; pdpt_idx++) {
             if (!(src_pdpt[pdpt_idx] & PAGE_PRESENT)) continue;
@@ -241,6 +248,56 @@ err_t vmm_init(void) {
     kprintf("[VMM] Kernel occupies 0x100000 - %lx\n", 0x100000 + kernel_end);
 
     return ERR_OK;
+}
+
+void vmm_split_identity_map(void) {
+    /* Split 2MB superpages in the kernel identity map into 4KB page tables.
+     * This works around a QEMU TCG softmmu TLB bug that silently drops stores
+     * to byte 128 of any 2MB-mapped page under multi-vCPU contention.
+     *
+     * Must be called AFTER all ACPI table parsing (acpi_init, smp_init, apic_init)
+     * but BEFORE any multi-vCPU activity, because:
+     * 1. The page tables overwrite "available" physical pages that may still
+     *    hold ACPI table data — call before ACPI init would corrupt the tables.
+     * 2. Stores through 2MB superpages work reliably on single-CPU (the TCG bug
+     *    only manifests with multiple vCPUs contending the TLB).
+     * After the CR3 reload below, all identity-map accesses use 4KB PTEs. */
+    page_entry_t* pml4 = (page_entry_t*)PHYS_TO_VIRT(kernel_pml4);
+    if (!(pml4[511] & PAGE_PRESENT)) return;
+    uint64_t pdpt_phys = pml4[511] & ~0xFFFULL;
+    page_entry_t* pdpt = (page_entry_t*)PHYS_TO_VIRT(pdpt_phys);
+    if (!(pdpt[511] & PAGE_PRESENT) || (pdpt[511] & PAGE_HUGE)) return;
+    uint64_t pd_phys = pdpt[511] & ~0xFFFULL;
+    page_entry_t* pd = (page_entry_t*)PHYS_TO_VIRT(pd_phys);
+    int split_count = 0;
+    for (int i = 0; i < 512; i++) {
+        if (!(pd[i] & PAGE_PRESENT)) continue;
+        if (!(pd[i] & PAGE_HUGE)) continue;
+
+        uint64_t base = pd[i] & ~0x1FFFFFULL;
+        uint64_t pt_phys = pmm_alloc_page();
+        if (!pt_phys) {
+            kprintf("[VMM] OOM splitting PD[%d], keeping 2MB page\n", i);
+            continue;
+        }
+        page_entry_t* pt = (page_entry_t*)PHYS_TO_VIRT(pt_phys);
+        for (int j = 0; j < 512; j++)
+            pt[j] = (base + j * PAGE_SIZE) | PAGE_PRESENT | PAGE_WRITE;
+
+        pd[i] = pt_phys | PAGE_PRESENT | PAGE_WRITE;
+        split_count++;
+    }
+    if (split_count)
+        kprintf("[VMM] Split %d 2MB superpages -> 4KB page tables\n", split_count);
+
+    /* Full TLB flush: reload CR3 to discard any cached 2MB superpage entries */
+    asm volatile("mov %0, %%cr3" : : "r"(kernel_pml4) : "memory");
+
+    /* Re-apply kernel text/rodata read-only protection — the split created
+     * writable PTEs; vmm_protect_kernel_text() was already called once before
+     * the split on the original 2MB superpage entries, but the split replaced
+     * those entries with 4KB page tables that have PAGE_WRITE set. */
+    vmm_protect_kernel_text();
 }
 
 void vmm_protect_kernel_text(void) {

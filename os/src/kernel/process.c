@@ -392,13 +392,6 @@ err_t process_exit(process_t* proc, int exit_code) {
     }
     spinlock_release(&process_lock, _sflags);
 
-    /* Close all open file descriptors via vfs_close (uses refcounting) */
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (proc->fds[i].used) {
-            vfs_close(i);
-        }
-    }
-
     /* Wake any waitpid waiters */
     sched_wake(&proc->exit_waiters);
 

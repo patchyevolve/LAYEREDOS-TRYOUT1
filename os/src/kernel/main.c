@@ -6,6 +6,8 @@
 #include "shell.h"
 #include "eventbus.h"
 #include "watchdog.h"
+#include "rcu.h"
+#include "lockdep.h"
 #include "kmalloc.h"
 #include "syscall.h"
 #include "process.h"
@@ -25,9 +27,12 @@
 #include "pty.h"
 #include "elf.h"
 #include "work.h"
+#include "smp.h"
 #include "hpet.h"
 #include "apic.h"
+#include "acpi.h"
 #include "swap.h"
+#include "security_test.h"
 #include "nic.h"
 #include "e1000.h"
 #include "eth.h"
@@ -38,6 +43,7 @@
 #include "ipv6.h"
 #include "icmp.h"
 #include "icmpv6.h"
+#include "net_ns.h"
 #include "udp.h"
 #include "tcp.h"
 #include "dns.h"
@@ -45,6 +51,10 @@
 #include "net.h"
 #include "net_test.h"
 #include "storage_test.h"
+#include "kernel_test.h"
+#include "sfs_test.h"
+#include "process_test.h"
+#include "security_test.h"
 #include "dhcp.h"
 #include "slaac.h"
 #include "gpt.h"
@@ -166,14 +176,38 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     boot_report("Syscall Interface");
     syscall_init();
 
+    boot_report("ACPI");
+    acpi_init(mb_info_phys);
+
+    boot_report("SMP - Symmetric Multi-Processing");
+    smp_init();
+
+    boot_report("I/O APIC");
+    apic_ioapic_init();
+
+    boot_report("VMM Identity-map split (workaround QEMU TCG 2MB-page bug)");
+    vmm_split_identity_map();
+
     boot_report("Layer 2 (SCHED) - Scheduler & Threading");
     sched_init();
+
+    boot_report("Lockdep — Lock Dependency Validator");
+    lockdep_init();
+
+    /* Bring up application processors (APs) after scheduler is ready */
+    /* Bring up application processors (APs) after scheduler is ready */
+    smp_init_aps();
+    smp_test_cross_cpu_ipi();
+    smp_test_ap_preemption();
 
     boot_report("Layer 3 (PROCESS) - Process Manager");
     process_init();
 
     boot_report("Work Queue & Deferred Tasks");
     work_init();
+
+    boot_report("RCU - Read-Copy-Update");
+    rcu_init();
 
     boot_report("I/O Subsystem - Keyboard, ATA, PCI, VFS, Ramdisk");
     keyboard_init();
@@ -244,6 +278,7 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     nvme_init();
     gpt_scan();
     nic_init();
+    net_ns_init();
     eth_init();
     arp_init();
     ndp_init();
@@ -288,10 +323,23 @@ void kmain(uint64_t magic, uint64_t mb_info) {
 #ifdef STORAGE_SELF_TEST
     storage_self_test();
 #endif
+#ifdef KERNEL_SELF_TEST
+    kernel_self_test();
+#endif
     kprintf("[BOOT] Formatting SFS on ramdisk...\n");
     sfs_format(block_find("ramdisk"));
     kprintf("[BOOT] Mounting SFS on ramdisk...\n");
     sfs_mount(block_find("ramdisk"));
+
+#ifdef SFS_SELF_TEST
+    sfs_self_test();
+#endif
+#ifdef PROCESS_SELF_TEST
+    process_self_test();
+#endif
+#ifdef SECURITY_SELF_TEST
+    security_self_test();
+#endif
 
     kprintf("[BOOT] Copy boot files from ramdisk into SFS...\n");
     /* Copy boot files from ramdisk into SFS */
@@ -487,22 +535,7 @@ void kmain(uint64_t magic, uint64_t mb_info) {
         }
     }
 
-    kprintf("[BOOT] Auto-test: ELF load test...\n");
-    extern char _binary_build_user_program_elf_start[];
-    extern char _binary_build_user_program_elf_end[];
-    process_t* test_proc = process_create("test", 0);
-    if (test_proc) {
-        size_t elf_len = (uint64_t)_binary_build_user_program_elf_end
-                       - (uint64_t)_binary_build_user_program_elf_start;
-        err_t e = elf_load(test_proc, _binary_build_user_program_elf_start, elf_len);
-        if (e == ERR_OK) {
-            kprintf("  ELF load OK, entry=%llx\n", test_proc->entry_point);
-        } else {
-            kprintf("  ELF load failed: %d\n", e);
-        }
-    }
-
-    kprintf("[BOOT] Auto-test: spawning user mode process...\n");
+    /* Spawn init-user early — this used to hang on SMP, but CLI in kputchar fixes it */
     {
         extern char _binary_build_user_program_elf_start[];
         extern char _binary_build_user_program_elf_end[];
@@ -512,28 +545,39 @@ void kmain(uint64_t magic, uint64_t mb_info) {
                            - (uint64_t)_binary_build_user_program_elf_start;
             err_t e = process_exec(uproc, _binary_build_user_program_elf_start, elf_len);
             if (e == ERR_OK) {
-                kprintf("  User process spawned, pid=%d\n", uproc->pid);
+                kprintf("[BOOT] User process spawned, pid=%d\n", uproc->pid);
             }
         }
     }
 
-    /* NOTE: Stress test moved after network tests (see below) */
+    kprintf("[BOOT] Auto-test: ELF load test...\n");
+    {
+        extern char _binary_build_user_program_elf_start[];
+        extern char _binary_build_user_program_elf_end[];
+        process_t* test_proc = process_create("test", 0);
+        if (test_proc) {
+            size_t elf_len = (uint64_t)_binary_build_user_program_elf_end
+                           - (uint64_t)_binary_build_user_program_elf_start;
+            err_t e = elf_load(test_proc, _binary_build_user_program_elf_start, elf_len);
+            if (e == ERR_OK) {
+                kprintf("  ELF load OK, entry=%llx\n", test_proc->entry_point);
+            } else {
+                kprintf("  ELF load failed: %d\n", e);
+            }
+        }
+    }
 
-    /* ---- Set up network services BEFORE auto-test so listeners are ready ---- */
-
-    /* Start NIC poll thread to drain RX ring immediately */
+    /* ---- Start NIC poll thread before network services ---- */
     {
         thread_t* np = thread_create(nic_poll_thread, NULL, THREAD_DEF_PRIO, "nic-poll");
         if (np) {
+            sched_set_thread_affinity(np, 1ULL); /* pin to CPU 0 — not SMP-safe */
             sched_add_thread(np);
             kprintf("[NET] NIC poll thread created\n");
         }
     }
 
-    /* Drain any queued packets before setting up listeners */
-    eth_rx_poll();
-    thread_sleep(10);
-    eth_rx_poll();
+    /* ---- Set up network services ---- */
 
     /* Set up TCP echo listener on port 80 (IPv4) */
     tcp_conn_t* ls = tcp_listen(AF_INET, 80, on_tcp_echo_connect);
@@ -551,248 +595,51 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     {
         thread_t* uth = thread_create(udp_echo_server, NULL, THREAD_DEF_PRIO, "udp-echo");
         if (uth) {
+            sched_set_thread_affinity(uth, 1ULL); /* pin to CPU 0 — not SMP-safe */
             sched_add_thread(uth);
             kprintf("[NET] UDP echo server thread created\n");
         }
     }
 
-    /* Network auto-test (runs after listeners are active) */
-    kprintf("[BOOT] Auto-test: network...\n");
+    /* NIC status summary */
     if (nic.present) {
-        /* Drain any initial queued packets (DHCP offers etc from SLiRP) */
-        {
-            uint32_t drain = nic_reg_read(E1000_GPRC);
-            kprintf("[NET] Drain: GPRC=%u RDH=%u\n", drain, nic_reg_read(E1000_RDH));
-            uint32_t rdh = nic_reg_read(E1000_RDH);
-            uint32_t rdt = nic_reg_read(E1000_RDT);
-            kprintf("[NET] RDH=%u RDT=%u\n", rdh, rdt);
-            /* Do a single poll to consume anything already in descriptors */
-            eth_rx_poll();
-            drain = nic_reg_read(E1000_GPRC);
-            rdh = nic_reg_read(E1000_RDH);
-            rdt = nic_reg_read(E1000_RDT);
-            kprintf("[NET] After drain: GPRC=%u RDH=%u RDT=%u\n", drain, rdh, rdt);
-        }
-
-        /* Read various registers before test */
-        uint32_t manc = nic_reg_read(E1000_MANC);
-        kprintf("[NET] MANC=0x%08x\n", manc);
-        uint32_t tpt_before = nic_reg_read(E1000_TPT);
-        uint32_t gprc_before = nic_reg_read(E1000_GPRC);
-        uint32_t tdh_before = nic_reg_read(E1000_TDH);
-        uint32_t tdt_before = nic_reg_read(E1000_TDT);
-
         uint32_t status = nic_reg_read(E1000_STATUS);
-        kprintf("[NET] STATUS=0x%08x (FD=%d LU=%d TXOFF=%d SPEED=%s)\n",
-               status, !!(status & E1000_STATUS_FD), !!(status & E1000_STATUS_LU),
-               !!(status & 4),
-               (status & 0x80) ? "1000M" : (status & 0x40) ? "100M" : "10M");
-        kprintf("[NET] Pre: TPT=%u GPRC=%u TDH=%u TDT=%u\n",
-                tpt_before, gprc_before, tdh_before, tdt_before);
-
-        /* Send a single ARP request directly, then check TX desc status */
-        uint8_t target_mac[6];
-        kprintf("[NET] Sending ARP request...\n");
-
-        ipv4_addr_t target_ip = ipv4_from_bytes(10, 0, 2, 2);
-        int ret = arp_resolve(target_ip, target_mac, 10000);
-        kprintf("[NET] arp_resolve=%d\n", ret);
-
-        /* Check descriptors and stats after */
         uint32_t tpt = nic_reg_read(E1000_TPT);
         uint32_t gprc = nic_reg_read(E1000_GPRC);
-        uint32_t rdh = nic_reg_read(E1000_RDH);
-        uint32_t rdt = nic_reg_read(E1000_RDT);
-        uint32_t tdh = nic_reg_read(E1000_TDH);
-        uint32_t tdt = nic_reg_read(E1000_TDT);
-        uint32_t icr = nic_reg_read(0xC0);
-        kprintf("[NET] Post: TPT=%u GPRC=%u TPT_delta=%d\n",
-                tpt, gprc, (int)(tpt - tpt_before));
-        kprintf("[NET] TDH=%u TDT=%u RDH=%u RDT=%u ICR=0x%x\n",
-                tdh, tdt, rdh, rdt, icr);
+        kprintf("[NET] NIC: %s %s SPEED=%s TPT=%u GPRC=%u\n",
+               !!(status & E1000_STATUS_FD) ? "FD" : "HD",
+               !!(status & E1000_STATUS_LU) ? "LINK_UP" : "LINK_DOWN",
+               (status & 0x80) ? "1000M" : (status & 0x40) ? "100M" : "10M",
+               tpt, gprc);
 
-        nic_dump_rx_ring();
-        nic_dump_tx_ring();
-
-        /* Test DNS resolution of real internet hostname */
-        {
-            uint8_t dns_result[16];
-            int dns_af;
-            kprintf("[NET] Testing DNS resolution of google.com...\n");
-            int dns_ret = dns_resolve("google.com", dns_result, &dns_af, 5000);
-            if (dns_ret == ERR_OK) {
-                if (dns_af == AF_INET)
-                    kprintf("[NET] google.com resolved to %d.%d.%d.%d\n",
-                            dns_result[0], dns_result[1], dns_result[2], dns_result[3]);
-                else
-                    kprintf("[NET] google.com resolved to IPv6\n");
-            } else {
-                kprintf("[NET] google.com DNS resolution failed: %d\n", dns_ret);
-            }
-        }
-
-        /* Test ICMPv4 ping to gateway */
-        if (ret == ERR_OK) {
-            kprintf("[NET] Testing ICMPv4 ping to 10.0.2.2...\n");
-            int ping_ret = icmpv4_ping(ipv4_from_bytes(10, 0, 2, 2), 3000);
-            kprintf("[NET] icmpv4_ping=%d\n", ping_ret);
-        }
-
-        /* Test UDP send path */
-        {
-            ipv4_addr_t gw = ipv4_from_bytes(10, 0, 2, 2);
-            uint8_t udp_buf[] = {0x00, 0x00, 0x00, 0x00};
-            kprintf("[NET] udp_sendto to 10.0.2.2:53...\n");
-            int e = udp_sendto(AF_INET, &gw, 53, 12345, udp_buf, 4);
-            eth_rx_poll();
-            thread_sleep(100);
-            kprintf("[NET] udp_sendto=%d (TPT=R/clr, not shown)\n", e);
-        }
-
-        /* IPv6 TAP test: send RS, resolve neighbor */
-        kprintf("[NET] Sending Router Solicitation...\n");
-        icmpv6_send_rs();
-
-        /* Poll for RA from host */
-        for (int p = 0; p < 10; p++) {
-            eth_rx_poll();
-            thread_sleep(100);
-        }
-
-        /* Try ICMPv6 ping to host's link-local */
-        {
-            uint8_t host_ip[16];
-            kmemset(host_ip, 0, 16);
-            host_ip[0] = 0xFE; host_ip[1] = 0x80;
-            /* fe80::a01d:86ff:fea5:6caf */
-            host_ip[8]  = 0xA0; host_ip[9]  = 0x1D;
-            host_ip[10] = 0x86; host_ip[11] = 0xFF;
-            host_ip[12] = 0xFE; host_ip[13] = 0xA5;
-            host_ip[14] = 0x6C; host_ip[15] = 0xAF;
-
-            kprintf("[NET] IPv6 ping host link-local...\n");
-            int pr = icmpv6_ping(host_ip, 2000);
-            kprintf("[NET] IPv6 ping result=%d\n", pr);
-        }
-
-        /* After a delay, try outgoing IPv6 TCP connect to default LL address */
-        /* If our MAC is the default (52:54:00:12:34:56), skip self-connect */
-        {
-            uint8_t default_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
-            int is_default = (kmemcmp(nic.mac, default_mac, 6) == 0);
-            if (is_default) {
-                kprintf("[NET] Default MAC, acting as listener only\n");
-                /* Pre-seed NDP cache for known connector MAC (52:54:00:12:34:57) */
-                uint8_t connector_ip[16];
-                kmemset(connector_ip, 0, 16);
-                connector_ip[0] = 0xFE; connector_ip[1] = 0x80;
-                connector_ip[8]  = 0x50; connector_ip[9]  = 0x54;
-                connector_ip[10] = 0x00; connector_ip[11] = 0xFF;
-                connector_ip[12] = 0xFE; connector_ip[13] = 0x12;
-                connector_ip[14] = 0x34; connector_ip[15] = 0x57;
-                uint8_t connector_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x57};
-                ndp_cache_update(connector_ip, connector_mac);
-                kprintf("[NET] Pre-seeded NDP for connector at %x:%x:%x:%x:%x:%x:%x:%x\n",
-                        (uint32_t)((connector_ip[0]<<8)|connector_ip[1]),
-                        (uint32_t)((connector_ip[2]<<8)|connector_ip[3]),
-                        (uint32_t)((connector_ip[4]<<8)|connector_ip[5]),
-                        (uint32_t)((connector_ip[6]<<8)|connector_ip[7]),
-                        (uint32_t)((connector_ip[8]<<8)|connector_ip[9]),
-                        (uint32_t)((connector_ip[10]<<8)|connector_ip[11]),
-                        (uint32_t)((connector_ip[12]<<8)|connector_ip[13]),
-                        (uint32_t)((connector_ip[14]<<8)|connector_ip[15]));
-            } else {
-                uint8_t peer_ip[16];
-                kmemset(peer_ip, 0, 16);
-                peer_ip[0] = 0xFE; peer_ip[1] = 0x80;
-                peer_ip[8]  = 0x50; peer_ip[9]  = 0x54;
-                peer_ip[10] = 0x00; peer_ip[11] = 0xFF;
-                peer_ip[12] = 0xFE; peer_ip[13] = 0x12;
-                peer_ip[14] = 0x34; peer_ip[15] = 0x56;
-                /* Pre-seed NDP cache for listener (no multicast NS forwarding in socket backend) */
-                uint8_t peer_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
-                ndp_cache_update(peer_ip, peer_mac);
-                kprintf("[NET] Pre-seeded NDP for listener at %x:%x:%x:%x:%x:%x:%x:%x\n",
-                        (uint32_t)((peer_ip[0]<<8)|peer_ip[1]),
-                        (uint32_t)((peer_ip[2]<<8)|peer_ip[3]),
-                        (uint32_t)((peer_ip[4]<<8)|peer_ip[5]),
-                        (uint32_t)((peer_ip[6]<<8)|peer_ip[7]),
-                        (uint32_t)((peer_ip[8]<<8)|peer_ip[9]),
-                        (uint32_t)((peer_ip[10]<<8)|peer_ip[11]),
-                        (uint32_t)((peer_ip[12]<<8)|peer_ip[13]),
-                        (uint32_t)((peer_ip[14]<<8)|peer_ip[15]));
-
-                kprintf("[NET] Connector mode, will run userspace tests\n");
-            }
+        uint8_t default_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+        int is_default = (kmemcmp(nic.mac, default_mac, 6) == 0);
+        if (is_default) {
+            kprintf("[NET] Default MAC — listener mode\n");
+            uint8_t conn_ip[16];
+            kmemset(conn_ip, 0, 16);
+            conn_ip[0] = 0xFE; conn_ip[1] = 0x80;
+            conn_ip[8]  = 0x50; conn_ip[9]  = 0x54;
+            conn_ip[10] = 0x00; conn_ip[11] = 0xFF;
+            conn_ip[12] = 0xFE; conn_ip[13] = 0x12;
+            conn_ip[14] = 0x34; conn_ip[15] = 0x57;
+            uint8_t conn_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x57};
+            ndp_cache_update(conn_ip, conn_mac);
+        } else {
+            kprintf("[NET] Non-default MAC — connector mode\n");
+            uint8_t peer_ip[16];
+            kmemset(peer_ip, 0, 16);
+            peer_ip[0] = 0xFE; peer_ip[1] = 0x80;
+            peer_ip[8]  = 0x50; peer_ip[9]  = 0x54;
+            peer_ip[10] = 0x00; peer_ip[11] = 0xFF;
+            peer_ip[12] = 0xFE; peer_ip[13] = 0x12;
+            peer_ip[14] = 0x34; peer_ip[15] = 0x56;
+            uint8_t peer_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+            ndp_cache_update(peer_ip, peer_mac);
         }
     } else {
         kprintf("[NET] SKIP: NIC not present\n");
     }
-
-    /* Userspace TCP + UDP echo tests via /tcp_echo.elf and /udp_echo.elf */
-    /* Retry both until they PASS (handles simultaneous boot without timeout races) */
-    if (nic.present) {
-        uint8_t default_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
-        int is_default = (kmemcmp(nic.mac, default_mac, 6) == 0);
-        if (!is_default) {
-            extern char _binary_build_tcp_echo_c_elf_start[];
-            extern char _binary_build_tcp_echo_c_elf_end[];
-            extern char _binary_build_udp_echo_c_elf_start[];
-            extern char _binary_build_udp_echo_c_elf_end[];
-            size_t tcp_elf_sz = (uint64_t)_binary_build_tcp_echo_c_elf_end
-                              - (uint64_t)_binary_build_tcp_echo_c_elf_start;
-            size_t udp_elf_sz = (uint64_t)_binary_build_udp_echo_c_elf_end
-                              - (uint64_t)_binary_build_udp_echo_c_elf_start;
-
-            int tcp_ok = 0, udp_ok = 0;
-            int retries = 0;
-            while ((!tcp_ok || !udp_ok) && retries < 3) {
-                retries++;
-                if (!tcp_ok) {
-                    kprintf("[NET] Spawning /tcp_echo.elf...\n");
-                    process_t* teproc = process_create("tcp_echo", 1);
-                    if (teproc) {
-                        err_t e = process_exec(teproc,
-                            _binary_build_tcp_echo_c_elf_start, tcp_elf_sz);
-                        if (e == ERR_OK) {
-                            while (!teproc->exited && !(teproc->flags & PROC_FLAG_STOPPED))
-                                sched_block(&teproc->exit_waiters);
-                            if (teproc->exit_code == 0) {
-                                kprintf("[NET] /tcp_echo.elf PASS\n");
-                                tcp_ok = 1;
-                            } else {
-                                kprintf("[NET] /tcp_echo.elf failed (code=%d), retrying...\n",
-                                        teproc->exit_code);
-                            }
-                        }
-                    }
-                }
-                if (!udp_ok) {
-                    kprintf("[NET] Spawning /udp_echo.elf...\n");
-                    process_t* udproc = process_create("udp_echo", 1);
-                    if (udproc) {
-                        err_t e = process_exec(udproc,
-                            _binary_build_udp_echo_c_elf_start, udp_elf_sz);
-                        if (e == ERR_OK) {
-                            while (!udproc->exited && !(udproc->flags & PROC_FLAG_STOPPED))
-                                sched_block(&udproc->exit_waiters);
-                            if (udproc->exit_code == 0) {
-                                kprintf("[NET] /udp_echo.elf PASS\n");
-                                udp_ok = 1;
-                            } else {
-                                kprintf("[NET] /udp_echo.elf failed (code=%d), retrying...\n",
-                                        udproc->exit_code);
-                            }
-                        }
-                    }
-                }
-                eth_rx_poll();
-                thread_sleep(100);
-            }
-        }
-    }
-
-
 
     kprintf("[BOOT] Starting shell...\n");
     shell_run();

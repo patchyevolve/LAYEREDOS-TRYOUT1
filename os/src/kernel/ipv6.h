@@ -18,6 +18,7 @@ typedef struct __attribute__((packed)) {
 } ipv6_hdr_t;
 
 #define IPV6_HDR_LEN 40
+#define IPV6_DISPATCH_SLOTS 8
 
 typedef void (*ipv6_handler_t)(const uint8_t* src, const uint8_t* dst,
                                 uint8_t next_header,

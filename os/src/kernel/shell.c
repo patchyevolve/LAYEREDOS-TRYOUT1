@@ -6,6 +6,7 @@
  *  • Full readline-style line editing  (backspace, arrow keys, Home/End)
  *  • 64-entry circular command history  (↑/↓ navigation, `history` command)
  *  • Tab completion  — commands AND VFS paths (files + directories)
+ *  • Background jobs  —  cmd &  (spawned in a kernel thread, managed via jobs/bg/fg)
  *  • Pipeline support  —  cmd1 | cmd2 | cmd3  (up to SHELL_MAX_PIPE stages)
  *  • I/O redirection  —  > file,  >> file,  < file
  *  • Alias  —  alias, unalias
@@ -46,6 +47,7 @@
 #include "e1000.h"
 #include "eth.h"
 #include "arp.h"
+#include "smp.h"
 
 extern char _binary_build_user_program_elf_start[];
 extern char _binary_build_user_program_elf_end[];
@@ -323,6 +325,7 @@ typedef struct {
     char*  redir_in;
     char*  redir_out;
     int    redir_append;
+    int    background;   /* non-zero → run asynchronously (&) */
 } pipeline_stage_t;
 
 static int parse_pipeline(char* line, pipeline_stage_t stages[]) {
@@ -365,6 +368,11 @@ static int parse_pipeline(char* line, pipeline_stage_t stages[]) {
                 if (*p) { *p = '\0'; p++; }
                 continue;
             }
+            if (*p == '&') {
+                st->background = 1;
+                p++;
+                break;
+            }
 
             if (*p == '"') {
                 p++;
@@ -390,7 +398,7 @@ static int parse_pipeline(char* line, pipeline_stage_t stages[]) {
 
             st->argv[st->argc++] = p;
             while (*p && *p != ' ' && *p != '\t' &&
-                   *p != '>' && *p != '<' && *p != '|') p++;
+                   *p != '>' && *p != '<' && *p != '|' && *p != '&') p++;
             if (*p == ' ' || *p == '\t') { *p = '\0'; p++; }
         }
         st->argv[st->argc] = NULL;
@@ -847,6 +855,18 @@ static struct {
 } shell_jobs[SHELL_MAX_JOBS];
 static int shell_job_count = 0;
 
+static void shell_add_job(pid_t pid, const char* cmd) {
+    for (int i = 0; i < SHELL_MAX_JOBS; i++) {
+        if (!shell_jobs[i].pid) {
+            shell_jobs[i].pid = pid;
+            kstrncpy(shell_jobs[i].cmd, cmd, 63);
+            shell_jobs[i].stopped = 0;
+            shell_job_count++;
+            return;
+        }
+    }
+}
+
 static void shell_remove_job(pid_t pid) {
     for (int i = 0; i < SHELL_MAX_JOBS; i++) {
         if (shell_jobs[i].pid == pid) {
@@ -1006,11 +1026,13 @@ static void cmd_run(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     }
     uint8_t* buf = kmalloc(fsz);
     if (!buf) { kprintf("run: OOM\n"); vfs_close(fd); return; }
-    vfs_read(fd, buf, fsz);
+    int64_t nread = vfs_read(fd, buf, fsz);
     vfs_close(fd);
+    if (nread <= 0) { kfree(buf); kprintf("run: read failed\n"); return; }
+    if ((uint64_t)nread < fsz) { kprintf("run: short read (%ld < %lu)\n", nread, fsz); }
     process_t* proc = process_create(args[1], 1);
     if (!proc) { kfree(buf); kprintf("run: create failed\n"); return; }
-    err_t e = process_exec(proc, buf, fsz);
+    err_t e = process_exec(proc, buf, (uint64_t)nread);
     if (e) { kprintf("run: exec failed: %d\n", e); kfree(buf); return; }
     kprintf("[run] pid=%d '%s'\n", proc->pid, args[1]);
 
@@ -1775,13 +1797,176 @@ static void cmd_fsck(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
         kprintf("fsck: found errors (%d)\n", e);
 }
 
-static void cmd_mount(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+/* ── df (disk free) ────────────────────────────────────────────────────── */
+static void cmd_df(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
     (void)args; (void)argc; (void)in;
+    cmd_printf(out, "%-16s %12s %12s %12s %5s  %s\n",
+               "Filesystem", "1K-blocks", "Used", "Available", "Use%", "Mounted on");
+    for (int i = 0; i < block_count(); i++) {
+        block_dev_t* d = block_get(i);
+        if (!d) continue;
+        uint64_t total = d->block_count;
+        uint64_t total_kb = total / 2; /* 512-byte blocks → 1K units */
+        uint64_t used = total_kb;      /* assume full until we check superblock */
+        /* Try to read SFS superblock for free counts */
+        if (d->block_count >= 2) {
+            sfs_superblock_t sb;
+            if (block_read(d, 0, 1, &sb) == 0 && sb.magic == SFS_MAGIC) {
+                uint32_t total_b = sb.total_blocks;
+                uint32_t bmap_start = sb.block_bmap_start;
+                uint32_t bmap_blocks = (total_b + 4095) / 4096;
+                uint32_t free_b = 0;
+                uint8_t bitbuf[512];
+                for (uint32_t bi = 0; bi < bmap_blocks && bi < 256; bi++) {
+                    if (block_read(d, bmap_start + bi, 1, bitbuf) != 0) break;
+                    for (int bj = 0; bj < 512 && (bi * 4096 + bj * 8) < total_b; bj++) {
+                        uint8_t byte = bitbuf[bj];
+                        for (int bk = 0; bk < 8; bk++) {
+                            if (!(byte & (1 << bk))) free_b++;
+                        }
+                    }
+                }
+                total_kb = (uint64_t)total_b;
+                uint64_t free_kb = (uint64_t)free_b;
+                used = total_kb - free_kb;
+                uint64_t pct = total_kb ? (used * 100 / total_kb) : 0;
+                cmd_printf(out, "%-16s %12llu %12llu %12llu %3llu%%  /\n",
+                           d->name, total_kb, used, free_kb, pct);
+                continue;
+            }
+        }
+        cmd_printf(out, "%-16s %12llu %12llu %12llu    -  %s\n",
+                   d->name, total_kb, used, (uint64_t)0, d->name);
+    }
+}
+
+/* ── du (disk usage) ───────────────────────────────────────────────────── */
+static void du_recurse(const char* path, uint64_t* total, pipe_buf_t* out, int depth) {
+    if (depth > 20) return;
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != 0) return;
+    *total += st.size;
+    if ((st.mode & 0170000) == 0040000) {
+        vfs_node_t* dir = vfs_find(path);
+        if (!dir || !dir->children) return;
+        char child[SHELL_LINE_BUF];
+        for (vfs_node_t* n = dir->children; n; n = n->next) {
+            int plen = kstrlen(path);
+            kmemcpy(child, path, (uint32_t)plen);
+            if (plen > 0 && path[plen - 1] != '/') child[plen++] = '/';
+            kstrncpy(child + plen, n->name, SHELL_LINE_BUF - plen - 1);
+            du_recurse(child, total, out, depth + 1);
+        }
+    }
+}
+
+static void cmd_du(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)in;
+    char target[SHELL_LINE_BUF];
+    kmemset(target, 0, sizeof(target));
+    target[0] = '.';
+    if (argc > 1) resolve_path(args[1], target, SHELL_LINE_BUF);
+    uint64_t total = 0;
+    du_recurse(target, &total, out, 0);
+    cmd_printf(out, "%llu\t%s\n", total, target);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Line processing + background execution
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Forward decls for pipeline executor (defined after command table) */
+static void exec_stage(pipeline_stage_t* st, pipe_buf_t* pipe_in, pipe_buf_t* pipe_out);
+static void exec_pipeline(pipeline_stage_t* stages, int nstages);
+
+struct bg_task {
+    pipeline_stage_t stages[SHELL_MAX_PIPE];
+    int nstages;
+    char cmd[64];
+};
+
+static void bg_thread_func(void* arg) {
+    struct bg_task* task = (struct bg_task*)arg;
+    exec_pipeline(task->stages, task->nstages);
+    kfree(task);
+    thread_exit(0);
+}
+
+static void process_line(const char* line) {
+    const char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p || *p == '#') return;
+
+    char expanded[SHELL_LINE_BUF];
+    expand_vars(line, expanded, SHELL_LINE_BUF);
+
+    char work[SHELL_LINE_BUF];
+    kstrncpy(work, expanded, SHELL_LINE_BUF - 1);
+
+    pipeline_stage_t stages[SHELL_MAX_PIPE];
+    int nstages = parse_pipeline(work, stages);
+    if (nstages == 0) return;
+
+    if (nstages == 1 && stages[0].background && stages[0].argc > 0) {
+        struct bg_task* task = kmalloc(sizeof(struct bg_task));
+        if (!task) { kprintf("shell: OOM for bg task\n"); return; }
+        kmemcpy(task->stages, stages, sizeof(pipeline_stage_t) * nstages);
+        task->nstages = nstages;
+        kstrncpy(task->cmd, stages[0].argv[0], 63);
+        task->stages[0].background = 0;
+        thread_t* t = thread_create(bg_thread_func, task, THREAD_DEF_PRIO, task->cmd);
+        if (!t) { kfree(task); kprintf("shell: failed to create bg thread\n"); return; }
+        sched_add_thread(t);
+        shell_add_job((pid_t)t->id, task->cmd);
+        kprintf("[%d] %lu\n", shell_job_count, (unsigned long)t->id);
+        return;
+    }
+
+    exec_pipeline(stages, nstages);
+}
+
+/* ── time (execution timer) ────────────────────────────────────────────────── */
+static void cmd_time(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)in;
+    if (argc < 2) { cmd_printf(out, "Usage: time <command> [args...]\n"); return; }
+    /* Rebuild a command line from args[1..] */
+    char subcmd[SHELL_LINE_BUF];
+    subcmd[0] = 0;
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) kstrncat(subcmd, " ", SHELL_LINE_BUF - kstrlen(subcmd) - 1);
+        kstrncat(subcmd, args[i], SHELL_LINE_BUF - kstrlen(subcmd) - 1);
+    }
+    uint64_t start = hal_timer_get_ns();
+    /* Execute via process_line to parse and run */
+    process_line(subcmd);
+    uint64_t elapsed = hal_timer_get_ns() - start;
+    uint64_t ms = elapsed / 1000000;
+    cmd_printf(out, "\nreal\t%llu.%03llus\n", ms / 1000, ms % 1000);
+}
+
+/* ── mount ─────────────────────────────────────────────────────────────────── */
+static void cmd_mount(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)in;
+    if (argc >= 2 && args[1][0] != '-') {
+        /* mount <devname> — mount an SFS filesystem */
+        block_dev_t* bdev = block_find(args[1]);
+        if (!bdev) { cmd_printf(out, "mount: device '%s' not found\n", args[1]); return; }
+        err_t e = sfs_mount(bdev);
+        if (e) { cmd_printf(out, "mount: sfs_mount failed (%d)\n", e); return; }
+        cmd_printf(out, "mounted %s\n", args[1]);
+        return;
+    }
     cmd_printf(out, "Block devices:\n");
     for (int i = 0; i < block_count(); i++) {
         block_dev_t* d = block_get(i);
-        cmd_printf(out, "  %s (%llu blocks)\n", d->name, d->block_count);
+        if (d) cmd_printf(out, "  %s (%llu blocks)\n", d->name, d->block_count);
     }
+}
+
+/* ── umount ───────────────────────────────────────────────────────────────── */
+static void cmd_umount(char** args, int argc, pipe_buf_t* in, pipe_buf_t* out) {
+    (void)args; (void)argc; (void)in; (void)out;
+    cmd_printf(out, "umount: not yet implemented (no VFS unmount API)\n");
 }
 
 /* ── history ───────────────────────────────────────────────────────────── */
@@ -2069,7 +2254,11 @@ static shell_cmd_t commands[] = {
     {"backup",    cmd_backup,    "Backup: save <archive> | restore <archive>"},
     {"fsck",      cmd_fsck,      "Check SFS integrity [-r to repair]"},
     {"format",    cmd_format,    "Format+remount SFS on ramdisk"},
-    {"mount",     cmd_mount,     "List block devices"},
+    {"df",        cmd_df,        "Report filesystem disk usage"},
+    {"du",        cmd_du,        "Estimate disk usage of a path"},
+    {"time",      cmd_time,      "Run command with timing"},
+    {"mount",     cmd_mount,     "List block devices / mount <devname>"},
+    {"umount",    cmd_umount,    "Unmount filesystem (stub)"},
     {"nicstat",   cmd_nicstat,   "Show NIC status"},
     {"nicdebug",  cmd_nicdebug,  "NIC hardware debug"},
     {"eth_test",  cmd_eth_test,  "Send Ethernet broadcast frame"},
@@ -2180,28 +2369,6 @@ static void exec_pipeline(pipeline_stage_t* stages, int nstages) {
         exec_stage(&stages[i], in, out);
     }
     kfree(bufs);
-}
-
-/* ══════════════════════════════════════════════════════════════════════════
- * Line processing
- * ══════════════════════════════════════════════════════════════════════════ */
-
-static void process_line(const char* line) {
-    const char* p = line;
-    while (*p == ' ' || *p == '\t') p++;
-    if (!*p || *p == '#') return;
-
-    char expanded[SHELL_LINE_BUF];
-    expand_vars(line, expanded, SHELL_LINE_BUF);
-
-    char work[SHELL_LINE_BUF];
-    kstrncpy(work, expanded, SHELL_LINE_BUF - 1);
-
-    pipeline_stage_t stages[SHELL_MAX_PIPE];
-    int nstages = parse_pipeline(work, stages);
-    if (nstages == 0) return;
-
-    exec_pipeline(stages, nstages);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -2361,7 +2528,7 @@ void shell_run(void) {
 
     for (;;) {
         eventbus_dispatch();
-        if (need_reschedule) schedule();
+        if (smp_this_cpu()->need_reschedule) schedule();
 
         eth_rx_poll();
 

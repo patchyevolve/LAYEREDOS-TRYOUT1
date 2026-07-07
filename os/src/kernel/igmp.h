@@ -3,6 +3,8 @@
 
 #include "types.h"
 
+#define IGMP_MAX_GROUPS     8
+
 #define IGMP_TYPE_QUERY    0x11
 #define IGMP_TYPE_REPORT   0x16
 #define IGMP_TYPE_LEAVE    0x17

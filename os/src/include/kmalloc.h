@@ -9,5 +9,6 @@ void  kfree(void* ptr);
 size_t kmalloc_used(void);
 size_t kmalloc_total(void);
 size_t kmalloc_compact(void);
+void   kmag_flush_one_cpu(int cpu);
 
 #endif

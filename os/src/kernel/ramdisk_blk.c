@@ -2,7 +2,7 @@
 #include "block.h"
 #include "pmm.h"
 
-#define RAMDISK_BLK_SIZE (1 * 1024 * 1024)
+#define RAMDISK_BLK_SIZE (2 * 1024 * 1024)
 
 static uint8_t* ramdisk_blk_data = NULL;
 static block_dev_t ramdisk_blk_dev;

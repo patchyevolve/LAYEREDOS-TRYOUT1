@@ -29,4 +29,15 @@ void  eth_rx_poll(void);
 err_t eth_register(uint16_t type, eth_handler_t handler);
 err_t eth_init(void);
 
+/* Dispatch a raw Ethernet frame to registered handlers.
+ * Returns 1 if a handler was found, 0 otherwise. */
+int   eth_dispatch_frame(const uint8_t* src_mac, uint16_t type,
+                         const uint8_t* data, uint32_t len);
+
+/* Check if a destination MAC is reachable via a veth pair.
+ * If so, deliver through the veth peer and return 1.
+ * Otherwise return 0. */
+int   eth_try_veth(const uint8_t* dst_mac, uint16_t type,
+                   const uint8_t* data, uint32_t len);
+
 #endif

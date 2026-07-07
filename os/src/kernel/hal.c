@@ -8,7 +8,10 @@
 #include "swap.h"
 #include "vmm.h"
 #include "pmm.h"
+#include "vma.h"
 #include "tty.h"
+#include "smp.h"
+#include "watchdog.h"
 
 
 #define UART_BASE 0x3F8
@@ -29,7 +32,7 @@
 #define PIC2_DATA 0xA1
 
 #define IDT_ENTRIES 256
-#define GDT_ENTRIES 7
+#define GDT_ENTRIES 8
 
 typedef struct {
     uint16_t size;
@@ -50,18 +53,10 @@ static idt_entry_t idt[IDT_ENTRIES] __attribute__((aligned(16)));
 static idtr_t idtr;
 
 static uint64_t gdt[GDT_ENTRIES] __attribute__((aligned(8)));
-typedef struct {
-    uint32_t reserved0;
-    uint64_t rsp[3];
-    uint64_t reserved1;
-    uint64_t ist[7];
-    uint64_t reserved2;
-    uint16_t reserved3;
-    uint16_t iopb_offset;
-} __attribute__((packed)) tss64_t;
 static tss64_t tss __attribute__((aligned(16)));
 
-static uint8_t ist_stack0[8192] __attribute__((aligned(16)));
+static uint8_t ist_stack0[8192] __attribute__((aligned(16)));  /* IST1: #DF */
+static uint8_t ist_stack1[8192] __attribute__((aligned(16)));  /* IST2: #PF */
 static uint8_t user_stack0[16384] __attribute__((aligned(16)));
 
 typedef struct {
@@ -70,8 +65,10 @@ typedef struct {
 } irq_reg_t;
 
 static irq_reg_t irq_handlers[48];
+static spinlock_t irq_reg_lock;
 static volatile uint64_t timer_ticks = 0;
 static volatile uint32_t timer_hz = 1000;
+volatile uint64_t tsc_khz = 0;
 int hal_smap_enabled(void) {
     static int available = 0;
     static int checked = 0;
@@ -115,6 +112,27 @@ int hal_is_qemu_tcg(void) {
 
     result = (ebx == 0x54434754 && ecx == 0x43544743 && edx == 0x47435447);
     return result;
+}
+
+int hal_is_qemu(void) {
+    static int result = -1;
+    if (result != -1) return result;
+
+    uint32_t eax, ebx, ecx, edx;
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+
+    /* Check hypervisor present bit */
+    if (!(ecx & (1U << 31))) { result = 0; return 0; }
+
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x40000000), "c"(0));
+
+    /* "KVMKVMKVM" (KVM) */
+    if (ebx == 0x4B4D564B && ecx == 0x564B4D56 && edx == 0x4D) { result = 1; return 1; }
+    /* "TCGTCGTCG" (QEMU TCG) */
+    if (ebx == 0x54434754 && ecx == 0x43544743 && edx == 0x47435447) { result = 1; return 1; }
+
+    result = 0;
+    return 0;
 }
 
 static inline uint64_t read_cr2(void) {
@@ -163,12 +181,22 @@ static void gdt_set_tss(int i, uint64_t tss_addr, uint32_t tss_size) {
 }
 
 static void gdt_init(void) {
+    /* Per-CPU GDT layout (8 entries, 64 bytes):
+     *   0: null         (0x00)
+     *   1: kernel code  (0x08) — ring 0, 64-bit
+     *   2: kernel data  (0x10) — ring 0
+     *   3: kernel code  (0x18) — ring 0, 64-bit (duplicate; AP trampoline leaves CS=0x18)
+     *   4: user code    (0x20, +RPL=3 → 0x23)
+     *   5: user data    (0x28, +RPL=3 → 0x2B)
+     *   6: TSS (low)    (0x30)
+     *   7: TSS (high) */
     gdt_set_entry(0, 0, 0, 0, 0);
     gdt_set_entry(1, 0, 0, 0x9A, 0x02);
     gdt_set_entry(2, 0, 0, 0x92, 0x00);
-    gdt_set_entry(3, 0, 0, 0xFA, 0x02);
-    gdt_set_entry(4, 0, 0, 0xF2, 0x00);
-    gdt_set_tss(5, (uint64_t)&tss, sizeof(tss) - 1);
+    gdt_set_entry(3, 0, 0, 0x9A, 0x02);  /* duplicate ring-0 64-bit code */
+    gdt_set_entry(4, 0, 0, 0xFA, 0x02);  /* user code, ring 3 */
+    gdt_set_entry(5, 0, 0, 0xF2, 0x00);  /* user data, ring 3 */
+    gdt_set_tss(6, (uint64_t)&tss, sizeof(tss) - 1);
 
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
     gdtr.limit = sizeof(gdt) - 1;
@@ -178,14 +206,80 @@ static void gdt_init(void) {
     asm volatile("movw $0x10, %%ax; movw %%ax, %%ds; movw %%ax, %%es; movw %%ax, %%ss"
         : : : "ax");
 
-    asm volatile("movw $0x28, %%ax; ltr %%ax" : : : "ax");
+    /* TSS selector: 0x30 = index 6, RPL=0 */
+    asm volatile("movw $0x30, %%ax; ltr %%ax" : : : "ax");
+
+    // Initialize TSS
+    kmemset(&tss, 0, sizeof(tss));
+    tss.rsp[0] = (uint64_t)user_stack0 + sizeof(user_stack0);
+    tss.ist[0] = (uint64_t)ist_stack0 + sizeof(ist_stack0);  /* IST1: #DF  */
+    tss.ist[1] = (uint64_t)ist_stack1 + sizeof(ist_stack1);  /* IST2: #PF  */
+    kprintf("[TSS] ist[0]=%lx ist[1]=%lx (ist_stack1=%lx)\n",
+            tss.ist[0], tss.ist[1], (uint64_t)ist_stack1);
+}
+
+void hal_init_cpu_gdt_tss(int cpu) {
+    per_cpu_data_t* pcp = per_cpu_data[cpu];
+    uint64_t* gdt_local = pcp->gdt;  /* per-CPU GDT, NOT the global gdt */
+
+    /* Inline gdt_set_entry/gdt_set_tss — these static helpers write to
+     * the global gdt[], not the per-CPU one.  We must populate per-CPU
+     * gdt directly.  Same layout as gdt_init() — entry 3 is duplicate
+     * ring-0 code so AP's CS=0x18 (from trampoline) remains valid. */
+
+    /* Entry 0: null */
+    gdt_local[0] = 0;
+
+    /* Entry 1: kernel code (0x08) — ring 0, 64-bit */
+    gdt_local[1] = ((uint64_t)0x9A << 40) | ((uint64_t)0x02 << 52);
+
+    /* Entry 2: kernel data (0x10) */
+    gdt_local[2] = ((uint64_t)0x92 << 40);
+
+    /* Entry 3: duplicate kernel code (0x18) — ring 0, 64-bit */
+    gdt_local[3] = ((uint64_t)0x9A << 40) | ((uint64_t)0x02 << 52);
+
+    /* Entry 4: user code (0x20, RPL=3 → 0x23) */
+    gdt_local[4] = ((uint64_t)0xFA << 40) | ((uint64_t)0x02 << 52);
+
+    /* Entry 5: user data (0x28, RPL=3 → 0x2B) */
+    gdt_local[5] = ((uint64_t)0xF2 << 40);
+
+    /* Entry 6+7: TSS (64-bit TSS descriptor occupies 2 entries) */
+    {
+        uint64_t tss_addr = (uint64_t)&pcp->tss;
+        uint32_t tss_size = sizeof(pcp->tss) - 1;
+        gdt_local[6] = ((uint64_t)tss_size & 0xFFFF)
+                     | (((uint64_t)tss_addr & 0xFFFFFF) << 16)
+                     | ((uint64_t)0x89 << 40)
+                     | ((((uint64_t)tss_addr >> 24) & 0xFF) << 56);
+        gdt_local[7] = (uint64_t)(tss_addr >> 32);
+    }
+
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
+    gdtr.limit = GDT_ENTRIES * 8 - 1;
+    gdtr.base = (uint64_t)gdt_local;
+    asm volatile("lgdt %0" : : "m"(gdtr));
+
+    asm volatile("movw $0x10, %%ax; movw %%ax, %%ds; movw %%ax, %%es; movw %%ax, %%ss"
+        : : : "ax");
+
+    asm volatile("movw $0x30, %%ax; ltr %%ax" : : : "ax");
+
+    /* Initialize TSS */
+    kmemset(&pcp->tss, 0, sizeof(pcp->tss));
+    pcp->tss.rsp[0] = (uint64_t)pcp->user_stack0 + sizeof(pcp->user_stack0);
+    pcp->tss.ist[0] = (uint64_t)pcp->ist_stack0 + sizeof(pcp->ist_stack0);  /* IST1: #DF */
+    pcp->tss.ist[1] = (uint64_t)pcp->ist_stack1 + sizeof(pcp->ist_stack1);  /* IST2: #PF */
 }
 
 static void idt_set_gate(uint8_t vec, uint64_t handler, uint8_t dpl) {
     idt_entry_t* e = &idt[vec];
     e->offset_low  = handler & 0xFFFF;
     e->selector    = 0x08;
-    e->ist         = (vec == 8) ? 1 : 0;
+    if (vec == 8)       e->ist = 1;   /* #DF:  IST1 */
+    else if (vec == 14) e->ist = 2;   /* #PF:  IST2 */
+    else                e->ist = 0;
     e->type_attr   = 0x8E | (dpl << 5);
     e->offset_mid  = (handler >> 16) & 0xFFFF;
     e->offset_high = (handler >> 32) & 0xFFFFFFFF;
@@ -206,16 +300,31 @@ static void idt_init(void) {
 
     kmemset(&tss, 0, sizeof(tss));
     tss.rsp[0] = (uint64_t)user_stack0 + sizeof(user_stack0);
-    tss.ist[0] = (uint64_t)ist_stack0 + sizeof(ist_stack0);
-    tss.ist[1] = (uint64_t)ist_stack0 + sizeof(ist_stack0);
+    tss.ist[0] = (uint64_t)ist_stack0 + sizeof(ist_stack0);  /* IST1: #DF */
+    tss.ist[1] = (uint64_t)ist_stack1 + sizeof(ist_stack1);  /* IST2: #PF */
 }
 
 void hal_set_kernel_stack(uint64_t rsp0) {
-    tss.rsp[0] = rsp0;
+    int cpu = smp_cpu_id();
+    if (cpu == 0) {
+        tss.rsp[0] = rsp0;
+    } else if (per_cpu_data[cpu]) {
+        per_cpu_data[cpu]->tss.rsp[0] = rsp0;
+    }
+}
+
+void hal_idt_reload(void) {
+    asm volatile("lidt %0" : : "m"(idtr));
 }
 
 uint64_t hal_get_kernel_stack(void) {
-    return tss.rsp[0];
+    int cpu = smp_cpu_id();
+    if (cpu == 0) {
+        return tss.rsp[0];
+    } else if (per_cpu_data[cpu]) {
+        return per_cpu_data[cpu]->tss.rsp[0];
+    }
+    return 0;
 }
 
 void hal_enable_irqs(void) {
@@ -238,7 +347,7 @@ static void pic_remap(void) {
     outb(PIC2_DATA, 0x02); io_wait();
     outb(PIC1_DATA, 0x01); io_wait();
     outb(PIC2_DATA, 0x01); io_wait();
-    outb(PIC1_DATA, 0xFB); io_wait();
+    outb(PIC1_DATA, 0xFA); io_wait();
     outb(PIC2_DATA, 0xFF); io_wait();
 }
 
@@ -250,10 +359,12 @@ void hal_irq_eoi(uint8_t irq) {
 
 err_t hal_irq_register(uint8_t irq, irq_handler_t handler, void* data) {
     if (irq >= 48) return ERR_INVAL;
+    cpu_flags_t _f;
+    spinlock_acquire(&irq_reg_lock, &_f);
     irq_handlers[irq].handler = handler;
     irq_handlers[irq].data = data;
     __sync_synchronize();
-    // Don't unmask automatically; unmask via hal_enable_irqs()
+    spinlock_release(&irq_reg_lock, _f);
     return ERR_OK;
 }
 
@@ -285,7 +396,7 @@ static void uart_rx_isr(int_frame_t* frame, void* data) {
         char c = inb(UART_RBR);
         tty_input_push(c);
     }
-    need_reschedule = 1;
+    per_cpu_data[smp_cpu_id()]->need_reschedule = 1;
 }
 
 err_t hal_uart_rx_init(void) {
@@ -372,7 +483,73 @@ void interrupt_handler(int_frame_t* frame) {
     uint8_t vec = frame->vector & 0xFF;
 
     if (vec == 32) {
-        timer_ticks++;
+        __sync_fetch_and_add(&timer_ticks, 1);
+        sched_timer_tick();
+    }
+
+    if (vec == 2) {
+        /* NMI — from watchdog IPI or external NMI source.  No EOI needed
+         * for NMI delivery mode (the APIC does not set ISR for NMIs). */
+        watchdog_nmi_handler(frame);
+        return;
+    }
+
+    /* Track interrupt count for IPI delivery debugging */
+    if (smp_enabled && (vec == IPI_VEC_RESCHEDULE || vec == IPI_VEC_TLB_SHOOTDOWN
+                        || vec == IPI_VEC_PANIC)) {
+        int cpu = smp_cpu_id();
+        if (cpu >= 0 && cpu < nr_cpus && per_cpu_data[cpu])
+            per_cpu_data[cpu]->irq_count++;
+    }
+
+    /* IPI handlers — these vectors must not map through IRQ handlers */
+    if (vec == IPI_VEC_RESCHEDULE) {
+        ap_ipi_test_counter++;
+        if (smp_enabled) {
+            int cpu = smp_cpu_id();
+            if (cpu >= 0 && cpu < nr_cpus && per_cpu_data[cpu]) {
+                /* On non-BSP CPUs, treat each reschedule IPI as a
+                 * scheduling tick — decrement time slice and preempt
+                 * when it expires.  We never *clear* need_reschedule,
+                 * so external wake signals (set by smp_send_reschedule)
+                 * are preserved even when the time slice hasn't expired. */
+                if (cpu != 0 && current_thread &&
+                    (void*)current_thread != per_cpu_data[cpu]->idle_thread) {
+                    current_thread->total_ticks++;
+                    if (current_thread->time_slice_remaining > 0)
+                        current_thread->time_slice_remaining--;
+                    if (current_thread->time_slice_remaining == 0)
+                        per_cpu_data[cpu]->need_reschedule = 1;
+                } else {
+                    /* BSP or idle thread: preempt / wake immediately */
+                    per_cpu_data[cpu]->need_reschedule = 1;
+                }
+                /* APs lack a local APIC timer on QEMU, so sched_timer_tick
+                 * never runs on them.  The idle loop calls check_sleepers()
+                 * but a busy AP never hits it — sleeping threads depend on
+                 * every reschedule IPI to also check and wake them. */
+                check_sleepers();
+            }
+        }
+        apic_eoi();
+        return;
+    }
+
+    if (vec == IPI_VEC_TLB_SHOOTDOWN) {
+        smp_handle_tlb_shootdown();
+        apic_eoi();
+        return;
+    }
+
+    if (vec == IPI_VEC_PANIC) {
+        kprintf("[SMP] PANIC IPI received on CPU %d\n", smp_cpu_id());
+        for (;;) asm volatile("cli; hlt");
+    }
+
+    if (vec == IPI_VEC_OFFLINE) {
+        smp_handle_offline();
+        apic_eoi();
+        return;
     }
 
     if (vec >= 32 && vec < 80) {
@@ -403,107 +580,51 @@ void interrupt_handler(int_frame_t* frame) {
         uint64_t fault_rip = frame->rip;
         uint64_t err = frame->error_code;
         if ((frame->cs & 3) == 3) {
-            /* Check if this is a swapped-out page */
+            /* Check if this is a swapped-out page or file-backed demand page */
             if (current_thread && current_thread->proc) {
                 uint64_t cr3 = current_thread->cr3;
                 if (cr3) {
                     page_entry_t* pte = vmm_walk_pagetable(cr3, cr2);
                     if (pte && (*pte & SWAP_PTE_MARKER) && !(*pte & PAGE_PRESENT)) {
                         int slot = swap_decode_pte(*pte);
-                        kprintf("[SWAP] Page fault resolved: slot %d -> %llx\n",
-                                slot, cr2);
                         uint64_t new_page = pmm_alloc_page();
                         if (!new_page) {
-                            kprintf("[SWAP] Failed to allocate page for swap-in\n");
+                            kprintf("[SWAP] OOM\n");
                             process_exit(current_thread->proc, -11);
                             thread_exit(-11);
                             for (;;) asm volatile("cli; hlt");
                         }
-                        if (swap_in(slot, new_page) != ERR_OK) {
-                            kprintf("[SWAP] swap_in failed for slot %d\n", slot);
-                        }
+                        if (swap_in(slot, new_page) != ERR_OK)
+                            kprintf("[SWAP] swap_in failed\n");
                         swap_free_slot(slot);
                         *pte = new_page | PAGE_PRESENT | swap_decode_pte_flags(*pte);
                         vmm_flush_tlb_page(cr2);
                         return;
                     }
-                }
-            }
-            /* Dump page table walk for fault address */
-            uint64_t dbg_cr3_val = 0;
-            asm volatile("mov %%cr3, %0" : "=r"(dbg_cr3_val));
-            kprintf("[PF] actual CR3=0x%lx cur_thr=%p cur_thr_cr3=0x%lx\n",
-                    dbg_cr3_val, current_thread,
-                    current_thread ? current_thread->cr3 : 0);
-            if (current_thread && current_thread->proc) {
-                kprintf("[PF] THR_CR3=0x%lx PROC_CR3=0x%lx\n",
-                        current_thread->cr3,
-                        current_thread->proc->cr3);
-            }
-            if (current_thread && current_thread->proc && current_thread->cr3) {
-                uint64_t dbg_cr3 = current_thread->cr3;
-                uint64_t pml4_i = (cr2 >> 39) & 0x1FF;
-                page_entry_t* dbg_pml4 = (page_entry_t*)PHYS_TO_VIRT(dbg_cr3);
-                kprintf("[PF] PML4[%lu]=0x%lx\n", pml4_i, dbg_pml4[pml4_i]);
-                if (dbg_pml4[pml4_i] & PAGE_PRESENT) {
-                    uint64_t dbg_pdpt_p = dbg_pml4[pml4_i] & ~0xFFFULL;
-                    page_entry_t* dbg_pdpt = (page_entry_t*)PHYS_TO_VIRT(dbg_pdpt_p);
-                    uint64_t pdpt_i = (cr2 >> 30) & 0x1FF;
-                    kprintf("[PF] PDPT[%lu]=0x%lx\n", pdpt_i, dbg_pdpt[pdpt_i]);
-                    if (dbg_pdpt[pdpt_i] & PAGE_PRESENT) {
-                        uint64_t dbg_pd_p = dbg_pdpt[pdpt_i] & ~0xFFFULL;
-                        page_entry_t* dbg_pd = (page_entry_t*)PHYS_TO_VIRT(dbg_pd_p);
-                        uint64_t pd_i = (cr2 >> 21) & 0x1FF;
-                        kprintf("[PF] PD[%lu]=0x%lx\n", pd_i, dbg_pd[pd_i]);
-                        if (dbg_pd[pd_i] & PAGE_PRESENT) {
-                            uint64_t dbg_pt_p = dbg_pd[pd_i] & ~0xFFFULL;
-                            page_entry_t* dbg_pt = (page_entry_t*)PHYS_TO_VIRT(dbg_pt_p);
-                            uint64_t pt_i = (cr2 >> 12) & 0x1FF;
-                            kprintf("[PF] PT[%lu]=0x%lx\n", pt_i, dbg_pt[pt_i]);
-                        }
-                    }
+                    /* File-backed demand paging via VMA */
+                    if (vma_handle_fault(current_thread->proc, cr2, err))
+                        return;
                 }
             }
             kprintf("PAGE FAULT pid=%lu rip=%lx addr=%lx error=%lu -- killing process\n",
                     current_thread && current_thread->proc ? current_thread->proc->pid : 0,
                     fault_rip, cr2, err);
-            /* Also walk using actual CR3 for comparison */
-            {
-                uint64_t acr3;
-                asm volatile("mov %%cr3, %0" : "=r"(acr3));
-                page_entry_t* apml4 = (page_entry_t*)PHYS_TO_VIRT(acr3);
-                uint64_t apml4_i = (cr2 >> 39) & 0x1FF;
-                kprintf("[PF-ACT] CR3=%lx PML4[%lu]=%lx\n", acr3, apml4_i, apml4[apml4_i]);
-                if (apml4[apml4_i] & PAGE_PRESENT) {
-                    page_entry_t* apdpt = (page_entry_t*)PHYS_TO_VIRT(apml4[apml4_i] & ~0xFFFULL);
-                    uint64_t apdpt_i = (cr2 >> 30) & 0x1FF;
-                    kprintf("[PF-ACT] PDPT[%lu]=%lx\n", apdpt_i, apdpt[apdpt_i]);
-                    if (apdpt[apdpt_i] & PAGE_PRESENT) {
-                        page_entry_t* apd = (page_entry_t*)PHYS_TO_VIRT(apdpt[apdpt_i] & ~0xFFFULL);
-                        uint64_t apd_i = (cr2 >> 21) & 0x1FF;
-                        kprintf("[PF-ACT] PD[%lu]=%lx\n", apd_i, apd[apd_i]);
-                        if (apd[apd_i] & PAGE_PRESENT) {
-                            page_entry_t* apt = (page_entry_t*)PHYS_TO_VIRT(apd[apd_i] & ~0xFFFULL);
-                            uint64_t apt_i = (cr2 >> 12) & 0x1FF;
-                            kprintf("[PF-ACT] PT[%lu]=%lx\n", apt_i, apt[apt_i]);
-                        }
-                    }
-                }
-            }
-            kprintf("[PF] rsp=%lx rflags=%lx ss=%lx cs=%lx\n",
-                    frame->rsp, frame->rflags, frame->ss, frame->cs);
-            kprintf("[PF] rax=%lx rbx=%lx rcx=%lx rdx=%lx\n",
-                    frame->rax, frame->rbx, frame->rcx, frame->rdx);
-            kprintf("[PF] rsi=%lx rdi=%lx rbp=%lx r8=%lx\n",
-                    frame->rsi, frame->rdi, frame->rbp, frame->r8);
             if (current_thread && current_thread->proc) {
                 process_exit(current_thread->proc, -11);
                 thread_exit(-11);
             }
             for (;;) { asm volatile("cli; hlt"); }
         } else {
-            kprintf("PAGE FAULT at %lx, rip=%lx, error=%lu (KERNEL)\n",
-                    cr2, fault_rip, err);
+            int crash_cpu = smp_cpu_id();
+            uint64_t current_rsp;
+            asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
+            kprintf("PAGE FAULT at %lx, rip=%lx, rsp=%lx, cur_rsp=%lx, error=%lu (KERNEL) cpu=%d\n",
+                    cr2, fault_rip, frame->rsp, current_rsp, err, crash_cpu);
+            /* Dump actual TSS IST values for diagnostic */
+            for (int cpu = 0; cpu < nr_cpus; cpu++) {
+                kprintf("  CPU%d per-CPU tss.ist[1]=%lx\n",
+                    cpu, smp_get_tss_ist(cpu, 1));
+            }
             kpanic("Page fault (kernel mode)");
         }
     }
@@ -538,16 +659,35 @@ void hal_reboot(void) {
     for (;;) { asm volatile("cli; hlt"); }
 }
 
+static void calibrate_tsc(void) {
+    // Wait for first timer tick to avoid partial tick
+    uint64_t start_tick = timer_ticks;
+    while (timer_ticks == start_tick) asm volatile("pause");
+
+    // Calibrate TSC using PIT for ~10ms
+    uint64_t start = rdtsc();
+    uint64_t target_ticks = timer_ticks + 10; // 10 ms at 1000 Hz
+    while (timer_ticks < target_ticks) {
+        asm volatile("pause");
+    }
+    uint64_t end = rdtsc();
+    tsc_khz = (end - start) / 10; // (ticks / 10ms) = kHz
+    kprintf("[HAL] TSC calibrated: %lu kHz\n", tsc_khz);
+}
+
 err_t hal_init(uint64_t mb_info_phys) {
     kmemset(idt, 0, sizeof(idt));
-    kmemset(gdt, 0, sizeof(gdt));
     kmemset(irq_handlers, 0, sizeof(irq_handlers));
+    spinlock_init(&irq_reg_lock, "irq_reg");
 
     gdt_init();
     idt_init();
     pic_remap();
     uart_init();
     hal_timer_init(1000);
+    hal_enable_irqs();          // Unmask PIC IRQs
+    hal_sti();                  // Enable interrupts (IF=1) so PIT fires
+    calibrate_tsc();            // Calibrate TSC using timer
 
     // Enable SMEP and SMAP if supported
     uint32_t eax, ebx, ecx, edx;

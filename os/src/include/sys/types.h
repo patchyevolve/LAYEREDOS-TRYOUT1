@@ -10,8 +10,8 @@ typedef long long uid_t;
 typedef long long gid_t;
 typedef unsigned int mode_t;
 typedef long long time_t;
-typedef long long intptr_t;
-typedef unsigned long long uintptr_t;
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
 #endif
 
 #endif

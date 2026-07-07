@@ -4,6 +4,9 @@
 #include "pmm.h"
 #include "sched.h"
 #include "eventbus.h"
+#include "apic.h"
+#include "smp.h"
+#include "barrier.h"
 
 #define MAX_WATCHDOG_LAYERS 16
 
@@ -166,12 +169,106 @@ void watchdog_timer_handler(int_frame_t* frame, void* data) {
     (void)frame;
     (void)data;
 
-    sched_timer_tick();
+    /* sched_timer_tick is now called directly from the timer ISR in hal.c */
 
     static uint64_t last_check = 0;
     uint64_t now = hal_timer_get_ticks();
     if (now - last_check >= 1000) {
         last_check = now;
         watchdog_run();
+    }
+}
+
+/* ============================================================
+ * NMI lockup detector
+ *
+ * Uses a per-CPU NMI count that is incremented whenever the CPU
+ * receives an NMI (vector 2).  NMIs are broadcast to all other
+ * CPUs from the BSP timer tick.  The NMI handler also records
+ * the interrupted RIP/RSP and detects when a CPU has not moved
+ * for several consecutive NMI samples — indicating a hard lockup
+ * (interrupts disabled, stuck in a tight loop, etc.).
+ * ============================================================ */
+
+/* Interval in timer ticks between NMI broadcasts */
+#define WDT_NMI_INTERVAL_TICKS  10       /* every 10ms at 1000 Hz */
+
+/* Check NMI sample every N NMI events */
+#define WDT_NMI_SAMPLE_RATE     3
+
+/* Stuck threshold: consecutive samples with identical RIP/RSP */
+#define WDT_STUCK_THRESHOLD     2
+
+static volatile uint64_t wdt_nmi_count[MAX_CPUS];
+static uint64_t wdt_last_rip[MAX_CPUS];
+static uint64_t wdt_last_rsp[MAX_CPUS];
+static volatile int wdt_stuck_count[MAX_CPUS];
+static volatile int wdt_stuck[MAX_CPUS];
+
+void watchdog_nmi_handler(int_frame_t* frame) {
+    int cpu = smp_cpu_id();
+    uint64_t count = __sync_fetch_and_add(&wdt_nmi_count[cpu], 1);
+
+    /* Skip stuck detection for idle threads — the idle loop intentionally
+     * stays at the same RIP (HLT instruction) for extended periods and is
+     * NOT a lockup.  Read cpu_thread directly from per-CPU data rather than
+     * using the current_thread macro, which may not resolve correctly from
+     * NMI context on non-BSP CPUs. */
+    if (cpu >= 0 && cpu < nr_cpus && per_cpu_data[cpu]) {
+        thread_t* cur = (thread_t*)per_cpu_data[cpu]->cpu_thread;
+        thread_t* idle = (thread_t*)per_cpu_data[cpu]->idle_thread;
+        if (cur == idle || cur == NULL || idle == NULL)
+            return;
+    }
+
+    if ((count % WDT_NMI_SAMPLE_RATE) == 0) {
+        uint64_t rip = frame->rip;
+        uint64_t rsp = frame->rsp;
+
+        if (rip == wdt_last_rip[cpu] && rsp == wdt_last_rsp[cpu]) {
+            wdt_stuck_count[cpu]++;
+            if (wdt_stuck_count[cpu] >= WDT_STUCK_THRESHOLD) {
+                if (!wdt_stuck[cpu]) {
+                    kprintf("[WDT] CPU %d stuck at rip=%lx rsp=%lx\n",
+                            cpu, rip, rsp);
+                }
+                wdt_stuck[cpu] = 1;
+            }
+        } else {
+            wdt_stuck_count[cpu] = 0;
+            wdt_stuck[cpu] = 0;
+        }
+
+        wdt_last_rip[cpu] = rip;
+        wdt_last_rsp[cpu] = rsp;
+    }
+}
+
+void watchdog_send_nmis_tick(void) {
+    /* Only the BSP sends NMI IPIs to other CPUs */
+    if (!smp_enabled || nr_cpus < 2 || smp_cpu_id() != 0)
+        return;
+
+    static uint64_t tick_counter = 0;
+    tick_counter++;
+    if ((tick_counter % WDT_NMI_INTERVAL_TICKS) != 0)
+        return;
+
+    /* Broadcast NMI to all other CPUs via the "All Except Self" shorthand.
+     * NMI delivery mode bypasses the IF flag, reaching CPUs with interrupts
+     * disabled.  The vector field in ICR is ignored for NMI delivery. */
+    apic_send_nmi_allbutself();
+}
+
+int watchdog_get_stuck(int cpu) {
+    if (cpu < 0 || cpu >= nr_cpus) return 0;
+    return wdt_stuck[cpu];
+}
+
+void watchdog_clear_stuck(void) {
+    int cpu = smp_cpu_id();
+    if (cpu >= 0 && cpu < MAX_CPUS) {
+        wdt_stuck_count[cpu] = 0;
+        wdt_stuck[cpu] = 0;
     }
 }

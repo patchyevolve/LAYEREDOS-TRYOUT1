@@ -1,0 +1,313 @@
+diff a/os/Makefile b/os/Makefile	(rejected hunks)
+@@ -17,24 +17,31 @@ DEBUG ?= $(shell test "$(BUILD)" = "debug" && echo 1 || echo 0)
+ RELEASE ?= $(shell test "$(BUILD)" = "release" && echo 1 || echo 0)
+ 
+ # Feature flags
+-ENABLE_SMP       ?= 0
+-ENABLE_ACPI      ?= 0
++ENABLE_SMP       ?= 1
++ENABLE_ACPI      ?= 1
+ ENABLE_NET       ?= 0
+-ENABLE_NET_TEST     ?= 0
+-ENABLE_STORAGE_TEST ?= 0
++# Disable QEMU SMP quirk workaround (enable SMP even with PCI network device)
++ENABLE_QEMU_SMP_WITH_NIC ?= 0
++ENABLE_NET_TEST       ?= 0
++ENABLE_STORAGE_TEST   ?= 0
++ENABLE_KERNEL_TEST    ?= 0
++ENABLE_SFS_TEST       ?= 0
++ENABLE_PROCESS_TEST   ?= 0
++ENABLE_SECURITY_TEST  ?= 0
++ENABLE_LOCKDEP        ?= 0
+ 
+ # Kernel compilation flags
+ KERNEL_CFLAGS = -ffreestanding -m64 -mcmodel=kernel -mno-red-zone \
+                 -mno-mmx -mno-sse -mno-sse2 -fno-stack-protector \
+                 -fno-pic -fno-pie -nostdlib -fno-strict-aliasing
+ 
+-# User-space compilation flags (small model — user programs at 0x40000000)
++# User-space compilation flags (position-independent for ASLR)
+ USER_CFLAGS = -ffreestanding -m64 -mcmodel=small -mno-red-zone \
+               -mno-mmx -mno-sse -mno-sse2 -fno-stack-protector \
+-              -fno-pic -fno-pie -nostdlib -fno-builtin \
++              -fPIE -fPIC -nostdlib -fno-builtin \
+               -fno-strict-aliasing
+ 
+-INCLUDES = -I src/include -I src/kernel
++INCLUDES = -I src/include -I src/kernel -I src/libtls -I $(BUILD_DIR)/kernel
+ WARNINGS = -Wall -Wextra -Werror -Wno-unused-parameter
+ 
+ # Debug vs release flags
+@@ -51,8 +58,16 @@ POST_LD        =
+ endif
+ 
+ CFLAGS  = $(KERNEL_CFLAGS) $(INCLUDES) $(WARNINGS) $(OPT_FLAGS)
++CFLAGS  += $(shell [ $(ENABLE_SMP) -eq 1 ] && echo "-DCONFIG_SMP")
++CFLAGS  += $(shell [ $(ENABLE_ACPI) -eq 1 ] && echo "-DCONFIG_ACPI")
++CFLAGS  += $(shell [ $(ENABLE_QEMU_SMP_WITH_NIC) -eq 1 ] && echo "-DCONFIG_QEMU_SMP_WITH_NIC")
+ CFLAGS  += $(shell [ $(ENABLE_NET_TEST) -eq 1 ] && echo "-DNET_SELF_TEST")
+ CFLAGS  += $(shell [ $(ENABLE_STORAGE_TEST) -eq 1 ] && echo "-DSTORAGE_SELF_TEST")
++CFLAGS  += $(shell [ $(ENABLE_KERNEL_TEST) -eq 1 ] && echo "-DKERNEL_SELF_TEST")
++CFLAGS  += $(shell [ $(ENABLE_SFS_TEST) -eq 1 ] && echo "-DSFS_SELF_TEST")
++CFLAGS  += $(shell [ $(ENABLE_PROCESS_TEST) -eq 1 ] && echo "-DPROCESS_SELF_TEST")
++CFLAGS  += $(shell [ $(ENABLE_SECURITY_TEST) -eq 1 ] && echo "-DSECURITY_SELF_TEST")
++CFLAGS  += $(shell [ $(ENABLE_LOCKDEP) -eq 1 ] && echo "-DCONFIG_LOCKDEP")
+ ASFLAGS = $(CFLAGS)
+ LDFLAGS = -nostdlib -z max-page-size=0x1000 -T linker.ld
+ 
+@@ -62,7 +77,7 @@ SRC_DIR   = src
+ BUILD_DIR = build
+ 
+ # ---- Kernel sources (exclude user programs and user library) ----
+-KERNEL_C_SRCS = $(filter-out $(SRC_DIR)/kernel/net_test.c $(SRC_DIR)/kernel/storage_test.c, $(wildcard $(SRC_DIR)/kernel/*.c)) \
++KERNEL_C_SRCS = $(filter-out $(SRC_DIR)/kernel/net_test.c $(SRC_DIR)/kernel/storage_test.c $(SRC_DIR)/kernel/kernel_test.c $(SRC_DIR)/kernel/sfs_test.c $(SRC_DIR)/kernel/process_test.c $(SRC_DIR)/kernel/security_test.c, $(wildcard $(SRC_DIR)/kernel/*.c)) \
+                 $(wildcard $(SRC_DIR)/lib/*.c)
+ ifeq ($(ENABLE_NET_TEST),1)
+ KERNEL_C_SRCS += $(SRC_DIR)/kernel/net_test.c
+@@ -70,6 +85,18 @@ endif
+ ifeq ($(ENABLE_STORAGE_TEST),1)
+ KERNEL_C_SRCS += $(SRC_DIR)/kernel/storage_test.c
+ endif
++ifeq ($(ENABLE_KERNEL_TEST),1)
++KERNEL_C_SRCS += $(SRC_DIR)/kernel/kernel_test.c
++endif
++ifeq ($(ENABLE_SFS_TEST),1)
++KERNEL_C_SRCS += $(SRC_DIR)/kernel/sfs_test.c
++endif
++ifeq ($(ENABLE_PROCESS_TEST),1)
++KERNEL_C_SRCS += $(SRC_DIR)/kernel/process_test.c
++endif
++ifeq ($(ENABLE_SECURITY_TEST),1)
++KERNEL_C_SRCS += $(SRC_DIR)/kernel/security_test.c
++endif
+ KERNEL_S_SRCS = $(filter-out \
+                     $(SRC_DIR)/boot/user_program.S \
+                     $(SRC_DIR)/boot/cat_program.S, \
+@@ -81,12 +108,16 @@ KERNEL_S_OBJS = $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(KERNEL_S_SRCS))
+ KERNEL_OBJS   = $(KERNEL_C_OBJS) $(KERNEL_S_OBJS)
+ 
+ # ---- User ELF binaries (embedded as .rodata in kernel) ----
+-USER_PROGRAMS   = user_program cat_program hello-c hello-dyn tcp_echo-c udp_echo-c exit_only thread_test-c
++USER_PROGRAMS   = user_program cat_program hello-c hello-dyn tcp_echo-c udp_echo-c exit_only thread_test-c https_get-c netns_mini-c
+ USER_ELF_BINS   = $(addprefix $(BUILD_DIR)/, $(addsuffix .elf, $(USER_PROGRAMS)))
+ USER_EMBEDDED   = $(addsuffix _embedded.o, $(basename $(USER_ELF_BINS)))
+ DYNSO_BINS      = $(BUILD_DIR)/ld.so $(BUILD_DIR)/lib/ldso/libdyn.so
+ DYNSO_EMBEDDED  = $(BUILD_DIR)/ld_so_embedded.o $(BUILD_DIR)/libdyn_so_embedded.o
+ 
++# ---- Secure boot: auto-generated hash table of known-good binaries ----
++SECURE_BOOT_HASHES_C = $(BUILD_DIR)/kernel/secure_boot_hashes.c
++SECURE_BOOT_ELFS     = $(USER_ELF_BINS) $(DYNSO_BINS)
++
+ # ---- libc sources (user-space library) ----
+ # Exclude the old user.c which has been replaced by the new libc
+ LIBC_C_SRCS = $(filter-out $(SRC_DIR)/lib/libuser/user.c, \
+@@ -103,7 +134,7 @@ KERNEL_ELF = $(BUILD_DIR)/kernel.elf
+ .PHONY: all clean rebuild run headless debug monitor dump size \
+         user_programs libc ldso dynso help test
+ 
+-all: $(KERNEL_ELF) $(LIBC_A) $(DYNSO_BINS)
++all: $(KERNEL_ELF) $(LIBC_A) $(LTLSA) $(DYNSO_BINS)
+ 
+ # ============================================================
+ # Generic pattern rules (applies to kernel AND boot .S / kernel-only .c)
+@@ -131,7 +162,7 @@ $(BUILD_DIR)/lib/libuser/%.o: $(SRC_DIR)/lib/libuser/%.c
+ 	@mkdir -p $(dir $@)
+ 	$(CC) $(USER_CFLAGS) $(INCLUDES) $(WARNINGS) -O2 -g -c $< -o $@
+ 
+-# Compile libc .S files
++# Compile libuser .S files
+ $(BUILD_DIR)/lib/libuser/%.o: $(SRC_DIR)/lib/libuser/%.S
+ 	@mkdir -p $(dir $@)
+ 	$(CC) $(USER_CFLAGS) $(INCLUDES) $(WARNINGS) -O2 -g -c $< -o $@
+@@ -143,20 +174,38 @@ $(LIBC_A): $(LIBC_OBJS)
+ 
+ libc: $(LIBC_A)
+ 
++# ============================================================
++# libtls (user-space TLS library)
++# ============================================================
++LIBSRC_LIBTLS = $(SRC_DIR)/libtls
++LTLSSRCS = $(wildcard $(LIBSRC_LIBTLS)/*.c)
++LTLSOBJS = $(patsubst $(LIBSRC_LIBTLS)/%.c, $(BUILD_DIR)/libtls/%.o, $(LTLSSRCS))
++LTLSA    = $(BUILD_DIR)/libuser/libtls.a
++
++$(BUILD_DIR)/libtls/%.o: $(LIBSRC_LIBTLS)/%.c
++	@mkdir -p $(dir $@)
++	$(CC) $(USER_CFLAGS) $(INCLUDES) $(WARNINGS) -O2 -g -c $< -o $@
++
++$(LTLSA): $(LTLSOBJS)
++	@mkdir -p $(dir $@)
++	$(AR) rcs $@ $^
++
++libtls: $(LTLSA)
++
+ # ============================================================
+ # User ELF programs
+ # ============================================================
+ 
+-# Link user program ELF at fixed address 0x40000000
+-# Assembly-only programs (no libc):
++# Link user programs as PIE (ET_DYN) so kernel applies ASLR
++# Assembly-only programs (no libc) — static PIE, no interpreter:
+ $(BUILD_DIR)/%.elf: $(BUILD_DIR)/boot/%.o
+ 	@mkdir -p $(dir $@)
+-	$(LD) -nostdlib -Ttext=0x40000000 -o $@ $<
++	$(LD) -nostdlib -pie --no-dynamic-linker -z max-page-size=0x1000 -o $@ $<
+ 
+-# C programs that use libc (program name must have -c suffix, e.g. hello-c.elf):
+-$(BUILD_DIR)/%-c.elf: $(BUILD_DIR)/boot/%-c.o $(LIBC_A)
++# C programs that use libc — static PIE, no interpreter:
++$(BUILD_DIR)/%-c.elf: $(BUILD_DIR)/boot/%-c.o $(LIBC_A) $(LTLSA)
+ 	@mkdir -p $(dir $@)
+-	$(LD) -nostdlib -Ttext=0x40000000 -o $@ $(BUILD_DIR)/lib/libuser/crt0.o $< -L $(BUILD_DIR)/libuser -lc
++	$(LD) -nostdlib -pie --no-dynamic-linker -z max-page-size=0x1000 -o $@ $(BUILD_DIR)/lib/libuser/crt0.o $< -L $(BUILD_DIR)/libuser -lc -ltls
+ 
+ # Embed as binary .rodata object (kernel links this)
+ $(BUILD_DIR)/%_embedded.o: $(BUILD_DIR)/%.elf
+@@ -167,6 +216,14 @@ $(BUILD_DIR)/%_embedded.o: $(BUILD_DIR)/%.elf
+ # Kernel link
+ # ============================================================
+ 
++# Generate secure boot hash table from all known-good ELF binaries
++$(SECURE_BOOT_HASHES_C): $(SECURE_BOOT_ELFS) scripts/gen_secure_boot_hashes.py
++	@mkdir -p $(BUILD_DIR)/kernel
++	python3 scripts/gen_secure_boot_hashes.py $@ $(SECURE_BOOT_ELFS)
++
++# secure_boot.o depends on the generated hash table
++$(BUILD_DIR)/kernel/secure_boot.o: $(SECURE_BOOT_HASHES_C)
++
+ $(KERNEL_ELF): $(LINK_OBJS) linker.ld
+ 	@mkdir -p $(BUILD_DIR)
+ 	$(LD) $(LDFLAGS) -o $@ $(LINK_OBJS) $(LIBGCC)
+@@ -177,12 +234,12 @@ $(KERNEL_ELF): $(LINK_OBJS) linker.ld
+ # Convenience targets
+ # ============================================================
+ 
+-run: $(KERNEL_ELF)
+-	$(QEMU) -kernel $(KERNEL_ELF) -serial mon:stdio \
+-		-m 512M -no-reboot -no-shutdown -vga std \
++run: clean all
++	$(QEMU) -kernel $(KERNEL_ELF) -nographic \
++		-m 512M -no-reboot -no-shutdown \
+ 		-nic user,model=e1000
+ 
+-headless: $(KERNEL_ELF)
++headless: clean all
+ 	$(QEMU) -kernel $(KERNEL_ELF) -nographic \
+ 		-m 512M -no-reboot -no-shutdown \
+ 		-d cpu_reset -D qemu.log
+@@ -274,11 +331,11 @@ size: $(KERNEL_ELF)
+ # Dynamic linker & shared library
+ # ============================================================
+ 
+-# Position-independent CFLAGS for shared objects
+-SO_CFLAGS = $(USER_CFLAGS) -fPIC
++# Position-independent CFLAGS for shared objects (USER_CFLAGS already has -fPIC)
++SO_CFLAGS = $(USER_CFLAGS)
+ 
+ # ld.so — compiled with -fPIE so internal refs are RIP-relative
+-LDSO_CFLAGS = $(SO_CFLAGS) -fPIE -fvisibility=hidden
++LDSO_CFLAGS = $(SO_CFLAGS) -fPIE -fvisibility=hidden -fno-stack-protector
+ 
+ $(BUILD_DIR)/lib/ldso/ldso.o: $(SRC_DIR)/lib/ldso/ldso.c
+ 	@mkdir -p $(dir $@)
+@@ -292,7 +349,7 @@ $(BUILD_DIR)/ld.so: $(BUILD_DIR)/lib/ldso/ldso.o
+ # libdyn.so — test shared library (export all symbols)
+ $(BUILD_DIR)/lib/ldso/libdyn.o: $(SRC_DIR)/lib/ldso/libdyn.c
+ 	@mkdir -p $(dir $@)
+-	$(CC) $(SO_CFLAGS) $(INCLUDES) $(WARNINGS) -O2 -g -c $< -o $@
++	$(CC) $(SO_CFLAGS) $(INCLUDES) $(WARNINGS) -O2 -g -fno-stack-protector -c $< -o $@
+ 
+ $(BUILD_DIR)/lib/ldso/libdyn.so: $(BUILD_DIR)/lib/ldso/libdyn.o
+ 	$(LD) -nostdlib -shared -z max-page-size=0x1000 -o $@ $<
+@@ -308,7 +365,7 @@ $(BUILD_DIR)/boot/hello-dyn.o: $(SRC_DIR)/boot/hello-dyn.c
+ 
+ $(BUILD_DIR)/hello-dyn.elf: $(BUILD_DIR)/boot/hello-dyn.o $(BUILD_DIR)/libdyn.so $(LIBC_A)
+ 	@mkdir -p $(dir $@)
+-	$(LD) -nostdlib -dynamic-linker /ld.so -z max-page-size=0x1000 \
++	$(LD) -nostdlib -pie -dynamic-linker /ld.so -z max-page-size=0x1000 \
+ 		-o $@ $(BUILD_DIR)/lib/libuser/crt0.o $< \
+ 		-L $(BUILD_DIR)/lib/ldso -ldyn \
+ 		-L $(BUILD_DIR)/libuser -lc
+@@ -340,6 +397,7 @@ help:
+ 	@echo "  run       - Build and run in QEMU"
+ 	@echo "  headless  - Run in headless mode (serial only)"
+ 	@echo "  test      - Run headless automated test"
++	@echo "  test-security - Run security self-tests"
+ 	@echo "  debug     - Run with GDB stub on :1234"
+ 	@echo "  monitor   - Run with QEMU monitor"
+ 	@echo "  dump      - Dump raw kernel binary"
+@@ -357,8 +415,10 @@ rebuild: clean all
+ clean:
+ 	rm -rf $(BUILD_DIR)
+ 	rm -f qemu.log
++	rm -f $(SECURE_BOOT_HASHES_C)
+ 
+-test-net: clean
++test-net:
++	$(MAKE) clean >/dev/null 2>&1
+ 	$(MAKE) ENABLE_NET_TEST=1 all
+ 	@echo "Running network self-tests..."
+ 	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
+@@ -366,7 +426,8 @@ test-net: clean
+ 		-nic none -device e1000 > /tmp/qemu_test_net.txt 2>&1 || true
+ 	@grep -a 'tcp_find_conn_ipv6\|ndp_cache_miss\|icmpv6_ns_parse\|socket_refcount\|udp_queue\|Results:' /tmp/qemu_test_net.txt || true
+ 
+-test-storage: clean
++test-storage:
++	$(MAKE) clean >/dev/null 2>&1
+ 	$(MAKE) ENABLE_STORAGE_TEST=1 all
+ 	@echo "Running storage self-tests..."
+ 	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
+@@ -374,6 +435,51 @@ test-storage: clean
+ 		-nic none -device e1000 > /tmp/qemu_test_storage.txt 2>&1 || true
+ 	@grep -a 'block_cache_basic\|block_cache_writeback\|block_register_reject\|swap_alloc_free\|swap_out_in\|journal_init\|journal_log_commit\|snapshot_take_info\|Results:' /tmp/qemu_test_storage.txt || true
+ 
++test-kernel:
++	$(MAKE) clean >/dev/null 2>&1
++	$(MAKE) ENABLE_KERNEL_TEST=1 all
++	@echo "Running kernel self-tests..."
++	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
++		-m 512M -no-reboot -no-shutdown \
++		-nic none -device e1000 > /tmp/qemu_test_kernel.txt 2>&1 || true
++	@grep -a 'kmalloc_free\|kmalloc_edge\|vma_add_find\|tcp_conn_create\|tcp_conn_bind_listen\|socket_lifecycle\|spinlock_acquire\|tcp_retransmission\|mutex_lock\|udp_endpoint_multi\|block_cache_eviction\|rwlock_basic\|seqlock_basic\|lockdep_ordering\|Results:' /tmp/qemu_test_kernel.txt || true
++
++test-sfs:
++	$(MAKE) clean >/dev/null 2>&1
++	$(MAKE) ENABLE_SFS_TEST=1 all
++	@echo "Running SFS self-tests..."
++	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
++		-m 512M -no-reboot -no-shutdown \
++		-nic none -device e1000 > /tmp/qemu_test_sfs.txt 2>&1 || true
++	@grep -a 'sfs_create_write\|sfs_mkdir_and\|sfs_rename\|sfs_links\|sfs_stat\|Results:' /tmp/qemu_test_sfs.txt || true
++
++test-process:
++	$(MAKE) clean >/dev/null 2>&1
++	$(MAKE) ENABLE_PROCESS_TEST=1 all
++	@echo "Running process self-tests..."
++	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
++		-m 512M -no-reboot -no-shutdown \
++		-nic none -device e1000 > /tmp/qemu_test_process.txt 2>&1 || true
++	@grep -a 'process_create_find\|process_exit_code\|process_fork_basic\|process_zombie\|Results:' /tmp/qemu_test_process.txt || true
++
++test-security:
++	$(MAKE) clean >/dev/null 2>&1
++	$(MAKE) ENABLE_SECURITY_TEST=1 all
++	@echo "Running security self-tests..."
++	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
++		-m 512M -no-reboot -no-shutdown \
++		-nic none -device e1000 > /tmp/qemu_test_security.txt 2>&1 || true
++	@grep -a 'syscall_bad_fd\|syscall_null_buf\|user_ptr_checks\|file_permissions\|process_memory_isolation\|stack_canary\|vfs_fd_mode_enforcement\|Results:' /tmp/qemu_test_security.txt || true
++
++test-all:
++	$(MAKE) clean >/dev/null 2>&1
++	$(MAKE) ENABLE_NET_TEST=1 ENABLE_STORAGE_TEST=1 ENABLE_KERNEL_TEST=1 ENABLE_SFS_TEST=1 ENABLE_PROCESS_TEST=1 ENABLE_SECURITY_TEST=1 all
++	@echo "Running all self-tests (one boot)..."
++	@timeout 180 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
++		-m 512M -no-reboot -no-shutdown \
++		-nic none -device e1000 > /tmp/qemu_test_all.txt 2>&1 || true
++	@grep -a 'PASS\|FAIL\|Results:' /tmp/qemu_test_all.txt || true
++
+ test-net-2qemu: all
+ 	@QEMU="$(QEMU)" chmod +x test-2qemu.sh; \
+ 	 QEMU="$(QEMU)" ./test-2qemu.sh

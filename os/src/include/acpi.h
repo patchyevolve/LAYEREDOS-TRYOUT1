@@ -115,4 +115,50 @@ typedef struct {
 extern int iso_count;
 extern iso_entry_t isos[MAX_ISOS];
 
+/* ---- NUMA (SRAT / SLIT) ---- */
+
+#define MAX_NUMA_NODES 8
+#define MAX_MEMORY_AFFINITIES 32
+#define MAX_CPU_AFFINITIES 64
+
+/* SRAT - Memory Affinity (type 1) */
+typedef struct __attribute__((packed)) {
+    madt_entry_header_t hdr;
+    uint32_t proximity_domain;
+    uint16_t reserved1;
+    uint64_t base_addr;
+    uint64_t length;
+    uint32_t reserved2;
+    uint32_t flags;  /* bit 0 = enabled */
+} srat_memory_affinity_t;
+
+/* SRAT - LAPIC Affinity (type 0) */
+typedef struct __attribute__((packed)) {
+    madt_entry_header_t hdr;
+    uint8_t  proximity_domain;
+    uint8_t  apic_id;
+    uint32_t flags;  /* bit 0 = enabled */
+} srat_lapic_affinity_t;
+
+/* Parsed memory region — maps a physical range to a NUMA node */
+typedef struct {
+    uint64_t base;
+    uint64_t length;
+    int node;
+    int enabled;
+} numa_memory_region_t;
+
+extern int numa_available;
+extern int numa_node_count;
+extern numa_memory_region_t numa_memory_regions[MAX_MEMORY_AFFINITIES];
+extern int numa_memory_region_count;
+extern int numa_cpu_to_node[MAX_CPUS];
+
+int acpi_parse_srat(void);
+int acpi_get_cpu_node(int cpu_idx);
+
+/* Check if a physical page at page_idx belongs to the given NUMA node.
+ * Returns 1 if yes, 0 if no or if NUMA is not available. */
+int acpi_is_page_in_node(uint64_t page_idx, int node);
+
 #endif /* ACPI_H */

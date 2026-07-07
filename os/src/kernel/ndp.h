@@ -84,6 +84,7 @@ typedef struct __attribute__((packed)) {
 err_t ndp_init(void);
 void  ndp_cache_update(const uint8_t* ipv6, const uint8_t* mac);
 int   ndp_cache_lookup(const uint8_t* ipv6, uint8_t* mac);
+int   ndp_cache_delete(const uint8_t* ipv6);
 int   ndp_resolve(const uint8_t* ipv6, uint8_t* mac, int timeout_ms);
 void  ndp_make_lladdr(const uint8_t* mac, uint8_t* ipv6_out);
 void  ndp_make_solicited_node(const uint8_t* ipv6, uint8_t* mc_out);

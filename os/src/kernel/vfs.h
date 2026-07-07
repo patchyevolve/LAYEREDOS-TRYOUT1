@@ -28,9 +28,12 @@
 typedef struct vfs_node vfs_node_t;
 typedef struct vfs_fs   vfs_fs_t;
 
+extern spinlock_t vfs_global_lock;
+
 typedef struct vfs_node {
     char        name[VFS_MAX_NAME];
-    uint32_t    flags;
+    uint32_t    flags;          // <-- NOT mode/permissions, but node flags (e.g. VFS_FLAG_SYMLINK)
+    uint32_t    mode;           // cached permission mode (lower 16 bits)
     uint64_t    size;
     uint64_t    inode;
     vfs_node_t* parent;
@@ -39,19 +42,44 @@ typedef struct vfs_node {
     vfs_fs_t*   fs;
     void*       private_data;
     int         refcount;
-    int         dynamic;    /* non-zero → vfs_close kfrees node when refcount hits 0 */
-    void        (*destructor)(void* private_data); /* called before kfree when dynamic */
+    int         dynamic;        /* non-zero → vfs_close kfrees node when refcount hits 0 */
+    void        (*destructor)(void* private_data);
+    uid_t       uid;            // cached file owner
+    gid_t       gid;            // cached file group
 } vfs_node_t;
+
+/* Permission mode bits (POSIX S_I* equivalents) */
+#define S_IRWXU  00700
+#define S_IRUSR  00400
+#define S_IWUSR  00200
+#define S_IXUSR  00100
+#define S_IRWXG  00070
+#define S_IRGRP  00040
+#define S_IWGRP  00020
+#define S_IXGRP  00010
+#define S_IRWXO  00007
+#define S_IROTH  00004
+#define S_IWOTH  00002
+#define S_IXOTH  00001
+#define S_ISUID  04000
+#define S_ISGID  02000
+#define S_ISVTX  01000
+
+/* Check if current process can access a file with the given mode.
+ * Returns 0 on success, negative errno on denial. */
+extern int vfs_access_check(vfs_node_t* node, int want_write);
 
 typedef struct vfs_stat {
     uint64_t    size;
     uint64_t    inode;
-    uint32_t    mode;
+    uint32_t    mode;       // <-- permissions + type (type in upper 16 bits)
     uint32_t    flags;
     uint64_t    atime;
     uint64_t    mtime;
     uint64_t    ctime;
     uint32_t    fs_flags;
+    uid_t       uid;        // file owner
+    gid_t       gid;        // file group
 } vfs_stat_t;
 
 typedef struct vfs_file_ops {

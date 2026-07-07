@@ -3,6 +3,10 @@
 
 #include "types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* IA32_APIC_BASE MSR */
 #define IA32_APIC_BASE_MSR  0x1B
 #define APIC_BASE_ENABLE    (1ULL << 11)
@@ -21,7 +25,7 @@
 #define APIC_REG_PPR        0x0A0
 #define APIC_REG_EOI        0x0B0
 #define APIC_REG_RRD        0x0C0
-#define APIC_REG_SVR        0x0D0
+#define APIC_REG_SVR        0x0F0
 #define APIC_REG_ISR0       0x100
 #define APIC_REG_TMR0       0x180
 #define APIC_REG_IRR0       0x200
@@ -37,6 +41,10 @@
 #define APIC_REG_TIMER_INIT 0x380
 #define APIC_REG_TIMER_CUR  0x390
 #define APIC_REG_TIMER_DIV  0x3E0
+
+/* x2APIC MSR base */
+#define X2APIC_MSR_BASE     0x800
+#define X2APIC_ICR_MSR      0x830
 
 /* SVR bits */
 #define APIC_SVR_ENABLE     (1ULL << 8)
@@ -55,6 +63,7 @@
 #define APIC_LVT_TIMER_ONESHOT  0
 #define APIC_LVT_TIMER_TSCDEADLINE (2ULL << 17)
 
+/* ICR delivery modes */
 #define APIC_ICR_DELIV_FIXED  0
 #define APIC_ICR_DELIV_LOWPRI (1ULL << 8)
 #define APIC_ICR_DELIV_SMI    (2ULL << 8)
@@ -74,15 +83,38 @@
 #define APIC_SPURIOUS_VEC 0xFF
 
 extern int apic_present;
+extern int apic_x2apic;
 extern uint32_t apic_id;
 
-err_t apic_init(void);
-void apic_enable(void);
-void apic_disable(void);
-void apic_eoi(void);
+/* Core APIC */
+err_t    apic_init(void);
+void     apic_enable(void);
+void     apic_disable(void);
+void     apic_eoi(void);
 uint32_t apic_read(unsigned reg);
-void apic_write(unsigned reg, uint32_t val);
-void apic_timer_init(uint32_t hz);
-void apic_disable_pic(void);
+void     apic_write(unsigned reg, uint32_t val);
+uint64_t apic_read_msr(uint32_t msr);
+void     apic_write_msr(uint32_t msr, uint64_t val);
 
+/* APIC timer */
+void     apic_timer_init(uint32_t hz);
+void     apic_disable_pic(void);
+
+/* IPI delivery */
+void apic_send_ipi(uint32_t apic_id_dest, uint8_t vector, uint32_t delivery_mode);
+void apic_send_ipi_self(uint8_t vector);
+void apic_send_ipi_allbutself(uint8_t vector);
+void apic_send_init_ipi(uint32_t apic_id_dest);
+void apic_send_sipi_ipi(uint32_t apic_id_dest, uint8_t vector);
+
+/* I/O APIC */
+void apic_ioapic_init(void);
+
+/* NMI IPI — sends NMI to all CPUs except self */
+void apic_send_nmi_allbutself(void);
+
+#ifdef __cplusplus
+}
 #endif
+
+#endif /* APIC_H */

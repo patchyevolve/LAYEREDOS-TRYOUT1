@@ -7,6 +7,7 @@
 #include "nic.h"
 #include "eth.h"
 #include "sched.h"
+#include "hpet.h"
 
 #define SLAAC_TIMEOUT_MS 2000
 
@@ -69,13 +70,15 @@ err_t slaac_configure(void) {
 
     int step = 100;
     int steps = SLAAC_TIMEOUT_MS / step;
+    uint64_t hpet_deadline = hpet_present ? hpet_ns() + (uint64_t)SLAAC_TIMEOUT_MS * 1000000ULL : 0;
     for (int i = 0; i < steps; i++) {
         eth_rx_poll();
         if (slaac_ra.received) {
             kprintf("[SLAAC] RA received within %d ms\n", i * step);
             break;
         }
-        thread_sleep((uint64_t)step);
+        if (hpet_present && hpet_ns() >= hpet_deadline) break;
+        thread_yield();
     }
 
     if (!slaac_ra.received) {

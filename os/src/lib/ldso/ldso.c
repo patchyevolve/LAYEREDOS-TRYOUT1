@@ -93,6 +93,7 @@ static void ld_exit(int code) {
 #define DT_FINI_ARRAY 26
 #define DT_INIT_ARRAYSZ 27
 #define DT_FINI_ARRAYSZ 28
+#define DT_GNU_HASH  0x6ffffef5
 
 #define R_X86_64_NONE      0
 #define R_X86_64_64        1
@@ -233,6 +234,8 @@ static struct so_entry {
     uint64_t init, fini;
     uint64_t init_array, init_arraysz;
     uint64_t fini_array, fini_arraysz;
+    uint64_t gnu_hash;
+    uint32_t symcnt;
     char     name[64];
 } so_list[MAX_SO];
 static int so_count = 0;
@@ -316,6 +319,7 @@ static int load_so(const char* path) {
         so->init = 0; so->fini = 0;
         so->init_array = 0; so->init_arraysz = 0;
         so->fini_array = 0; so->fini_arraysz = 0;
+        so->gnu_hash = 0;
         uint64_t dyn_end = so->dyn + dyn_memsz;
         elf_dyn_t* dyn = (elf_dyn_t*)so->dyn;
         while (dyn->d_tag != DT_NULL && (uint64_t)(dyn + 1) <= dyn_end) {
@@ -336,6 +340,7 @@ static int load_so(const char* path) {
             case DT_INIT_ARRAYSZ: so->init_arraysz = dyn->d_val; break;
             case DT_FINI_ARRAY:   so->fini_array   = dyn->d_val + load_base; break;
             case DT_FINI_ARRAYSZ: so->fini_arraysz = dyn->d_val; break;
+            case DT_GNU_HASH:     so->gnu_hash = dyn->d_val + load_base; break;
             case DT_NEEDED: {
                 const char* dep = (const char*)(so->strtab + dyn->d_val);
                 load_so(dep);
@@ -345,6 +350,20 @@ static int load_so(const char* path) {
             dyn++;
         }
         if (dyn->d_tag != DT_NULL) { ld_write("ld.so: no DT_NULL\n"); return -1; }
+    }
+
+    so->symcnt = 0;
+    if (so->gnu_hash) {
+        uint32_t* h = (uint32_t*)so->gnu_hash;
+        uint32_t nbuckets = h[0];
+        /* Skip nbuckets(4) + symoffset(4) + bloom(size_t[nbloom]) */
+        unsigned nbloom = sizeof(unsigned long) == 8 ? 2 : 1;
+        unsigned nbloom_u32 = nbloom * (sizeof(unsigned long) / sizeof(uint32_t));
+        uint32_t* buckets = h + 2 + nbloom_u32;
+        uint32_t max_bucket = 0;
+        for (unsigned b = 0; b < nbuckets; b++)
+            if (buckets[b] > max_bucket) max_bucket = buckets[b];
+        so->symcnt = max_bucket + 1;
     }
 
     so_count++;
@@ -358,7 +377,7 @@ static uint64_t find_sym(const char* name) {
     for (int s = 0; s < so_count; s++) {
         struct so_entry* so = &so_list[s];
         if (!so->symtab || !so->strtab) continue;
-        unsigned nsym = so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t));
+        unsigned nsym = so->symcnt ? so->symcnt : (so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t)));
         elf_sym_t* symtab = (elf_sym_t*)so->symtab;
         for (unsigned i = 0; i < nsym; i++) {
             elf_sym_t* sym = &symtab[i];
@@ -383,7 +402,7 @@ static void process_rela(struct so_entry* so) {
         unsigned long relaent = so->relaent ? so->relaent : 24;
         unsigned long n = so->relasz / relaent;
         elf_rela_t* r = (elf_rela_t*)so->rela;
-        unsigned nsym_so = so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t));
+        unsigned nsym_so = so->symcnt ? so->symcnt : (so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t)));
         for (unsigned long i = 0; i < n; i++) {
             if (r[i].r_offset > ~so->base) continue;
             uint64_t* addr = (uint64_t*)(so->base + r[i].r_offset);
@@ -427,7 +446,7 @@ static void process_rela(struct so_entry* so) {
     if (so->pltrel && so->pltrelsz) {
         unsigned long n = so->pltrelsz / 24;
         elf_rela_t* r = (elf_rela_t*)so->pltrel;
-        unsigned nsym_so = so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t));
+        unsigned nsym_so = so->symcnt ? so->symcnt : (so->strsz / (so->syment ? so->syment : sizeof(elf_sym_t)));
         for (unsigned long i = 0; i < n; i++) {
             uint64_t* addr = (uint64_t*)(so->base + r[i].r_offset);
             unsigned type = ELF64_R_TYPE(r[i].r_info);
@@ -473,34 +492,51 @@ void __attribute__((noinline)) _start(void) {
     if (at_phdr && at_phnum) {
         struct so_entry* main_so = &so_list[so_count];
         memset(main_so, 0, sizeof(*main_so));
-        /* For ET_EXEC (non-PIE) base=0; for ET_DYN (PIE) base is implicit in vaddrs.
-         * We determine base by checking if the ELF header at at_entry has type.
-         * For now assume ET_EXEC with base=0. */
-        main_so->base = 0;
-        memcpy(main_so->name, "main", 5);
-        /* Scan program headers to find PT_DYNAMIC */
+        /* Determine base load address from AT_PHDR:
+         *   base = at_phdr - PT_PHDR.vaddr
+         * For ET_EXEC (non-PIE) this gives 0; for ET_DYN (PIE) this gives the ASLR offset. */
+        uint64_t main_base = 0;
         elf_phdr_t* ph = (elf_phdr_t*)at_phdr;
         for (unsigned i = 0; i < (unsigned)at_phnum; i++) {
+            if (ph[i].type == PT_PHDR)
+                { main_base = (uint64_t)at_phdr - ph[i].vaddr; break; }
+        }
+        main_so->base = main_base;
+        memcpy(main_so->name, "main", 5);
+        /* Scan program headers to find PT_DYNAMIC */
+        for (unsigned i = 0; i < (unsigned)at_phnum; i++) {
             if (ph[i].type == PT_DYNAMIC)
-                { main_so->dyn = ph[i].vaddr; break; }  /* vaddr already includes base */
+                { main_so->dyn = ph[i].vaddr + main_base; break; }
         }
         if (main_so->dyn) {
             elf_dyn_t* dyn = (elf_dyn_t*)main_so->dyn;
             while (dyn->d_tag != DT_NULL) {
                 switch (dyn->d_tag) {
-                case DT_STRTAB: main_so->strtab = dyn->d_val; break;
+                case DT_STRTAB: main_so->strtab = dyn->d_val + main_base; break;
                 case DT_STRSZ:  main_so->strsz  = dyn->d_val; break;
-                case DT_SYMTAB: main_so->symtab = dyn->d_val; break;
+                case DT_SYMTAB: main_so->symtab = dyn->d_val + main_base; break;
                 case DT_SYMENT: main_so->syment = dyn->d_val; break;
-                case DT_RELA:   main_so->rela   = dyn->d_val; break;
+                case DT_RELA:   main_so->rela   = dyn->d_val + main_base; break;
                 case DT_RELASZ: main_so->relasz = dyn->d_val; break;
                 case DT_RELAENT:main_so->relaent= dyn->d_val; break;
-                case DT_PLTREL: main_so->pltrel = dyn->d_val; break;
+                case DT_PLTREL: main_so->pltrel = dyn->d_val + main_base; break;
                 case DT_PLTRELSZ: main_so->pltrelsz = dyn->d_val; break;
-                case DT_JMPREL: main_so->pltrel = dyn->d_val; break;
+                case DT_JMPREL: main_so->pltrel = dyn->d_val + main_base; break;
+                case DT_GNU_HASH: main_so->gnu_hash = dyn->d_val + main_base; break;
                 }
                 dyn++;
             }
+        }
+        if (main_so->gnu_hash) {
+            uint32_t* h = (uint32_t*)main_so->gnu_hash;
+            uint32_t nbuckets = h[0];
+            unsigned nbloom = sizeof(unsigned long) == 8 ? 2 : 1;
+            unsigned nbloom_u32 = nbloom * (sizeof(unsigned long) / sizeof(uint32_t));
+            uint32_t* buckets = h + 2 + nbloom_u32;
+            uint32_t max_bucket = 0;
+            for (unsigned b = 0; b < nbuckets; b++)
+                if (buckets[b] > max_bucket) max_bucket = buckets[b];
+            main_so->symcnt = max_bucket + 1;
         }
         so_count++;
     }

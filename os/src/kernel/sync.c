@@ -20,6 +20,7 @@ void spinlock_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
     }
     lock->holder = current_thread ? current_thread->id : 0;
     __sync_synchronize();
+    lockdep_acquire((void*)lock, lock->name, 0);
     *out_flags = flags;
 }
 
@@ -31,11 +32,13 @@ int spinlock_try_acquire(spinlock_t* lock, cpu_flags_t* out_flags) {
     }
     lock->holder = current_thread ? current_thread->id : 0;
     __sync_synchronize();
+    lockdep_acquire((void*)lock, lock->name, 0);
     *out_flags = flags;
     return 1;
 }
 
 void spinlock_release(spinlock_t* lock, cpu_flags_t flags) {
+    lockdep_release((void*)lock);
     __sync_synchronize();
     lock->holder = 0;
     __sync_lock_release(&lock->lock);

@@ -3,6 +3,7 @@
 #include "hal.h"
 #include "block.h"
 #include "sched.h"
+#include "sync.h"
 
 #define ATA_PRIMARY_IO    0x1F0
 #define ATA_PRIMARY_CTRL  0x3F6
@@ -36,6 +37,7 @@
 #define ATA_IRQ_TIMEOUT_MS 5000
 
 static ata_drive_t drives[4];
+static mutex_t   ata_global_lock;
 
 static int ata_wait_bsy(uint16_t base, int timeout) {
     for (int i = 0; i < timeout; i++) {
@@ -142,6 +144,7 @@ static void ata_identify_drive(ata_drive_t* d, uint16_t base, uint8_t drive) {
 
 err_t ata_init(void) {
     kmemset(drives, 0, sizeof(drives));
+    mutex_init(&ata_global_lock);
 
     drives[0].base = ATA_PRIMARY_IO;
     drives[0].ctrl = ATA_PRIMARY_CTRL;
@@ -157,8 +160,7 @@ err_t ata_init(void) {
     drives[3].irq  = ATA_SECONDARY_IRQ;
 
     for (int i = 0; i < 4; i++) {
-        drives[i].wq.waiters = NULL;
-        drives[i].wq.count = 0;
+        wait_queue_init(&drives[i].wq);
         drives[i].irq_received = 0;
         drives[i].irq_status = 0;
     }
@@ -188,12 +190,18 @@ err_t ata_init(void) {
 /* IRQ-driven PIO transfer */
 static int ata_pio_transfer_irq(uint16_t base, uint8_t drive, uint64_t lba,
                                 uint8_t count, void* buf, int write) {
+    err_t e = mutex_lock(&ata_global_lock, 10000);
+    if (e != ERR_OK) return -1;
+
     uint8_t drive_idx;
     for (drive_idx = 0; drive_idx < 4; drive_idx++) {
         if (drives[drive_idx].base == base && (drive_idx & 1) == (drive & 1))
             break;
     }
-    if (drive_idx >= 4) return -1;
+    if (drive_idx >= 4) {
+        mutex_unlock(&ata_global_lock);
+        return -1;
+    }
 
     ata_drive_t* drv = &drives[drive_idx];
 
@@ -214,14 +222,20 @@ static int ata_pio_transfer_irq(uint16_t base, uint8_t drive, uint64_t lba,
     for (int s = 0; s < count; s++) {
         if (write) {
             /* Wait for drive ready to accept data */
-            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) return -1;
+            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) {
+                mutex_unlock(&ata_global_lock);
+                return -1;
+            }
 
             /* Write sector data */
             for (int i = 0; i < 256; i++)
                 outw(base + ATA_REG_DATA, word_buf[s * 256 + i]);
         } else {
             /* Wait for data ready */
-            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) return -1;
+            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) {
+                mutex_unlock(&ata_global_lock);
+                return -1;
+            }
 
             /* Read sector data */
             for (int i = 0; i < 256; i++)
@@ -232,9 +246,13 @@ static int ata_pio_transfer_irq(uint16_t base, uint8_t drive, uint64_t lba,
     /* For writes, flush write cache */
     if (write) {
         outb(base + ATA_REG_CMD, ATA_CMD_FLUSH);
-        if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) return -1;
+        if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) {
+            mutex_unlock(&ata_global_lock);
+            return -1;
+        }
     }
 
+    mutex_unlock(&ata_global_lock);
     return count * ATA_SECTOR_SIZE;
 }
 

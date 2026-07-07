@@ -6,10 +6,11 @@
 #include "hal.h"
 #include "sched.h"
 #include "sync.h"
+#include "net_ns.h"
 
-static ndp_cache_entry_t ndp_cache[NDP_CACHE_SIZE];
-static int ndp_initialized = 0;
-static spinlock_t ndp_lock;
+#define ndp_cache (get_current_ns()->ndp_cache)
+#define ndp_initialized (get_current_ns()->ndp_initialized)
+#define ndp_lock (get_current_ns()->ndp_lock)
 
 static void ndp_cache_evict(void) {
     int lru = 0;
@@ -60,6 +61,22 @@ void ndp_cache_update(const uint8_t* ipv6, const uint8_t* mac) {
     spinlock_release(&ndp_lock, flags);
 }
 
+int ndp_cache_delete(const uint8_t* ipv6) {
+    if (!ndp_initialized) return ERR_NOENT;
+    cpu_flags_t flags;
+    spinlock_acquire(&ndp_lock, &flags);
+    for (int i = 0; i < NDP_CACHE_SIZE; i++) {
+        if (ndp_cache[i].valid &&
+            kmemcmp(ndp_cache[i].ipv6, ipv6, IPV6_ADDR_LEN) == 0) {
+            ndp_cache[i].valid = 0;
+            spinlock_release(&ndp_lock, flags);
+            return ERR_OK;
+        }
+    }
+    spinlock_release(&ndp_lock, flags);
+    return ERR_NOENT;
+}
+
 int ndp_cache_lookup(const uint8_t* ipv6, uint8_t* mac) {
     if (!ndp_initialized) return 0;
 
@@ -81,7 +98,6 @@ int ndp_cache_lookup(const uint8_t* ipv6, uint8_t* mac) {
 }
 
 void ndp_make_lladdr(const uint8_t* mac, uint8_t* ipv6_out) {
-    /* fe80:: + EUI-64: invert bit 7 of first byte, insert ff:fe in middle */
     kmemset(ipv6_out, 0, IPV6_ADDR_LEN);
     ipv6_out[0] = 0xFE;
     ipv6_out[1] = 0x80;
@@ -97,7 +113,6 @@ void ndp_make_lladdr(const uint8_t* mac, uint8_t* ipv6_out) {
 }
 
 void ndp_make_solicited_node(const uint8_t* ipv6, uint8_t* mc_out) {
-    /* FF02::1:FFxx:xxxx where xx:xxxx = last 3 bytes of target address */
     kmemset(mc_out, 0, IPV6_ADDR_LEN);
     mc_out[0]  = 0xFF;
     mc_out[1]  = 0x02;
@@ -139,11 +154,9 @@ err_t ndp_init(void) {
     if (ndp_initialized) return ERR_OK;
 
     spinlock_init(&ndp_lock, "ndp");
-    kmemset(ndp_cache, 0, sizeof(ndp_cache));
 
     ndp_initialized = 1;
 
-    /* Derive and print our link-local address */
     uint8_t lladdr[IPV6_ADDR_LEN];
     ndp_make_lladdr(nic.mac, lladdr);
     kprintf("[NDP] Initialized (cache %d entries)\n", NDP_CACHE_SIZE);

@@ -527,6 +527,8 @@ static int sfs_vfs_stat(vfs_node_t* node, vfs_stat_t* st) {
     st->mtime = f->inode.mtime;
     st->ctime = f->inode.ctime;
     st->fs_flags = f->inode.flags;
+    st->uid  = 0;  /* SFS does not store uid; default to root */
+    st->gid  = 0;
     return 0;
 }
 

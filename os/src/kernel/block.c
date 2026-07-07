@@ -22,7 +22,7 @@ static uint64_t cache_hits = 0;
 static uint64_t cache_misses = 0;
 static uint64_t cache_writes = 0;
 static uint64_t cache_clock = 0;
-static spinlock_t cache_lock;
+static spinlock_t cache_lock = { .name = "cache_lock" };
 
 static cache_line_t* cache_lookup(block_dev_t* dev, uint64_t lba) {
     for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
@@ -120,6 +120,22 @@ err_t block_write(block_dev_t* dev, uint64_t lba, uint8_t count, const void* buf
         spinlock_release(&cache_lock, flags);
     }
     return ERR_OK;
+}
+
+/* Non-blocking sync: returns 1 if cache_lock was acquired and sync ran,
+ * 0 if lock was contended (caller should skip). */
+int block_try_sync(void) {
+    cpu_flags_t flags;
+    if (!spinlock_try_acquire(&cache_lock, &flags)) return 0;
+    for (int i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        cache_line_t* cl = &block_cache[i];
+        if (cl->valid && cl->dirty && cl->dev && cl->dev->write) {
+            cl->dev->write(cl->dev, cl->lba, 1, cl->data);
+            cl->dirty = 0;
+        }
+    }
+    spinlock_release(&cache_lock, flags);
+    return 1;
 }
 
 err_t block_sync(void) {

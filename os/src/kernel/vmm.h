@@ -22,5 +22,6 @@ void vmm_free_user_pages(uint64_t pml4_phys);
 uint64_t vmm_get_kernel_pml4(void);
 page_entry_t* vmm_walk_pagetable(uint64_t pml4_phys, uint64_t virt);
 void vmm_protect_kernel_text(void);
+void vmm_split_identity_map(void);
 
 #endif

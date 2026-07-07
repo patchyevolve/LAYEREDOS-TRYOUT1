@@ -4,23 +4,18 @@
 #include "udp.h"
 #include "ipv6.h"
 #include "igmp.h"
+#include "unix.h"
 #include "process.h"
 #include "sched.h"
 #include "kmalloc.h"
+#include "net_ns.h"
 
 #ifndef SOCKADDR_MAX
 #define SOCKADDR_MAX sizeof(sockaddr_in6_t)
 #endif
 
-/* Socket table (one per process, mapped via fd-like index) */
-#define NET_MAX_SOCKETS 32
-
-static struct {
-    int        used;
-    socket_t*  sock;
-} net_sockets[NET_MAX_SOCKETS];
-
-static int net_initialized = 0;
+#define net_initialized (get_current_ns()->net_initialized)
+#define net_sockets (get_current_ns()->net_sockets)
 
 /* ---- TCP socket operations ---- */
 
@@ -139,8 +134,9 @@ static int tcp_sock_send(socket_t* s, const uint8_t* buf, uint32_t len) {
 
 static int tcp_sock_sendto(socket_t* s, const uint8_t* buf, uint32_t len,
                              const sockaddr_t* dst_addr, socklen_t addrlen) {
-    (void)s; (void)buf; (void)len; (void)dst_addr; (void)addrlen;
-    return ERR_NOSYS;
+    (void)dst_addr; (void)addrlen;
+    /* On connected sockets, sendto ignores dest_addr per POSIX */
+    return tcp_sock_send(s, buf, len);
 }
 
 static int tcp_sock_recv(socket_t* s, uint8_t* buf, uint32_t size) {
@@ -153,8 +149,35 @@ static int tcp_sock_recv(socket_t* s, uint8_t* buf, uint32_t size) {
 
 static int tcp_sock_recvfrom(socket_t* s, uint8_t* buf, uint32_t size,
                                sockaddr_t* src_addr, socklen_t* addrlen) {
-    (void)s; (void)buf; (void)size; (void)src_addr; (void)addrlen;
-    return ERR_NOSYS;
+    int ret = tcp_sock_recv(s, buf, size);
+    if (ret < 0) return ret;
+    if (src_addr && addrlen) {
+        tcp_conn_t* c = (tcp_conn_t*)s->proto;
+        if (c) {
+            socklen_t need = (s->family == AF_INET) ? sizeof(sockaddr_in_t) : sizeof(sockaddr_in6_t);
+            socklen_t copy_len = *addrlen < need ? *addrlen : need;
+            kmemset(src_addr, 0, copy_len);
+            if (s->family == AF_INET) {
+                sockaddr_in_t* out = (sockaddr_in_t*)src_addr;
+                out->sin_family = AF_INET;
+                out->sin_port = __builtin_bswap16(c->remote_port);
+                kmemcpy(out->sin_addr, c->remote_ip.v4.bytes, 4);
+            } else {
+                sockaddr_in6_t* out = (sockaddr_in6_t*)src_addr;
+                out->sin6_family = AF_INET6;
+                out->sin6_port = __builtin_bswap16(c->remote_port);
+                if (c->af == AF_INET && !s->ipv6only) {
+                    out->sin6_addr[10] = 0xFF;
+                    out->sin6_addr[11] = 0xFF;
+                    kmemcpy(out->sin6_addr + 12, c->remote_ip.v4.bytes, 4);
+                } else {
+                    kmemcpy(out->sin6_addr, c->remote_ip.v6, 16);
+                }
+            }
+            *addrlen = need;
+        }
+    }
+    return ret;
 }
 
 static int tcp_sock_close(socket_t* s) {
@@ -419,31 +442,6 @@ static int udp_sock_bind(socket_t* s, const sockaddr_t* addr, socklen_t len) {
     return ERR_OK;
 }
 
-static int udp_sock_connect(socket_t* s, const sockaddr_t* addr, socklen_t len) {
-    (void)s; (void)addr; (void)len;
-    return ERR_NOSYS;
-}
-
-static int udp_sock_listen(socket_t* s, int backlog) {
-    (void)backlog;
-    return ERR_NOSYS;
-}
-
-static socket_t* udp_sock_accept(socket_t* s, sockaddr_t* addr, socklen_t* len) {
-    (void)s; (void)addr; (void)len;
-    return NULL;
-}
-
-static int udp_sock_send(socket_t* s, const uint8_t* buf, uint32_t len) {
-    (void)s; (void)buf; (void)len;
-    return ERR_NOSYS;
-}
-
-static int udp_sock_recv(socket_t* s, uint8_t* buf, uint32_t size) {
-    (void)s; (void)buf; (void)size;
-    return ERR_NOSYS;
-}
-
 static uint16_t udp_auto_port = 49152;
 
 static int udp_sock_autobind(socket_t* s) {
@@ -456,6 +454,33 @@ static int udp_sock_autobind(socket_t* s) {
     s->proto = udp_find_endpoint(s->family, port);
     s->state = SS_BOUND;
     return ERR_OK;
+}
+
+static int udp_sock_connect(socket_t* s, const sockaddr_t* addr, socklen_t len) {
+    if (!s || !addr) return ERR_INVAL;
+    if (s->type != 2) return ERR_INVAL; /* SOCK_DGRAM */
+    udp_endpoint_t* ep = (udp_endpoint_t*)s->proto;
+    if (!ep) {
+        int e = udp_sock_autobind(s);
+        if (e != ERR_OK) return e;
+        ep = (udp_endpoint_t*)s->proto;
+    }
+    if (!ep) return ERR_INVAL;
+    socklen_t copy = (len < SOCKADDR_MAX) ? len : SOCKADDR_MAX;
+    kmemcpy(s->udp_conn_addr, addr, copy);
+    s->udp_conn_addrlen = copy;
+    s->state = SS_CONNECTED;
+    return ERR_OK;
+}
+
+static int udp_sock_listen(socket_t* s, int backlog) {
+    (void)s; (void)backlog;
+    return ERR_NOSYS;
+}
+
+static socket_t* udp_sock_accept(socket_t* s, sockaddr_t* addr, socklen_t* len) {
+    (void)s; (void)addr; (void)len;
+    return NULL;
 }
 
 static int udp_sock_sendto(socket_t* s, const uint8_t* buf, uint32_t len,
@@ -521,6 +546,18 @@ static int udp_sock_recvfrom(socket_t* s, uint8_t* buf, uint32_t size,
     }
 
     return ret;
+}
+
+static int udp_sock_send(socket_t* s, const uint8_t* buf, uint32_t len) {
+    if (!s || s->state != SS_CONNECTED || s->udp_conn_addrlen == 0)
+        return ERR_NOTCONN;
+    return udp_sock_sendto(s, buf, len,
+                           (const sockaddr_t*)s->udp_conn_addr,
+                           s->udp_conn_addrlen);
+}
+
+static int udp_sock_recv(socket_t* s, uint8_t* buf, uint32_t size) {
+    return udp_sock_recvfrom(s, buf, size, NULL, NULL);
 }
 
 static int udp_sock_close(socket_t* s) {
@@ -670,6 +707,8 @@ static sock_ops_t udp_ops = {
 
 /* ---- Socket alloc/retain/release ---- */
 
+extern sock_ops_t unix_ops;
+
 socket_t* socket_alloc(int family, int type, int protocol) {
     (void)protocol;
     if (!net_initialized) return NULL;
@@ -685,6 +724,11 @@ socket_t* socket_alloc(int family, int type, int protocol) {
     s->recv_timeout = 5000; /* default 5 second timeout */
     s->send_timeout = 5000; /* default 5 second send timeout */
     s->ipv6only = 0;       /* default: dual-stack */
+
+    if (family == AF_UNIX) {
+        s->ops = &unix_ops;
+        return s;
+    }
 
     if (type == SOCK_STREAM) {
         tcp_conn_t* c = tcp_conn_create(family);
@@ -826,7 +870,7 @@ int sock_unregister(int fd) {
 
 void net_init(void) {
     if (net_initialized) return;
-    kmemset(net_sockets, 0, sizeof(net_sockets));
     net_initialized = 1;
+    unix_init();
     kprintf("[NET] Socket layer initialized\n");
 }

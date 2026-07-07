@@ -30,5 +30,7 @@ int  route_lookup_v4(ipv4_addr_t dst, ipv4_addr_t* next_hop);
 int  route_lookup_v6(const uint8_t* dst, uint8_t* next_hop);
 int  route_add_v4(ipv4_addr_t dst, int prefix_len, ipv4_addr_t gateway);
 int  route_add_v6(const uint8_t* dst, int prefix_len, const uint8_t* gateway);
+int  route_del_v4(ipv4_addr_t dst, int prefix_len);
+int  route_del_v6(const uint8_t* dst, int prefix_len);
 
 #endif

@@ -6,14 +6,14 @@
 #include "nic.h"
 #include "hal.h"
 #include "sched.h"
+#include "net_ns.h"
 
 #define ICMPV6_PING_DATA "opencode6"
 #define ICMPV6_PING_DATALEN 9
 
-static int icmpv6_initialized = 0;
-static uint16_t icmpv6_next_id = 1;
-
-static void (*icmpv6_ra_callback)(const uint8_t* src, const uint8_t* data, uint32_t len) = NULL;
+#define icmpv6_initialized (get_current_ns()->icmpv6_initialized)
+#define icmpv6_next_id (get_current_ns()->icmpv6_next_id)
+#define icmpv6_ra_callback (get_current_ns()->icmpv6_ra_callback)
 
 void icmpv6_set_ra_callback(void (*cb)(const uint8_t* src, const uint8_t* data, uint32_t len)) {
     icmpv6_ra_callback = cb;

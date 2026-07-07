@@ -294,3 +294,183 @@ pid_t clone(int (*fn)(void*), void* stack, int flags, void* arg) {
     if (ret < 0) { errno = (int)(-ret); return -1; }
     return (pid_t)ret;
 }
+
+/* ---- Security / Capabilities ---- */
+
+int capget(unsigned long pid, unsigned long* caps) {
+    long ret = __syscall2(SYS_CAPGET, pid, (long)caps);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return 0;
+}
+
+int capset(unsigned long caps) {
+    long ret = __syscall1(SYS_CAPSET, caps);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return 0;
+}
+
+int audit_read(audit_entry_t* buf, unsigned long count) {
+    long ret = __syscall2(SYS_AUDIT_READ, (long)buf, count);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+/* ---- UID/GID ---- */
+
+uid_t getuid(void) {
+    return (uid_t)__syscall0(SYS_GETUID);
+}
+
+uid_t geteuid(void) {
+    return (uid_t)__syscall0(SYS_GETEUID);
+}
+
+gid_t getgid(void) {
+    return (gid_t)__syscall0(SYS_GETGID);
+}
+
+gid_t getegid(void) {
+    return (gid_t)__syscall0(SYS_GETEGID);
+}
+
+int setuid(uid_t uid) {
+    long ret = __syscall1(SYS_SETUID, uid);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return 0;
+}
+
+int setgid(gid_t gid) {
+    long ret = __syscall1(SYS_SETGID, gid);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return 0;
+}
+
+/* ---- Random ---- */
+
+ssize_t getrandom(void* buf, size_t count, unsigned int flags) {
+    long ret = __syscall3(SYS_GETRANDOM, (long)buf, count, flags);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (ssize_t)ret;
+}
+
+/* ---- Syscall filter ---- */
+
+int set_syscall_filter(const unsigned long long* masks, size_t count) {
+    long ret = __syscall2(SYS_SET_SSF, (long)masks, count);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return 0;
+}
+
+/* ---- socketpair ---- */
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+    long ret = __syscall5(SYS_SOCKETPAIR, domain, type, protocol, (long)sv, 0);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return 0;
+}
+
+/* ---- prctl ---- */
+int prctl(int option, unsigned long arg2, unsigned long arg3,
+          unsigned long arg4, unsigned long arg5) {
+    long ret = __syscall5(SYS_PRCTL, option, arg2, arg3, arg4, arg5);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+/* ---- veth_pair ---- */
+int veth_pair(netconfig_req_t* req) {
+    long ret = __syscall1(SYS_VETH_PAIR, (long)req);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+/* ---- netconfig ---- */
+int netconfig(netconfig_req_t* req) {
+    long ret = __syscall1(SYS_NETCONFIG, (long)req);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+/* ---- veth_move ---- */
+int veth_move(int pair_idx, int end_sel) {
+    long ret = __syscall2(SYS_VETH_MOVE, pair_idx, end_sel);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+/* ---- extra POSIX wrappers ---- */
+int chmod(const char* path, unsigned int mode) {
+    long ret = __syscall2(SYS_CHMOD, (long)path, mode);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int link(const char* target, const char* linkpath) {
+    long ret = __syscall2(SYS_LINK, (long)target, (long)linkpath);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int symlink(const char* target, const char* linkpath) {
+    long ret = __syscall2(SYS_SYMLINK, (long)target, (long)linkpath);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int readlink(const char* path, char* buf, size_t size) {
+    long ret = __syscall3(SYS_READLINK, (long)path, (long)buf, size);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int rmdir(const char* path) {
+    long ret = __syscall1(SYS_RMDIR, (long)path);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int ftruncate(int fd, uint64_t size) {
+    long ret = __syscall2(SYS_FTRUNCATE, fd, (long)size);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int dup(int oldfd) {
+    long ret = __syscall1(SYS_DUP, oldfd);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int access(const char* path, int mode) {
+    long ret = __syscall2(SYS_ACCESS, (long)path, mode);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int nanosleep(const struct timespec* req, struct timespec* rem) {
+    long ret = __syscall2(SYS_NANOSLEEP, (long)req, (long)rem);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int uname(struct utsname* buf) {
+    long ret = __syscall1(SYS_UNAME, (long)buf);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+void sync(void) {
+    __syscall0(SYS_SYNC);
+}
+
+/* ---- secure_boot ---- */
+int unshare(int flags) {
+    long ret = __syscall1(SYS_UNSHARE, flags);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int secure_boot(int cmd, unsigned long arg) {
+    long ret = __syscall2(SYS_SECURE_BOOT, cmd, arg);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}

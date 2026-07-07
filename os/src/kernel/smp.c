@@ -10,16 +10,19 @@
 #include "sync.h"
 #include "hpet.h"
 #include "pci.h"
+#include "kmalloc.h"
 
 int smp_enabled = 0;
 int smp_flags = 0;
 int smp_ipi_works = 0;  /* Set to 1 on platforms where cross-CPU IPIs deliver */
 
 static spinlock_t tlb_lock;
+volatile int ap_ipi_test_counter = 0;
 
 uint64_t __per_cpu_offset[MAX_CPUS];
 per_cpu_data_t* per_cpu_data[MAX_CPUS];
 volatile int ap_ready_count = 0;
+cpu_state_t cpu_state[MAX_CPUS];
 
 int smp_cpu_id(void) {
     if (!smp_enabled) return 0;
@@ -64,6 +67,7 @@ static void smp_alloc_per_cpu(void) {
         per_cpu_data[i] = p;
         __per_cpu_offset[i] = (uint64_t)p - (uint64_t)per_cpu_data[0];
         p->cpu_id = i;
+        kprintf("[SMP] per-CPU data for CPU %d at %p (phys %lx)\n", i, (void*)p, phys);
 
         /* Initialize priority bitmap */
         kmemset(p->priority_bitmap, 0, sizeof(p->priority_bitmap));
@@ -75,6 +79,9 @@ void smp_init(void) {
 
     /* Scan CPUs from ACPI */
     acpi_scan_cpus();
+
+    /* Parse SRAT for NUMA topology */
+    acpi_parse_srat();
 
     if (nr_cpus <= 0) {
         nr_cpus = 1;
@@ -93,6 +100,10 @@ void smp_init(void) {
 
     /* Initialize priority bitmap for BSP */
     kmemset(per_cpu_data[0]->priority_bitmap, 0, sizeof(per_cpu_data[0]->priority_bitmap));
+
+    /* Initialize CPU state tracking: BSP gets CPU_STATE_ONLINE, others pending */
+    for (int i = 0; i < nr_cpus; i++)
+        cpu_state[i] = (i == 0) ? CPU_STATE_ONLINE : CPU_STATE_OFFLINE;
 
     smp_enabled = (nr_cpus > 1) ? 1 : 0;
 
@@ -130,6 +141,10 @@ void ap_entry(per_cpu_data_t* pcp) {
     mb();
     __sync_fetch_and_add(&ap_ready_count, 1);
 
+    /* Mark this CPU online (hotplug-aware) */
+    cpu_state[cpu] = CPU_STATE_ONLINE;
+    mb();  /* Ensure write is visible to other CPUs */
+
     /* Initialize per-CPU scheduler (creates idle thread for this CPU) */
     err_t err = sched_init_ap();
     if (err) {
@@ -138,19 +153,41 @@ void ap_entry(per_cpu_data_t* pcp) {
     }
     set_current_thread((thread_t*)per_cpu_data[cpu]->idle_thread);
 
-    /* NOTE: APIC timer is NOT initialized on the AP.  On QEMU, writing
-     * APIC timer registers from the AP corrupts the BSP's APIC timer
+    /* Initialize APIC timer on bare metal.  On QEMU, writing APIC
+     * timer registers from the AP corrupts the BSP's APIC timer
      * (the in-kernel APIC shares state between vCPUs).  On bare metal
-     * this can be enabled via apic_timer_init().
-     *
-     * The AP idle thread runs in a HLT loop.  Scheduling on the AP is
+     * each CPU has its own local APIC with independent timer. */
+    if (apic_present && !hal_is_qemu()) {
+        apic_timer_init(hal_timer_get_hz());
+        kprintf("[AP] CPU %d: APIC timer initialized at %u Hz\n",
+                cpu, hal_timer_get_hz());
+    }
+
+    /* The AP idle thread runs in a HLT loop.  Scheduling on the AP is
      * driven by:
-     *   - BSP timer tick → check_sleepers() → wake affine tasks
+     *   - APIC timer tick (bare metal) or BSP timer tick + IPI (QEMU)
      *   - IPI from BSP when a thread is enqueued to the AP's run queue */
 
-    /* Enable interrupts and enter the idle thread (HLT loop) */
-    asm volatile("sti");
-    idle_thread(NULL);
+    /* Switch to the idle thread's dedicated kernel stack via context
+     * switch rather than calling idle_thread() directly on the shared
+     * trampoline stack (ap_stacks[cpu]).  The trampoline stack is only
+     * 16 KB and carries all AP bring-up frames; calling idle_thread()
+     * from it would cause nested IRQs (IPIs, timers) to accumulate on
+     * the same shallow stack, eventually overflowing into adjacent BSS
+     * memory and corrupting ap_entry's return address / locals. */
+    {
+        thread_t* idle = (thread_t*)per_cpu_data[cpu]->idle_thread;
+        thread_t trampoline_ctx;
+        kmemset(&trampoline_ctx, 0, sizeof(thread_t));
+        thread_t* trampoline_ptr = &trampoline_ctx;
+
+        idle->state = THREAD_RUNNING;
+        uint64_t kstack_top = (uint64_t)idle->kernel_stack + idle->kernel_stack_size;
+        hal_set_kernel_stack(kstack_top);
+
+        asm volatile("sti");
+        switch_context(&trampoline_ptr, &idle);
+    }
 
     /* Should never reach here */
     kprintf("[AP] CPU %d: unexpected return from idle_thread, halting\n", cpu);
@@ -195,6 +232,42 @@ void smp_test_ipi(void) {
     }
 
     kprintf("[SMP] IPI test done\n");
+}
+
+void smp_test_cross_cpu_ipi(void) {
+    if (nr_cpus < 2) {
+        kprintf("[IPI-TEST] cross-CPU IPI: SKIP (only 1 CPU)\n");
+        return;
+    }
+
+    ap_ipi_test_counter = 0;
+    mb();
+
+    uint32_t target_apic_id = cpu_info[1].apic_id;
+    kprintf("[IPI-TEST] Sending IPI_VEC_RESCHEDULE to CPU 1 (APIC ID %u)...\n",
+            target_apic_id);
+
+    apic_send_ipi(target_apic_id, IPI_VEC_RESCHEDULE, APIC_ICR_DELIV_FIXED);
+
+    /* Busy-wait up to ~50ms polling the counter */
+    uint64_t start_ns = hpet_ns();
+    uint64_t deadline = start_ns + 50000000ULL;  /* 50 ms */
+    int received = 0;
+    while (hpet_ns() < deadline) {
+        if (ap_ipi_test_counter > 0) {
+            received = 1;
+            break;
+        }
+        asm volatile("pause");
+    }
+
+    uint64_t elapsed_us = (hpet_ns() - start_ns) / 1000;
+    if (received)
+        kprintf("[IPI-TEST] cross-CPU IPI to CPU1: RECEIVED (counter=%d) after %llu us\n",
+                ap_ipi_test_counter, elapsed_us);
+    else
+        kprintf("[IPI-TEST] cross-CPU IPI to CPU1: NOT RECEIVED after %llu us\n",
+                elapsed_us);
 }
 
 void smp_init_aps(void) {
@@ -272,7 +345,41 @@ void smp_init_aps(void) {
     smp_test_ipi();
 }
 
-/* Send IPI_RESCHEDULE to a specific CPU */
+static volatile uint64_t ap_busy_loop_counter = 0;
+static volatile int ap_busy_loop_done = 0;
+
+static void ap_busy_loop_thread(void* arg) {
+    (void)arg;
+    while (!ap_busy_loop_done) {
+        ap_busy_loop_counter++;
+        for (volatile int i = 0; i < 200; i++);
+    }
+}
+
+void smp_test_ap_preemption(void) {
+    if (nr_cpus < 2 || !smp_enabled) {
+        kprintf("[AP-SCHED] PREEMPTION TEST: SKIP (only 1 CPU)\n");
+        return;
+    }
+    /* Full original test: create, place, IPI, sleep, check */
+    kprintf("[AP-SCHED] Creating busy-loop thread on CPU 1...\n");
+    ap_busy_loop_done = 0;
+    ap_busy_loop_counter = 0;
+    thread_t* t = thread_create(ap_busy_loop_thread, NULL, THREAD_DEF_PRIO, "ap-busy");
+    if (!t) { kprintf("[AP-SCHED] FAILED\n"); return; }
+    sched_set_thread_affinity(t, 2);
+    sched_place_thread(t, 1);
+    smp_send_reschedule(1);
+    thread_sleep(500);
+    uint64_t cb = ap_busy_loop_counter;
+    kprintf("[AP-SCHED] Counter after 500ms: %lu\n", cb);
+    thread_sleep(200);
+    uint64_t ca = ap_busy_loop_counter;
+    kprintf("[AP-SCHED] Counter after 700ms: %lu\n", ca);
+    ap_busy_loop_done = 1;
+    thread_sleep(10);
+    kprintf("[AP-SCHED] PREEMPTION TEST: %s\n", ca > cb ? "OK" : "FAIL");
+}
 void smp_send_reschedule(int cpu) {
     if (cpu < 0 || cpu >= nr_cpus) return;
     /* Set the target CPU's need_reschedule flag first */
@@ -364,4 +471,159 @@ void smp_handle_tlb_shootdown(void) {
     }
 
     per_cpu_data[cpu]->tlb_flush_pending = 0;
+}
+
+uint64_t smp_get_tss_ist(int cpu, int ist_idx) {
+    if (cpu < 0 || cpu >= MAX_CPUS || !per_cpu_data[cpu]) return 0;
+    if (ist_idx < 0 || ist_idx > 2) return 0;
+    return per_cpu_data[cpu]->tss.ist[ist_idx];
+}
+
+/* ------------------------------------------------------------------ */
+/*  CPU hotplug — offline/online a specific CPU                       */
+/* ------------------------------------------------------------------ */
+
+/* Hotplug IPI handler: called from interrupt_handler via IPI_VEC_OFFLINE.
+ * Sets the CPU state to OFFLINE and forces a reschedule.
+ * The idle thread on this CPU will then park itself. */
+void smp_handle_offline(void) {
+    int cpu = smp_cpu_id();
+    kprintf("[HOTPLUG] CPU %d going offline\n", cpu);
+
+    /* Mark the CPU as offline */
+    cpu_state[cpu] = CPU_STATE_OFFLINE;
+    mb();
+
+    /* Migrate current thread (if not idle) to CPU 0 so it doesn't get
+     * stuck on an offline CPU.  The run queue was already migrated by
+     * smp_cpu_offline before sending the IPI. */
+    if (current_thread && per_cpu_data[cpu] &&
+        (void*)current_thread != per_cpu_data[cpu]->idle_thread) {
+        cpu_flags_t qflags;
+        spinlock_acquire(&sched_queue_lock, &qflags);
+        current_thread->state = THREAD_READY;
+        per_cpu_data_t* cpu0 = per_cpu_data[0];
+        uint32_t p = current_thread->priority;
+        thread_t* tail = (thread_t*)cpu0->rq_tails[p];
+        if (tail) {
+            tail->rq_next = current_thread;
+        } else {
+            cpu0->rq_heads[p] = (void*)current_thread;
+            cpu0->priority_bitmap[p / 64] |= (1ULL << (p % 64));
+        }
+        current_thread->rq_prev = tail;
+        current_thread->rq_next = NULL;
+        cpu0->rq_tails[p] = (void*)current_thread;
+        cpu0->rq_counts[p]++;
+        cpu0->rq_total++;
+        current_thread->cpu_queue = 0;
+        spinlock_release(&sched_queue_lock, qflags);
+    }
+
+    /* Force reschedule so the idle thread takes over */
+    per_cpu_data[cpu]->need_reschedule = 1;
+}
+
+/* Offline a CPU using a software-based parking mechanism:
+ *   - Flushes per-CPU caches
+ *   - Migrates threads to CPU 0
+ *   - Sends IPI_VEC_OFFLINE so the target CPU parks in its idle thread
+ *   - The target CPU's idle thread spins (HLT) waiting for online
+ *
+ * Returns ERR_OK on success. */
+err_t smp_cpu_offline(int cpu) {
+    if (!smp_enabled || nr_cpus < 2)
+        return ERR_NOENT;
+    if (cpu == 0 || cpu >= nr_cpus)
+        return ERR_INVAL;
+    if (cpu_state[cpu] != CPU_STATE_ONLINE)
+        return ERR_BUSY;
+
+    kprintf("[HOTPLUG] Offlining CPU %d...\n", cpu);
+
+    /* Mark CPU as going down */
+    cpu_state[cpu] = CPU_STATE_GOING_DOWN;
+    mb();
+
+    /* Step 1: Flush target CPU's kmalloc magazines to global slab */
+    kmag_flush_one_cpu(cpu);
+
+    /* Step 2: Flush target CPU's PMM cache to global free list */
+    pmm_flush_cpu_cache(cpu);
+
+    /* Step 3: Migrate all threads from target's run queue to CPU 0 */
+    int migrated = sched_migrate_cpu(cpu, 0);
+    kprintf("[HOTPLUG] Migrated %d threads from CPU %d to CPU 0\n",
+            migrated, cpu);
+
+    /* Step 4: Send IPI_VEC_OFFLINE to the target CPU.
+     * The handler will set cpu_state to OFFLINE, migrate the current
+     * thread, set need_reschedule, and return.  When the CPU next
+     * enters its idle thread, it will see OFFLINE and park. */
+    {
+        uint32_t target_apic_id = cpu_info[cpu].apic_id;
+        apic_send_ipi(target_apic_id, IPI_VEC_OFFLINE, APIC_ICR_DELIV_FIXED);
+
+        /* Busy-wait up to ~50ms for the CPU to acknowledge */
+        mb();
+        uint64_t deadline = hpet_ns() + 50000000ULL;
+        while (hpet_ns() < deadline) {
+            if (cpu_state[cpu] == CPU_STATE_OFFLINE)
+                break;
+            asm volatile("pause");
+        }
+
+        if (cpu_state[cpu] != CPU_STATE_OFFLINE) {
+            kprintf("[HOTPLUG] WARNING: CPU %d did not acknowledge offline within 50ms\n", cpu);
+            cpu_state[cpu] = CPU_STATE_OFFLINE;
+            return ERR_TIMEOUT;
+        }
+    }
+
+    kprintf("[HOTPLUG] CPU %d is now offline\n", cpu);
+    return ERR_OK;
+}
+
+/* Online a previously offline CPU:
+ *   - Sets cpu_state back to ONLINE
+ *   - Sends a reschedule IPI to wake the parked CPU from HLT
+ *   - The target CPU's idle thread resumes normal operation */
+err_t smp_cpu_online(int cpu) {
+    if (!smp_enabled || nr_cpus < 2)
+        return ERR_NOENT;
+    if (cpu == 0 || cpu >= nr_cpus)
+        return ERR_INVAL;
+    if (cpu_state[cpu] != CPU_STATE_OFFLINE)
+        return ERR_BUSY;
+
+    kprintf("[HOTPLUG] Onlining CPU %d...\n", cpu);
+
+    /* Set the state back to ONLINE — the target CPU's parking loop
+     * in idle_thread will see this and exit. */
+    cpu_state[cpu] = CPU_STATE_ONLINE;
+    mb();
+
+    /* Send reschedule IPI to wake the CPU (it may be in a HLT loop) */
+    {
+        uint32_t target_apic_id = cpu_info[cpu].apic_id;
+        apic_send_ipi(target_apic_id, IPI_VEC_RESCHEDULE, APIC_ICR_DELIV_FIXED);
+
+        /* Wait briefly for the CPU to acknowledge online */
+        mb();
+        uint64_t deadline = hpet_ns() + 50000000ULL;
+        while (hpet_ns() < deadline) {
+            if (per_cpu_data[cpu]->cpu_thread != NULL &&
+                (void*)per_cpu_data[cpu]->cpu_thread !=
+                (void*)per_cpu_data[cpu]->idle_thread) {
+                break;
+            }
+            /* Check if the idle thread is running (means it exited park) */
+            if (cpu_state[cpu] == CPU_STATE_ONLINE)
+                break;
+            asm volatile("pause");
+        }
+    }
+
+    kprintf("[HOTPLUG] CPU %d is now online\n", cpu);
+    return ERR_OK;
 }

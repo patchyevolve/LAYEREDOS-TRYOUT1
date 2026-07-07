@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "vfs.h"
+#include "security.h"
 #include "hal.h"
 #include "process.h"
 #include "sched.h"
@@ -20,7 +21,7 @@ typedef struct {
 static dentry_entry_t dentry_cache[DENTRY_CACHE_SIZE];
 static int dentry_cache_age = 0;
 static int dentry_cache_count = 0;
-static spinlock_t vfs_global_lock;
+spinlock_t vfs_global_lock;
 
 vfs_fd_t* vfs_get_fd_table(void) {
     if (current_thread && current_thread->proc)
@@ -60,6 +61,7 @@ static vfs_fs_t* vfs_fs_for_path(const char* path) {
 
 
 err_t vfs_init(void) {
+    spinlock_init(&vfs_global_lock, "vfs_global_lock");
     kmemset(&root_node, 0, sizeof(root_node));
     kstrncpy(root_node.name, "/", VFS_MAX_NAME - 1);
     root_node.flags = 1;
@@ -354,6 +356,50 @@ vfs_node_t* vfs_find_nofollow(const char* path) {
     return vfs_find_flags(path, 0);
 }
 
+/* Check if current process can access a file with the given node.
+ * Returns 0 on success, -1 on denial. */
+int vfs_access_check(vfs_node_t* node, int want_write) {
+    process_t* proc = current_thread ? current_thread->proc : NULL;
+    /* Kernel threads with no process can access everything */
+    if (!proc) return 0;
+    /* Root (euid 0) can access everything */
+    if (proc->euid == 0) return 0;
+    /* CAP_DAC_OVERRIDE bypasses permission checks */
+    if (proc->caps & CAP_DAC_OVERRIDE) return 0;
+
+    /* Stat the node to get mode, uid, gid */
+    vfs_stat_t st;
+    int has_stat = 0;
+    if (node->fs && node->fs->ops && node->fs->ops->stat) {
+        if (node->fs->ops->stat(node, &st) == 0) has_stat = 1;
+    }
+    if (!has_stat) {
+        st.mode = node->mode;
+        st.uid  = node->uid;
+        st.gid  = node->gid;
+    }
+    /* mode=0 means not set — allow for backward compat */
+    if (st.mode == 0) return 0;
+
+    uint32_t mode = st.mode & 0xFFFF; /* lower 16 bits are permissions */
+
+    /* Determine which set of permission bits to use */
+    uint32_t check_bits;
+    if (proc->euid == st.uid)
+        check_bits = (mode >> 6) & 7;  /* owner: bits 8-6 */
+    else if (proc->egid == st.gid)
+        check_bits = (mode >> 3) & 7;  /* group: bits 5-3 */
+    else
+        check_bits = mode & 7;         /* other: bits 2-0 */
+
+    if (want_write) {
+        if (!(check_bits & 2)) return -1;  /* write bit not set */
+    } else {
+        if (!(check_bits & 4)) return -1;  /* read bit not set */
+    }
+    return 0;
+}
+
 int vfs_open(const char* path, int flags) {
     /* Handle O_CREAT: create file if it doesn't exist */
     if (flags & O_CREAT) {
@@ -367,33 +413,23 @@ int vfs_open(const char* path, int flags) {
     vfs_node_t* node = vfs_find(path);
     if (!node) { kprintf("[VFS_OPEN] vfs_find '%s' failed\n", path); return -1; }
 
-    /* Check write permission when opening for write */
+    /* DAC permission check */
+    if (flags & (O_WRONLY | O_RDWR)) {
+        if (vfs_access_check(node, 1) != 0) return -1;
+    } else {
+        if (vfs_access_check(node, 0) != 0) return -1;
+    }
+
+    /* Advisory write lock check */
     if ((flags & (O_WRONLY | O_RDWR)) && node->fs && node->fs->ops && node->fs->ops->stat) {
         vfs_stat_t st;
         if (node->fs->ops->stat(node, &st) == 0) {
-            /* mode=0 means unset (backward compat); reject if explicitly read-only */
-            if (st.mode != 0 && (st.mode & 0200) == 0) {
-                kprintf("[VFS_OPEN] '%s' not writable (mode=%o)\n", path, st.mode);
-                return -1;
-            }
-            /* Advisory write lock check */
             if (st.fs_flags & VFS_FS_FLAG_LOCKED) {
                 kprintf("[VFS_OPEN] '%s' locked\n", path);
                 return -1;
             }
         }
     }
-
-    int fd = -1;
-    {
-        cpu_flags_t _sf;
-        spinlock_acquire(&vfs_global_lock, &_sf);
-        for (int i = 0; i < VFS_MAX_FDS; i++) {
-            if (!vfs_get_fd_table()[i].used) { fd = i; break; }
-        }
-        spinlock_release(&vfs_global_lock, _sf);
-    }
-    if (fd < 0) return -1;
 
     /* Handle O_TRUNC: truncate file to zero length */
     if ((flags & O_TRUNC) && node->fs && node->fs->ops && node->fs->ops->truncate)
@@ -405,14 +441,21 @@ int vfs_open(const char* path, int flags) {
             return -1;
         }
 
+    int fd = -1;
     {
         cpu_flags_t _sf;
         spinlock_acquire(&vfs_global_lock, &_sf);
-        vfs_get_fd_table()[fd].node   = node;
-        vfs_get_fd_table()[fd].offset = 0;
-        vfs_get_fd_table()[fd].flags  = flags;
-        vfs_get_fd_table()[fd].used   = 1;
-        __sync_fetch_and_add(&node->refcount, 1);
+        for (int i = 0; i < VFS_MAX_FDS; i++) {
+            if (!vfs_get_fd_table()[i].used) {
+                vfs_get_fd_table()[i].node   = node;
+                vfs_get_fd_table()[i].offset = 0;
+                vfs_get_fd_table()[i].flags  = flags;
+                vfs_get_fd_table()[i].used   = 1;
+                __sync_fetch_and_add(&node->refcount, 1);
+                fd = i;
+                break;
+            }
+        }
         spinlock_release(&vfs_global_lock, _sf);
     }
     return fd;
@@ -450,43 +493,79 @@ int vfs_close(int fd) {
 }
 
 int64_t vfs_read(int fd, void* buf, uint64_t count) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
         return -1;
+    }
 
     vfs_fd_t* f = &vfs_get_fd_table()[fd];
+    if ((f->flags & 3) == O_WRONLY) {
+        spinlock_release(&vfs_global_lock, _sf);
+        return -1;
+    }
+
     vfs_node_t* node = f->node;
+    uint64_t cur_offset = f->offset;
+    spinlock_release(&vfs_global_lock, _sf);
 
     if (node->fs && node->fs->ops && node->fs->ops->read) {
-        int64_t ret = node->fs->ops->read(node, buf, count, f->offset);
-        if (ret > 0) f->offset += ret;
+        int64_t ret = node->fs->ops->read(node, buf, count, cur_offset);
+        if (ret > 0) {
+            spinlock_acquire(&vfs_global_lock, &_sf);
+            f->offset += ret;
+            spinlock_release(&vfs_global_lock, _sf);
+        }
         return ret;
     }
     return -1;
 }
 
 int64_t vfs_write(int fd, const void* buf, uint64_t count) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
         return -1;
+    }
 
     vfs_fd_t* f = &vfs_get_fd_table()[fd];
+    if ((f->flags & 3) == O_RDONLY) {
+        spinlock_release(&vfs_global_lock, _sf);
+        return -1;
+    }
+
     vfs_node_t* node = f->node;
+    uint64_t cur_offset = f->offset;
+    if (f->flags & O_APPEND) {
+        cur_offset = node->size;
+        f->offset = cur_offset;
+    }
+    spinlock_release(&vfs_global_lock, _sf);
 
     if (node->fs && node->fs->ops && node->fs->ops->write) {
-        if (f->flags & O_APPEND) {
-            cpu_flags_t _flags = hal_save_irq();
-            f->offset = node->size;
-            hal_restore_irq(_flags);
+        int64_t ret = node->fs->ops->write(node, buf, count, cur_offset);
+        if (ret > 0) {
+            spinlock_acquire(&vfs_global_lock, &_sf);
+            f->offset = cur_offset + ret;
+            spinlock_release(&vfs_global_lock, _sf);
         }
-        int64_t ret = node->fs->ops->write(node, buf, count, f->offset);
-        if (ret > 0) f->offset += ret;
         return ret;
     }
     return -1;
 }
 
 int64_t vfs_lseek(int fd, int64_t offset, int whence) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
         return -1;
+    }
 
     vfs_fd_t* f = &vfs_get_fd_table()[fd];
     vfs_node_t* node = f->node;
@@ -495,9 +574,11 @@ int64_t vfs_lseek(int fd, int64_t offset, int whence) {
         case VFS_SEEK_SET: f->offset = (uint64_t)offset; break;
         case VFS_SEEK_CUR: f->offset += offset; break;
         case VFS_SEEK_END: f->offset = node->size + offset; break;
-        default: return -1;
+        default: spinlock_release(&vfs_global_lock, _sf); return -1;
     }
-    return (int64_t)f->offset;
+    int64_t result = (int64_t)f->offset;
+    spinlock_release(&vfs_global_lock, _sf);
+    return result;
 }
 
 int vfs_create(const char* path, int is_dir) {
@@ -556,9 +637,14 @@ int vfs_rmdir(const char* path) {
 }
 
 int vfs_ftruncate(int fd, uint64_t size) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
         return -1;
+    }
     vfs_node_t* node = vfs_get_fd_table()[fd].node;
+    spinlock_release(&vfs_global_lock, _sf);
     if (node->fs && node->fs->ops && node->fs->ops->truncate)
         return node->fs->ops->truncate(node, size);
     return -1;
@@ -578,6 +664,8 @@ int vfs_stat(const char* path, vfs_stat_t* st) {
     st->mtime = 0;
     st->ctime = 0;
     st->fs_flags = 0;
+    st->uid  = node->uid;
+    st->gid  = node->gid;
     return 0;
 }
 
@@ -713,9 +801,14 @@ int vfs_readlink(const char* path, char* buf, uint64_t size) {
 }
 
 int vfs_ioctl(int fd, uint64_t request, void* argp) {
-    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used)
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
         return -1;
+    }
     vfs_node_t* node = vfs_get_fd_table()[fd].node;
+    spinlock_release(&vfs_global_lock, _sf);
     if (node->fs && node->fs->ops && node->fs->ops->ioctl)
         return node->fs->ops->ioctl(node, request, argp);
     return -1;

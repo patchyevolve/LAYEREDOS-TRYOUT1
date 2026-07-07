@@ -1,6 +1,7 @@
 #ifndef TYPES_H
 #define TYPES_H
 
+#ifndef _STDINT_H
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -9,10 +10,15 @@ typedef signed char        int8_t;
 typedef signed short       int16_t;
 typedef signed int         int32_t;
 typedef signed long long   int64_t;
+#ifndef _SYS_TYPES_H
 typedef uint64_t           size_t;
 typedef int64_t            ssize_t;
 typedef uint64_t           uintptr_t;
 typedef int64_t            intptr_t;
+typedef uint32_t           uid_t;
+typedef uint32_t           gid_t;
+#endif
+#endif
 #define NULL  ((void*)0)
 
 #define offsetof(T, M) __builtin_offsetof(T, M)
@@ -40,6 +46,7 @@ typedef enum { ERR_OK = 0,
     ERR_CAP       = -19,
     ERR_BADFD     = -20,
     ERR_NOTCONN   = -21,
+    ERR_CONNREFUSED = -22,
 } err_t;
 
 #define KERNEL_PHYS_BASE   0x100000
@@ -60,6 +67,17 @@ typedef enum { ERR_OK = 0,
 #define TIME_SLICE_MS      10
 
 typedef uint64_t cpu_flags_t;
+
+typedef struct spinlock {
+    volatile uint64_t lock;
+    const char*       name;
+    uint64_t          holder;
+} spinlock_t;
+
+#ifndef _SYS_TYPES_H
+typedef uint32_t uid_t;
+typedef uint32_t gid_t;
+#endif
 
 // Embedded intrusive doubly-linked list
 typedef struct list_head {

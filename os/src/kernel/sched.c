@@ -9,6 +9,8 @@
 #include "process.h"
 #include "sync.h"
 #include "smp.h"
+#include "apic.h"
+#include "rcu.h"
 
 static uint64_t next_thread_id = 1;
 static uint64_t kernel_cr3 = 0;
@@ -22,7 +24,7 @@ volatile int sched_running = 0;
 thread_t* current_thread_global = NULL;
 
 static spinlock_t all_threads_lock;
-static spinlock_t sched_queue_lock;
+spinlock_t sched_queue_lock;
 
 static inline per_cpu_data_t* sched_pcp(void) {
     return per_cpu_data[smp_cpu_id()];
@@ -132,11 +134,45 @@ static void sched_add_thread_to_cpu(thread_t* t, int cpu) {
     cpu_flags_t flags;
     spinlock_acquire(&sched_queue_lock, &flags);
     sched_add_thread_to_cpu_locked(t, cpu);
+    /* If the target CPU is idle (HLT), it won't notice the new thread
+     * without a reschedule IPI.  This is critical when the BSP's APIC
+     * timer is broken by QEMU's SMP+PCI quirk — without the IPI the
+     * BSP stays in HLT forever even with READY threads on its queue. */
+    if (cpu != smp_cpu_id() && per_cpu_data[cpu]) {
+        per_cpu_data_t* tgt = per_cpu_data[cpu];
+        if ((thread_t*)tgt->cpu_thread == (thread_t*)tgt->idle_thread) {
+            spinlock_release(&sched_queue_lock, flags);
+            smp_send_reschedule(cpu);
+            return;
+        }
+    }
     spinlock_release(&sched_queue_lock, flags);
 }
 
 void sched_add_thread(thread_t* t) {
-    sched_add_thread_to_cpu(t, smp_cpu_id());
+    if (!t) return;
+    int cpu = smp_cpu_id();
+    /* If the thread's affinity doesn't include the current CPU, find
+     * the first allowed CPU and place it there.  This ensures threads
+     * bound to a specific CPU via sched_set_thread_affinity actually
+     * land on the right run queue.
+     * If cpu_affinity is 0 (uninitialized / edge case), stay on the
+     * current CPU rather than iterating an empty mask. */
+    if (t->cpu_affinity != 0 && !(t->cpu_affinity & (1ULL << cpu))) {
+        int mask = t->cpu_affinity;
+        for (int c = 0; c < nr_cpus; c++) {
+            if (mask & (1ULL << c)) { cpu = c; break; }
+        }
+    }
+    sched_add_thread_to_cpu(t, cpu);
+}
+
+/* Place a thread directly on a specific CPU's run queue.
+ * The caller must ensure the thread is not already queued. */
+void sched_place_thread(thread_t* t, int cpu) {
+    if (!t || cpu < 0 || cpu >= MAX_CPUS || !per_cpu_data[cpu])
+        return;
+    sched_add_thread_to_cpu(t, cpu);
 }
 
 static void sched_add_thread_locked(thread_t* t) {
@@ -210,7 +246,10 @@ static thread_t* sched_steal_thread(void) {
         if (target == this_cpu || !per_cpu_data[target]) continue;
 
         cpu_flags_t qflags;
-        spinlock_acquire(&sched_queue_lock, &qflags);
+        if (!spinlock_try_acquire(&sched_queue_lock, &qflags)) {
+            /* Contended — skip this CPU and try the next */
+            continue;
+        }
 
         per_cpu_data_t* tgt = per_cpu_data[target];
         int tprio = bitmap_find_highest(tgt);
@@ -259,8 +298,9 @@ static thread_t* sched_steal_thread(void) {
 }
 
 /* Push one thread from this CPU's queue to an underloaded sibling.
- * Called periodically from sched_timer_tick when this CPU is overloaded. */
-__attribute__((unused)) static void sched_balance_push(void) {
+ * Called from sched_timer_tick when this CPU is overloaded.
+ * Uses try_acquire so it is safe in ISR context — skips if contended. */
+static void sched_balance_push(void) {
     int this_cpu = smp_cpu_id();
     int ncpus = smp_enabled ? nr_cpus : 1;
     if (ncpus < 2) return;
@@ -279,7 +319,8 @@ __attribute__((unused)) static void sched_balance_push(void) {
 
     /* Find the lowest populated priority level */
     cpu_flags_t qflags;
-    spinlock_acquire(&sched_queue_lock, &qflags);
+    if (!spinlock_try_acquire(&sched_queue_lock, &qflags))
+        return;
 
     int low_prio = -1;
     for (int p = THREAD_MAX_PRIO; p >= 0; p--) {
@@ -372,6 +413,15 @@ static thread_t* pick_next(void) {
         return (thread_t*)pcp->idle_thread;
     }
 
+    /* Proactive stealing: if the best local thread is low-priority,
+     * try to steal a higher-priority thread from a loaded sibling. */
+    if (prio > 150 && smp_enabled && nr_cpus > 1) {
+        thread_t* stolen = sched_steal_thread();
+        if (stolen && stolen->priority < prio)
+            return stolen;
+        /* Stolen was NULL or lower priority — fall through to local. */
+    }
+
     cpu_flags_t qflags;
     if (!spinlock_try_acquire(&sched_queue_lock, &qflags)) {
         /* Contended — skip this round; called from ISR context. */
@@ -419,6 +469,14 @@ static inline void sched_sync_current(thread_t* old, thread_t* next) {
 void schedule(void) {
     if (!sched_running || !current_thread) return;
 
+    /* Report RCU quiescent state — every context switch is a QS */
+    rcu_quiescent_state();
+
+    /* Clear watchdog stuck flag — any context switch proves forward
+     * progress, clearing any false-positive NMI stuck detection from
+     * boot (before the idle thread was recognized). */
+    watchdog_clear_stuck();
+
     per_cpu_data_t* pcp = sched_pcp();
     pcp->need_reschedule = 0;
     cpu_flags_t flags = hal_save_irq();
@@ -426,7 +484,8 @@ void schedule(void) {
     thread_t* next = pick_next();
 
     if (next == current_thread) {
-        if (current_thread->state == THREAD_RUNNING)
+        if (current_thread->state == THREAD_RUNNING &&
+            current_thread != (thread_t*)pcp->idle_thread)
             sched_add_thread(next);
         hal_restore_irq(flags);
         return;
@@ -553,8 +612,22 @@ void thread_sleep(uint64_t ms) {
 err_t thread_join(thread_t* t, int* exit_code) {
     if (!t) return ERR_INVAL;
     if (t == current_thread) return ERR_INVAL;
-    while (t->state != THREAD_ZOMBIE && t->state != THREAD_TERMINATED) {
-        sched_block(&t->join_queue);
+    cpu_flags_t flags;
+    for (;;) {
+        spinlock_acquire(&t->join_queue.lock, &flags);
+        if (t->state == THREAD_ZOMBIE || t->state == THREAD_TERMINATED) {
+            spinlock_release(&t->join_queue.lock, flags);
+            break;
+        }
+        if (current_thread->state == THREAD_READY ||
+            current_thread->state == THREAD_RUNNING)
+            sched_remove_thread(current_thread);
+        current_thread->state = THREAD_BLOCKED;
+        current_thread->wq_next = t->join_queue.waiters;
+        t->join_queue.waiters = current_thread;
+        t->join_queue.count++;
+        spinlock_release(&t->join_queue.lock, flags);
+        schedule();
     }
     if (exit_code) *exit_code = t->exit_code;
     return ERR_OK;
@@ -624,7 +697,7 @@ void sched_wake_one(wait_queue_t* wq) {
     spinlock_release(&wq->lock, flags);
 }
 
-static int check_sleepers(void) {
+int check_sleepers(void) {
     int woken = 0;
     uint64_t now = hal_timer_get_ticks();
 
@@ -677,19 +750,50 @@ int sched_isr_check(void) {
     return 0;
 }
 
+static void idle_poll_halt(per_cpu_data_t* pcp) {
+    (void)pcp;
+    asm volatile("sti; hlt; cli");
+}
+
 void idle_thread(void* arg) {
     (void)arg;
+    int this_cpu = smp_cpu_id();
     int has_mwait = hal_cpu_has_mwait();
     for (;;) {
+        /* Check if this CPU has been offlined.  If so, park in a HLT loop
+         * until the BSP sets cpu_state back to ONLINE and sends a
+         * reschedule IPI to wake us. */
+        if (this_cpu != 0 && cpu_state[this_cpu] == CPU_STATE_OFFLINE) {
+            while (cpu_state[this_cpu] == CPU_STATE_OFFLINE) {
+                /* Report RCU QS even while parked */
+                rcu_quiescent_state();
+                watchdog_clear_stuck();
+                { per_cpu_data_t* pcp_ = sched_pcp(); if (pcp_->need_reschedule) schedule(); }
+                { per_cpu_data_t* pcp_ = sched_pcp(); idle_poll_halt(pcp_); }
+            }
+            /* Wake up from park: the BSP set us ONLINE — fall through to
+             * normal idle loop. */
+        }
+
+        /* APs now also run check_sleepers and sched_reap_zombies
+         * (they use all_threads_lock — a proper spinlock — so
+         * concurrent access is safe).  watchdog_flush stays on
+         * BSP only (uses raw CLI/STI, not SMP-safe).
+         * eventbus_dispatch also stays on BSP (CLI/STI lock). */
         if (check_sleepers()) schedule();
-        { per_cpu_data_t* pcp_ = sched_pcp(); if (pcp_->need_reschedule) schedule(); }
         sched_reap_zombies();
-        watchdog_flush();
-        eventbus_dispatch();
+        if (this_cpu == 0) {
+            watchdog_flush();
+        }
+        { per_cpu_data_t* pcp_ = sched_pcp(); if (pcp_->need_reschedule) schedule(); }
+        /* Report RCU QS on every idle iteration — idle CPUs are always
+         * in a quiescent state even when HLTing. */
+        rcu_quiescent_state();
+        watchdog_clear_stuck();
         per_cpu_data_t* pcp = sched_pcp();
         (void)has_mwait;
         (void)pcp;
-        asm volatile("sti; hlt; cli");
+        idle_poll_halt(pcp);
     }
 }
 
@@ -735,7 +839,7 @@ void sched_timer_tick(void) {
         per_cpu_data_t* _pcp = sched_pcp();
         if (++_pcp->balance_counter >= 100) {
             _pcp->balance_counter = 0;
-            /* sched_balance_push disabled — cross-CPU IPI unreliable on KVM */
+            sched_balance_push();
         }
     }
 
@@ -746,6 +850,30 @@ void sched_timer_tick(void) {
     pcp->idle_wake_hint = current_thread->total_ticks;
     if (current_thread->time_slice_remaining == 0)
         pcp->need_reschedule = 1;
+
+    /* AP-targeted IPIs (reschedule + NMI watchdog): only fire after ALL
+     * expected APs have signaled ready (ap_ready_count).  Sending IPIs
+     * or NMIs to an AP before it is fully booted will crash it — the
+     * trampoline runs in 16-bit mode with no NMI handler, and even in
+     * 64-bit mode the AP's IDT may not be set up yet. */
+    if (smp_enabled && smp_cpu_id() == 0 && ap_ready_count >= nr_cpus - 1) {
+        /* Periodic reschedule IPI to APs — skip offline CPUs */
+        {
+            static uint64_t ap_tick_counter = 0;
+            if (++ap_tick_counter >= THREAD_TIME_SLICE) {
+                ap_tick_counter = 0;
+                for (int c = 1; c < nr_cpus; c++) {
+                    if (!per_cpu_data[c]) continue;
+                    if (cpu_state[c] != CPU_STATE_ONLINE) continue;
+                    uint32_t apic_id = cpu_info[c].apic_id;
+                    apic_send_ipi(apic_id, IPI_VEC_RESCHEDULE, APIC_ICR_DELIV_FIXED);
+                }
+            }
+        }
+
+        /* NMI watchdog: BSP periodically broadcasts NMI IPIs for lockup detection */
+        watchdog_send_nmis_tick();
+    }
 }
 
 err_t sched_init_ap(void) {
@@ -863,4 +991,63 @@ int sched_kill_thread(uint64_t id) {
     t->state = THREAD_ZOMBIE;
     sched_wake(&t->join_queue);
     return 0;
+}
+
+/* Migrate all threads from one CPU's run queue to another.
+ * Called from SMP hotplug path (smp_cpu_offline).
+ * Must NOT be called with sched_queue_lock already held. */
+int sched_migrate_cpu(int from_cpu, int to_cpu) {
+    if (from_cpu == to_cpu) return 0;
+    if (!per_cpu_data[from_cpu] || !per_cpu_data[to_cpu]) return 0;
+
+    cpu_flags_t qflags;
+    spinlock_acquire(&sched_queue_lock, &qflags);
+
+    per_cpu_data_t* src = per_cpu_data[from_cpu];
+    per_cpu_data_t* dst = per_cpu_data[to_cpu];
+    int migrated = 0;
+
+    for (int prio = 0; prio <= THREAD_MAX_PRIO; prio++) {
+        thread_t* t = (thread_t*)src->rq_heads[prio];
+        while (t) {
+            thread_t* next = t->rq_next;
+
+            /* Dequeue from source */
+            if (t->rq_prev) t->rq_prev->rq_next = t->rq_next;
+            else src->rq_heads[prio] = (void*)t->rq_next;
+
+            if (t->rq_next) t->rq_next->rq_prev = t->rq_prev;
+            else src->rq_tails[prio] = (void*)t->rq_prev;
+
+            t->rq_next = NULL;
+            t->rq_prev = NULL;
+            src->rq_counts[prio]--;
+            src->rq_total--;
+
+            /* Add to destination */
+            uint32_t p = t->priority;
+            thread_t* tail = (thread_t*)dst->rq_tails[p];
+            if (tail) {
+                tail->rq_next = t;
+            } else {
+                dst->rq_heads[p] = (void*)t;
+                dst->priority_bitmap[p / 64] |= (1ULL << (p % 64));
+            }
+            t->rq_prev = tail;
+            t->rq_next = NULL;
+            dst->rq_tails[p] = (void*)t;
+            dst->rq_counts[p]++;
+            dst->rq_total++;
+            t->cpu_queue = to_cpu;
+
+            migrated++;
+            t = next;
+        }
+        /* Clear this priority level's bitmap on source */
+        if (src->rq_heads[prio] == NULL)
+            src->priority_bitmap[prio / 64] &= ~(1ULL << (prio % 64));
+    }
+
+    spinlock_release(&sched_queue_lock, qflags);
+    return migrated;
 }

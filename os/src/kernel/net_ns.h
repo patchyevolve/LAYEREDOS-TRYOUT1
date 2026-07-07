@@ -23,6 +23,7 @@ typedef struct net_ns {
     /* Routing */
     int route_initialized;
     route_entry_t route_table[ROUTE_TABLE_SIZE];
+    spinlock_t route_lock;
 
     /* ARP cache */
     struct {
@@ -66,6 +67,7 @@ typedef struct net_ns {
     int igmp_initialized;
     uint32_t igmp_groups[IGMP_MAX_GROUPS];
     int      igmp_group_used[IGMP_MAX_GROUPS];
+    spinlock_t igmp_lock;
 
     /* TCP */
     int tcp_initialized;

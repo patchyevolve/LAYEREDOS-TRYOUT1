@@ -3,8 +3,8 @@
 
 #include "types.h"
 
-#define USER_CS 0x1B
-#define USER_DS 0x23
+#define USER_CS 0x23
+#define USER_DS 0x2B
 
 typedef struct int_frame {
     uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
@@ -38,10 +38,13 @@ err_t hal_uart_rx_init(void);
 void hal_poweroff(void);
 void hal_reboot(void);
 void hal_set_kernel_stack(uint64_t rsp0);
+void hal_idt_reload(void);
 void hal_enable_irqs(void);
 uint64_t hal_get_kernel_stack(void);
-int  hal_smap_enabled(void);
-int  hal_is_qemu_tcg(void);
+int hal_smap_enabled(void);
+int hal_is_qemu_tcg(void);
+int hal_is_qemu(void);
+void hal_init_cpu_gdt_tss(int cpu);
 
 extern uint64_t isr_vectors[256];
 
@@ -116,11 +119,20 @@ static inline void outb(uint16_t port, uint8_t v) {
     asm volatile("outb %0, %1" : : "a"(v), "dN"(port));
 }
 
+extern volatile uint64_t tsc_khz;
+
+static inline uint64_t rdtsc(void) {
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static inline void hal_udelay(uint32_t us) {
-    uint64_t start = hal_timer_get_ns();
-    uint64_t target = start + (uint64_t)us * 1000;
-    while (hal_timer_get_ns() < target) {
-        for (volatile int i = 0; i < 100; i++);
+    /* tsc_khz is kHz; divide by 1000 to get µs-scale ticks */
+    uint64_t start = rdtsc();
+    uint64_t target = start + (uint64_t)us * (tsc_khz / 1000);
+    while (rdtsc() < target) {
+        asm volatile("pause");
     }
 }
 

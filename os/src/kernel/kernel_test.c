@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "test_framework.h"
+#include "pmm.h"
 #include "kmalloc.h"
 #include "vma.h"
 #include "tcp.h"
@@ -708,14 +709,27 @@ static void smp_pmm_worker(void* arg) {
             thread_exit(1);
         }
         uint8_t* v = (uint8_t*)PHYS_TO_VIRT(phys);
+        for (int j = 0; j < 4096; j++) {
+            if (v[j] != 0) {
+                kprintf("[FAIL] smp_pmm_worker[%d]: alloc byte %d non-zero (%d) at iter %d phys=%lx page_owner=%lx on_cpu=%d\n",
+                        tid, j, v[j], i, phys,
+                        pmm_page_owner(phys),
+                        smp_cpu_id());
+                thread_exit(1);
+            }
+        }
         for (int j = 0; j < 4096; j++)
             v[j] = (uint8_t)(tid + i + j);
         for (int j = 0; j < 4096; j++) {
             if (v[j] != (uint8_t)(tid + i + j)) {
-                kprintf("[FAIL] smp_pmm_worker[%d]: byte %d corrupt at iter %d\n", tid, j, i);
+                kprintf("[FAIL] smp_pmm_worker[%d]: byte %d corrupt at iter %d (phys=%lx, expected=%d, actual=%d) page_owner=%lx on_cpu=%d\n",
+                        tid, j, i, phys, (uint8_t)(tid + i + j), v[j],
+                        pmm_page_owner(phys), smp_cpu_id());
                 thread_exit(1);
             }
         }
+        kprintf("[PMT] worker %d iter %d phys=%lx page_owner=%lx on_cpu=%d\n",
+                tid, i, phys, pmm_page_owner(phys), smp_cpu_id());
         pmm_free_page(phys);
     }
     thread_exit(0);
@@ -729,6 +743,7 @@ static int test_smp_pmm_concurrent(void) {
 
     int n = smp_nr_cpus();
     if (n > 4) n = 4;
+    kprintf("[TEST] test_smp_pmm_concurrent: starting (%d threads, %d iters)...\n", n, smp_pmm_iters);
     thread_t* threads[4];
 
     for (int i = 0; i < n; i++) {

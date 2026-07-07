@@ -125,6 +125,7 @@ err_t work_init(void) {
         kprintf("[WORK] Failed to create worker thread\n");
         return ERR_NOMEM;
     }
+    sched_set_thread_affinity(system_wq.worker, 1ULL); /* pin to CPU 0 — not SMP-safe */
 
     list_init(&deferred_list);
     spinlock_init(&deferred_lock, "deferred");

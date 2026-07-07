@@ -8,6 +8,7 @@
 /* BSD-compatible socket type constants */
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
+#define AF_UNIX     1
 #define AF_UNSPEC   0
 
 /* Socket options */
@@ -16,6 +17,7 @@
 #define SOL_IPV6     41
 #define SOL_TCP      6
 #define SO_REUSEADDR 2
+#define SO_PEERCRED  17
 #define SO_KEEPALIVE 9
 #define SO_RCVTIMEO  20
 #define SO_SNDTIMEO  21
@@ -49,6 +51,9 @@ typedef struct {
     uint32_t imr_interface;
 } ip_mreq_t;
 
+/* Socket table size per namespace */
+#define NET_MAX_SOCKETS 32
+
 /* sockaddr_storage must be large enough for sockaddr_in6 */
 #define SOCKADDR_MAX sizeof(sockaddr_in6_t)
 typedef uint32_t socklen_t;
@@ -71,6 +76,11 @@ typedef struct __attribute__((packed)) {
     uint16_t sa_family;  /* AF_* */
     uint8_t  sa_data[14];
 } sockaddr_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t sun_family;
+    char     sun_path[108];
+} sockaddr_un_t;
 
 typedef struct __attribute__((packed)) {
     uint16_t sin_family;  /* AF_INET */
@@ -141,6 +151,9 @@ typedef struct socket {
     int          send_timeout; /* send timeout (milliseconds) */
     int          ipv6only;  /* IPV6_V6ONLY flag (default 0 = dual-stack) */
     int          nonblock;  /* non-blocking I/O (O_NONBLOCK) */
+    /* UDP connected address (for connect() + send/recv on DGRAM sockets) */
+    uint8_t      udp_conn_addr[SOCKADDR_MAX];
+    socklen_t    udp_conn_addrlen;
 } socket_t;
 
 /* ---- Socket API (called by syscalls, wraps transport layer) ---- */

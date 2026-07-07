@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "test_framework.h"
+#include "security.h"
 #include "vfs.h"
 #include "process.h"
 #include "vma.h"

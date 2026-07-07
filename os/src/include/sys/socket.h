@@ -3,6 +3,7 @@
 
 /* Standard POSIX values for user-space */
 #define AF_UNSPEC   0
+#define AF_UNIX     1
 #define AF_INET     2
 #define AF_INET6    10
 
@@ -42,6 +43,11 @@ typedef unsigned int socklen_t;
 struct timeval {
     long tv_sec;
     long tv_usec;
+};
+
+struct sockaddr_un {
+    unsigned short sun_family;
+    char           sun_path[108];
 };
 
 struct sockaddr {

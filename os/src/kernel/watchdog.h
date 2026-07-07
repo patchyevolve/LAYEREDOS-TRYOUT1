@@ -28,4 +28,17 @@ void watchdog_run(void);
 void watchdog_flush(void);
 void watchdog_timer_handler(int_frame_t* frame, void* data);
 
+/* NMI lockup detector — called from vector 2 (NMI) handler */
+void watchdog_nmi_handler(int_frame_t* frame);
+
+/* Called from BSP timer tick to broadcast NMI IPIs and check liveness */
+void watchdog_send_nmis_tick(void);
+
+/* Test accessor — returns 1 if CPU `cpu` was detected as stuck */
+int watchdog_get_stuck(int cpu);
+
+/* Clear stuck state for current CPU (called on QS to prevent false
+ * positives from the boot-time NMI before idle thread is running) */
+void watchdog_clear_stuck(void);
+
 #endif

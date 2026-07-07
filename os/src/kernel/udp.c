@@ -4,14 +4,16 @@
 #include "ipv6.h"
 #include "route.h"
 #include "nic.h"
-#include "ndp.h"
+#include "eth.h"
 #include "sched.h"
+#include "hpet.h"
 #include "eth.h"
 #include "sync.h"
+#include "net_ns.h"
 
-static int udp_initialized = 0;
-static udp_endpoint_t udp_endpoints[UDP_MAX_ENDPOINTS];
-static spinlock_t udp_lock;
+#define udp_initialized (get_current_ns()->udp_initialized)
+#define udp_endpoints (get_current_ns()->udp_endpoints)
+#define udp_lock (get_current_ns()->udp_lock)
 
 static uint16_t udp_htons(uint16_t v) { return __builtin_bswap16(v); }
 
@@ -198,9 +200,11 @@ void udp_endpoint_enqueue(udp_endpoint_t* ep, int af, const void* src_ip,
 int udp_endpoint_dequeue(udp_endpoint_t* ep, uint8_t* buf, uint32_t size,
                           int* out_af, void* out_src_addr,
                           uint16_t* out_src_port, int timeout_ms) {
-    int step = 50;
-    int steps = timeout_ms / step;
-    for (int i = 0; i < steps; i++) {
+    uint64_t hpet_deadline = 0;
+    if (hpet_present)
+        hpet_deadline = hpet_ns() + (uint64_t)timeout_ms * 1000000ULL;
+
+    for (;;) {
         eth_rx_poll();
         cpu_flags_t flags;
         spinlock_acquire(&udp_lock, &flags);
@@ -221,9 +225,20 @@ int udp_endpoint_dequeue(udp_endpoint_t* ep, uint8_t* buf, uint32_t size,
             return (int)copy_len;
         }
         spinlock_release(&udp_lock, flags);
-        thread_sleep((uint64_t)step);
+
+        /* HPET-based timeout (works even if APIC timer is stuck) */
+        if (hpet_present) {
+            if (hpet_ns() >= hpet_deadline)
+                return ERR_TIMEOUT;
+            thread_yield();
+        } else {
+            /* APIC/PIT fallback: decrement timeout in ~10ms steps */
+            if (timeout_ms <= 0)
+                return ERR_TIMEOUT;
+            thread_sleep(10);
+            timeout_ms -= 10;
+        }
     }
-    return ERR_TIMEOUT;
 }
 
 /* ---- Packet handling ---- */
@@ -307,7 +322,6 @@ void udp_init(void) {
     if (udp_initialized) return;
 
     spinlock_init(&udp_lock, "udp");
-    kmemset(udp_endpoints, 0, sizeof(udp_endpoints));
 
     ipv4_register_handler(17, udp_ipv4_handler);
     ipv6_register_handler(17, udp_ipv6_handler);
