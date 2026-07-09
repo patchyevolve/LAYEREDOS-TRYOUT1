@@ -3,3 +3,5 @@ build/
 run.sh
 os/build/
 os/*.log
+auditofpmmvmmsched.txt
+os/src/boot/minimal_test.S
