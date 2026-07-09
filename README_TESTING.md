@@ -98,27 +98,75 @@ This directory now contains comprehensive testing documentation and analysis for
 
 ---
 
-## 🎯 What Tests Currently Exist?
+## 🎯 What Tests Currently Exist? (81 total across 6 suites)
 
-### ✅ Network Tests (5/5 passing)
+### ✅ Network Tests (5/5 passing) — `make test-net`
 - IPv6 TCP connection matching
 - NDP cache operations
 - ICMPv6 NS packet parsing
 - Socket reference counting
 - UDP datagram queue I/O
 
-### ✅ Storage Tests (10/10 passing)
-- Block cache read/write
-- Swap page I/O
-- Journal transactions
+### ✅ Storage Tests (10/10 passing) — `make test-storage`
+- Block cache read/write + writeback
+- Block device registration validation
+- Swap slot alloc/free + swap-out/in
+- Journal init/log/commit/multi-txn/full/checkpoint
 - Snapshot creation
-- Multi-transaction handling
 
-### ✅ Threading Tests (6/6 passing)
-- Pipe I/O
-- Process creation/execution
-- Thread creation/joining
-- Memory allocation
+### ✅ Kernel Tests (37/37 passing) — `make test-kernel`
+- kmalloc roundtrip/edge/stress/sizes/compaction
+- VMA add/find/remove
+- TCP connection lifecycle, bind/listen, state transitions, retransmission
+- Socket lifecycle (extended)
+- Spinlock acquire/release
+- Mutex lock/unlock + stress
+- UDP endpoint multi + queue-full
+- Block cache eviction
+- Error code translation
+- Veth pair basic + frame roundtrip
+- SMP concurrent spinlock + PMM concurrent alloc/free
+- Scheduler steal/balance/affinity
+- rwlock, seqlock, lockdep
+- PMM alloc/free stress, multi-page stress, accounting
+- VMM map/unmap stress, page permissions
+- Thread storm, sleep accuracy, guard page
+- NUMA basic (node alloc/free, SLIT distances)
+
+### ✅ SFS Filesystem Tests (6/6 passing) — `make test-sfs`
+- File create/write/read roundtrip
+- mkdir + file in subdir
+- File rename
+- Hard links + symlinks
+- File stat fields
+- Error paths (OOM, invalid paths)
+
+### ✅ Process Tests (4/4 passing) — `make test-process`
+- Create/find/exit lifecycle
+- Exit code propagation to parent
+- Fork + child PID
+- Zombie reap via waitpid
+
+### ✅ Security Tests (19/19 passing) — `make test-security`
+- Syscall bad-fd rejection
+- NULL buffer rejection
+- User pointer range checks
+- File permission enforcement
+- Process memory isolation (separate CR3 + VMA parity)
+- Stack canary verification
+- VFS fd mode enforcement
+- Capability system (4 caps)
+- Fork limit enforcement
+- Audit ring buffer
+- UID/GID syscalls
+- DAC permissions
+- Syscall filtering
+- SHA-256 known digest (NIST vectors)
+- CSPRNG non-deterministic output
+- AF_UNIX ring buffer I/O
+- socketpair data roundtrip + credentials
+- no_new_privs blocks setuid
+- Secure boot whitelist
 
 ### ✅ Integration Tests (2)
 - Two-QEMU IPv6 TCP/UDP echo

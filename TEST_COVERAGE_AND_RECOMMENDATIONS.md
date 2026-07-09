@@ -1,13 +1,13 @@
 # 🧪 Comprehensive Testing Analysis & Recommendations
 **OPERtur/TRY1 - OS/Kernel Implementation**  
-**Date:** June 13, 2026 *(last updated 2026-07-10 — test count audit)*  
-**Status:** Historical reference — codebase has significantly evolved since this audit
+**Date:** June 13, 2026 *(fully updated 2026-07-10 — comprehensive test suite sync)*  
+**Status:** Synchronised with current codebase (81 tests across 6 suites)
 
 ---
 
 ## Executive Summary
 
-The codebase contains **~14 existing unit tests** organized into 3 test suites, plus integration test scripts. This report:
+The codebase contains **81 existing unit tests** organized into 6 test suites, plus integration test scripts. This report:
 
 1. **Catalogs all existing tests** with descriptions
 2. **Identifies coverage gaps** across major subsystems
@@ -29,9 +29,9 @@ The codebase contains **~14 existing unit tests** organized into 3 test suites, 
 >
 > All 81 pass in a single `make test-all` build. See `AGENTS.md` for full history.
 
-### Existing Test Suites
+### Current Test Suites (as of 2026-07-10: 81 total)
 
-#### 1. **Network Tests** (`net_test.c`) - 5 Tests
+#### 1. **Network Tests** (`net_test.c`) — 5 Tests
 | Test ID | Name | Coverage | Status |
 |---------|------|----------|--------|
 | N1 | `test_tcp_find_conn_ipv6` | TCP IPv6 5-tuple matching | ✅ Passing |
@@ -40,12 +40,11 @@ The codebase contains **~14 existing unit tests** organized into 3 test suites, 
 | N4 | `test_socket_refcount` | Socket lifecycle management | ✅ Passing |
 | N5 | `test_udp_queue_roundtrip` | UDP datagram queue I/O | ✅ Passing |
 
-**Invocation:** `make test-net` (runs 5/5 passing)  
-**Coverage Gap:** TCP, UDP, DHCP, DNS, NTP, routing, multicast, error paths
+**Invocation:** `make test-net` (runs 5/5 passing)
 
 ---
 
-#### 2. **Storage Tests** (`storage_test.c`) - 10 Tests
+#### 2. **Storage Tests** (`storage_test.c`) — 10 Tests
 | Test ID | Name | Coverage | Status |
 |---------|------|----------|--------|
 | S1 | `test_block_cache_basic` | Block cache read/write | ✅ Passing |
@@ -59,34 +58,102 @@ The codebase contains **~14 existing unit tests** organized into 3 test suites, 
 | S9 | `test_journal_full` | Journal capacity + checkpoint | ✅ Passing |
 | S10 | `test_snapshot_take_info` | Snapshot creation | ✅ Passing |
 
-**Invocation:** `make test-storage` (runs 10/10 passing)  
-**Coverage Gap:** SFS filesystem, VFS operations, concurrent I/O, error recovery
+**Invocation:** `make test-storage` (runs 10/10 passing)
 
 ---
 
-#### 3. **Threading Tests** (`thread_test-c.c`) - 6 Tests
+#### 3. **Kernel Tests** (`kernel_test.c`) — 37 Tests (38 with lockdep)
+| Test ID | Name | Coverage |
+|---------|------|----------|
+| K1–K5 | kmalloc (roundtrip, edge, stress, sizes, compaction) | Slab allocator correctness |
+| K6 | `test_vma_add_find_remove` | VMA tracking |
+| K7–K8 | `test_tcp_conn_create_destroy`, `test_tcp_conn_bind_listen` | TCP connection management |
+| K9 | `test_socket_lifecycle_extended` | Socket refcount/ops |
+| K10 | `test_spinlock_acquire_release` | Spinlock correctness |
+| K11 | `test_tcp_retransmission` | TCP data retransmission |
+| K12–K13 | `test_mutex_lock_unlock`, `test_mutex_stress` | Mutex correctness + concurrency |
+| K14 | `test_udp_endpoint_multi` | Multiple UDP endpoints |
+| K15 | `test_udp_endpoint_queue_full` | UDP queue overflow handling |
+| K16 | `test_block_cache_eviction` | Block cache LRU eviction |
+| K17 | `test_tcp_state_transitions` | TCP full state machine |
+| K18 | `test_error_codes` | Kernel ERR_* to POSIX errno |
+| K19–K20 | `test_veth_pair_basic`, `test_veth_frame_roundtrip` | Veth network pair |
+| K21 | `test_smp_concurrent_spinlock` | SMP spinlock stress (2-CPU) |
+| K22 | `test_smp_pmm_concurrent` | SMP PMM concurrent alloc/free |
+| K23–K25 | `test_sched_steal`, `test_sched_balance_push`, `test_sched_affinity_pin` | SMP scheduler (2-CPU) |
+| K26–K28 | `test_rwlock_basic`, `test_seqlock_basic`, `test_lockdep_ordering` | Sync primitives |
+| K29–K31 | `test_pmm_alloc_free_stress`, `test_pmm_multi_page_stress`, `test_pmm_accounting` | PMM stress |
+| K32–K33 | `test_vmm_map_unmap_stress`, `test_vmm_page_permissions` | VMM stress |
+| K34 | `test_sched_thread_storm` | Many-thread scheduling |
+| K35 | `test_sched_sleep_accuracy` | Sleep timer precision |
+| K36 | `test_guard_page_basic` | Guard page detection |
+| K37 | `test_numa_basic` | NUMA node alloc/free + SLIT distances |
+
+**Invocation:** `make test-kernel` (runs 37/37 passing; +1 with lockdep)
+
+---
+
+#### 4. **SFS Filesystem Tests** (`sfs_test.c`) — 6 Tests
 | Test ID | Name | Coverage | Status |
 |---------|------|----------|--------|
-| T1 | `pipe_test` | Pipe I/O | ✅ Passing |
-| T2 | `fork_test` | Process creation | ✅ Passing |
-| T3 | `exec_test` | Program execution | ✅ Passing |
-| T4 | `thread_test` | Thread creation/join | ✅ Passing |
-| T5 | `malloc_test` | Memory allocation | ✅ Passing |
-| T6 | `large_alloc_test` | Large buffer allocation | ✅ Passing |
+| F1 | `test_sfs_create_write_read` | File create/write/read roundtrip | ✅ Passing |
+| F2 | `test_sfs_mkdir_and_file` | Directory + file in subdir | ✅ Passing |
+| F3 | `test_sfs_rename` | File rename | ✅ Passing |
+| F4 | `test_sfs_links` | Hard links + symlinks | ✅ Passing |
+| F5 | `test_sfs_stat` | File stat fields | ✅ Passing |
+| F6 | `test_sfs_error_paths` | OOM/invalid-path errors | ✅ Passing |
 
-**Invocation:** Embedded in boot sequence  
-**Coverage Gap:** Race conditions, deadlock scenarios, stress testing
+**Invocation:** `make test-sfs` (runs 6/6 passing)
+
+---
+
+#### 5. **Process Tests** (`process_test.c`) — 4 Tests
+| Test ID | Name | Coverage | Status |
+|---------|------|----------|--------|
+| P1 | `test_process_create_find_exit` | Create/find/exit lifecycle | ✅ Passing |
+| P2 | `test_process_exit_code` | Exit code propagation to parent | ✅ Passing |
+| P3 | `test_process_fork_basic` | Fork + child PID | ✅ Passing |
+| P4 | `test_process_zombie_cleanup` | Zombie reap via waitpid | ✅ Passing |
+
+**Invocation:** `make test-process` (runs 4/4 passing)
+
+---
+
+#### 6. **Security Tests** (`security_test.c`) — 19 Tests
+| Test ID | Name | Coverage | Status |
+|---------|------|----------|--------|
+| SEC1 | `test_syscall_bad_fd` | Bad FD rejection | ✅ Passing |
+| SEC2 | `test_syscall_null_buf` | NULL buffer rejection | ✅ Passing |
+| SEC3 | `test_user_ptr_checks` | Kernel/user pointer range checks | ✅ Passing |
+| SEC4 | `test_file_permissions` | File permission enforcement | ✅ Passing |
+| SEC5 | `test_process_memory_isolation` | Separate CR3 + VMA parity | ✅ Passing |
+| SEC6 | `test_stack_canary` | Stack canary verification | ✅ Passing |
+| SEC7 | `test_vfs_fd_mode_enforcement` | VFS fd read/write mode enforcement | ✅ Passing |
+| SEC8 | `test_cap_system` | Capability checks (CAP_SYS_BOOT, etc.) | ✅ Passing |
+| SEC9 | `test_fork_limit` | Fork limit enforcement | ✅ Passing |
+| SEC10 | `test_audit_log` | Audit ring buffer write/read | ✅ Passing |
+| SEC11 | `test_uid_gid` | UID/GID syscalls | ✅ Passing |
+| SEC12 | `test_dac_permissions` | POSIX DAC permission model | ✅ Passing |
+| SEC13 | `test_syscall_filtering` | Syscall mask enforcement | ✅ Passing |
+| SEC14 | `test_sha256` | SHA-256 known digest (NIST vectors) | ✅ Passing |
+| SEC15 | `test_getrandom` | CSPRNG non-deterministic output | ✅ Passing |
+| SEC16 | `test_unix_buf_direct` | AF_UNIX ring buffer I/O | ✅ Passing |
+| SEC17 | `test_socketpair` | socketpair data round-trip + credentials | ✅ Passing |
+| SEC18 | `test_no_new_privs` | prctl no_new_privs blocks setuid | ✅ Passing |
+| SEC19 | `test_secure_boot` | Known-good ELF passes, garbage rejected | ✅ Passing |
+
+**Invocation:** `make test-security` (runs 19/19 passing)
 
 ---
 
 ### Integration Test Scripts
 
-#### 4. **Two-QEMU Test** (`test-2qemu.sh`)
+#### 7. **Two-QEMU Test** (`test-2qemu.sh`)
 - **Purpose:** IPv6 TCP/UDP echo validation between two QEMU instances
 - **Coverage:** End-to-end network communication
 - **Status:** ✅ Working (with timing issues)
 
-#### 5. **Test Runner** (`test-runner.sh`)
+#### 8. **Test Runner** (`test-runner.sh`)
 - **Purpose:** Automated prompt-based output capture
 - **Status:** ⚠️ Partial (pipe buffering issues in no-KVM QEMU)
 

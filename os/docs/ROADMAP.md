@@ -67,9 +67,9 @@
 
 ### Syscall Layer
 
-- ✅ **Syscall gateway** — int 0x80 fast path with full register save; syscall table maps 38 syscall numbers (0–37: SYS_IOCTL=34, SYS_GETPGID=35, SYS_SETPGID=36, SYS_PTY_PAIR=37) to kernel handlers.
+- ✅ **Syscall gateway** — int 0x80 fast path with full register save; syscall table maps 90 syscall numbers (0–89) to kernel handlers.
 - ✅ **Syscall validation** — All pointer arguments validated against user address range via copy_from_user/copy_to_user; invalid addresses return `-EFAULT` before any kernel state is touched.
-- ✅ **Stable userspace ABI** — 38 syscalls (0–37) with stable numbers; SYS_IOCTL, SYS_GETPGID, SYS_SETPGID, SYS_PTY_PAIR added for terminal/job-control/PTY support. Syscall numbers are stable within the build.
+- ✅ **Stable userspace ABI** — 90 syscalls (0–89) with stable numbers including: sockets (38–52), capabilities (54–55), audit (56), UID/GID (57–62), CSPRNG (63), syscall filter (64), socketpair (65), prctl (66), secure boot (67), network namespaces (68–71), filesystem ops (72–88), scheduler affinity (89). Syscall numbers are stable within the build.
 
 ### Userspace Runtime
 

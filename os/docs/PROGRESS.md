@@ -47,7 +47,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Kernel worker threads (kworker processes system work queue at THREAD_DEF_PRIO)
 
 ## Syscall and userspace
-- ✅ Syscall gateway (int 0x80, 38 syscalls 0–37: IOCTL=34, GETPGID=35, SETPGID=36, PTY_PAIR=37 added)
+- ✅ Syscall gateway (int 0x80, 90 syscalls 0–89: sockets 38–52, capabilities 54–55, audit 56, UID/GID 57–62, CSPRNG 63, syscall filter 64, socketpair 65, prctl 66, secure boot 67, netns 68–71, fs 72–88, sched_setaffinity 89)
 - ✅ Syscall argument validation (user-range + mapped + SMAP checks)
 - ❌ Userspace ABI stability (no formal ABI)
 - ✅ Userspace C library (full libc: stdio/printf, stdlib/malloc, string, unistd syscall wrappers, signal, errno, crt0)
@@ -124,8 +124,8 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ Sockets API (socket/bind/connect/listen/accept/send/recv/sendto/recvfrom/close, fd dispatch, AF_INET/AF_INET6, IPV6_V6ONLY, IP_ADD/DROP_MEMBERSHIP, setsockopt/getsockopt, error propagation via kernel_err_to_posix)
 - ✅ poll() syscall (POLLIN/POLLOUT/POLLERR, implemented for TCP and UDP sockets)
 - ✅ Socket-level multicast (IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP, IPV6_JOIN_GROUP/IPV6_LEAVE_GROUP)
-- ❌ TLS support
-- ❌ Network namespaces or isolation
+- ❌ TLS support (plan: docs/7_TLS_PLAN.md — userspace libtls.a wrapping TCP sockets with TLS 1.3)
+- ✅ Network namespaces (net_ns_t struct, unshare CLONE_NEWNET, veth pairs, sys_netconfig/sys_veth_move, cross-namespace TCP test)
 
 ## Security and isolation
 - ✅ Capability system (4 caps: CAP_SYS_BOOT, CAP_KILL, CAP_NET_RAW, CAP_SYS_ADMIN; capget/capset syscalls; enforced at reboot/kill/setpgid)
@@ -196,7 +196,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - 🟡 Performance counters (basic: switch/yield count, free pages)
 - 🟡 Stress testing (mutex contention test, compute threads)
 - ❌ Fuzzing for syscalls and filesystem
-- ❌ Regression tests (no automated regression suite)
+- ✅ Regression tests (make test-all: 81 tests across 6 suites; make test-net/test-kernel/test-sfs/test-process/test-security for individual suites)
 - ❌ Benchmarking tools
 - ✅ Code style consistency (uniform style across kernel)
 - ✅ NUMA awareness (SRAT/SLIT parsing, per-node PMM free lists, node-local allocation for kmalloc/vmm/sched)
