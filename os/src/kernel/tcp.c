@@ -115,22 +115,19 @@ static int tcp_send_pkt(tcp_conn_t* conn, uint8_t flags,
     if (len > 0) kmemcpy(buf + TCP_HDR_LEN, data, len);
 
     if (conn->af == AF_INET) {
-        ipv4_addr_t my_ip = ipv4_from_bytes(10, 0, 2, 15);
-        hdr->checksum = tcp_checksum_pseudo(buf, total, &my_ip,
+        hdr->checksum = tcp_checksum_pseudo(buf, total, &conn->local_ip.v4,
                                               &conn->remote_ip.v4, AF_INET);
         KDEBUG("[TCP] TX flags=0x%02x seq=%u ack=%u csum=0x%04x data=%u\n",
                 flags, conn->snd_nxt, conn->rcv_nxt, hdr->checksum, len);
         return ipv4_send(conn->remote_ip.v4, IPV4_PROTO_TCP, buf, total);
     } else {
-        uint8_t my_ip[16];
-        ndp_make_lladdr(nic.mac, my_ip);
-        hdr->checksum = tcp_checksum_pseudo(buf, total, my_ip,
+        hdr->checksum = tcp_checksum_pseudo(buf, total, conn->local_ip.v6,
                                               conn->remote_ip.v6, AF_INET6);
         return ipv6_send(conn->remote_ip.v6, IPV6_NEXT_TCP, buf, total);
     }
 }
 
-static void tcp_handle_common(int af, const void* src_ip,
+static void tcp_handle_common(int af, const void* src_ip, const void* dst_ip,
                                const uint8_t* data, uint32_t len) {
     cpu_flags_t flags;
     spinlock_acquire(&tcp_lock, &flags);
@@ -177,10 +174,13 @@ static void tcp_handle_common(int af, const void* src_ip,
             child->iss = 0;
             child->irs = seq;
             child->closed = 0;
-            if (af == AF_INET)
+            if (af == AF_INET) {
                 child->remote_ip.v4 = *(const ipv4_addr_t*)src_ip;
-            else
+                child->local_ip.v4 = *(const ipv4_addr_t*)dst_ip;
+            } else {
                 kmemcpy(child->remote_ip.v6, src_ip, 16);
+                kmemcpy(child->local_ip.v6, dst_ip, 16);
+            }
             child->on_recv = NULL;
             child->on_close = NULL;
             child->on_connect = listener->on_connect;
@@ -228,14 +228,16 @@ static void tcp_handle_common(int af, const void* src_ip,
             rst->checksum = 0;
             rst->urgent = 0;
             if (af == AF_INET) {
-                ipv4_addr_t my_ip4 = ipv4_from_bytes(10, 0, 2, 15);
+                ipv4_addr_t my_ip4 = ipv4_get_addr();
                 rst->checksum = tcp_checksum_pseudo(rst_buf, TCP_HDR_LEN,
                                                      &my_ip4, src_ip, AF_INET);
                 ipv4_send(*(const ipv4_addr_t*)src_ip, IPV4_PROTO_TCP,
                            rst_buf, TCP_HDR_LEN);
             } else {
+                uint8_t my_ip6[16];
+                ipv6_get_lladdr(my_ip6);
                 rst->checksum = tcp_checksum_pseudo(rst_buf, TCP_HDR_LEN,
-                                                     NULL, src_ip, AF_INET6);
+                                                     my_ip6, src_ip, AF_INET6);
                 ipv6_send(src_ip, IPV6_NEXT_TCP, rst_buf, TCP_HDR_LEN);
             }
         }
@@ -414,16 +416,14 @@ static void tcp_ipv4_handler(ipv4_addr_t src, ipv4_addr_t dst,
                                uint8_t protocol,
                                const uint8_t* data, uint32_t len) {
     (void)protocol;
-    (void)dst;
-    tcp_handle_common(AF_INET, &src, data, len);
+    tcp_handle_common(AF_INET, &src, &dst, data, len);
 }
 
 static void tcp_ipv6_handler(const uint8_t* src, const uint8_t* dst,
                                uint8_t next_header,
                                const uint8_t* data, uint32_t len) {
     (void)next_header;
-    (void)dst;
-    tcp_handle_common(AF_INET6, src, data, len);
+    tcp_handle_common(AF_INET6, src, dst, data, len);
 }
 
 tcp_conn_t* tcp_listen(int af, uint16_t port,
@@ -636,10 +636,6 @@ void tcp_tick(void) {
                 uint32_t rlen = c->retrans_len;
                 uint32_t rseq = c->retrans_seq;
                 kmemcpy(rbuf, c->retrans_buf, rlen);
-                uint32_t old_snd_nxt = c->snd_nxt;
-                c->snd_nxt = rseq;
-
-                /* Exponential backoff */
                 c->rto_ms = (c->rto_ms * 2 > 60000) ? 60000 : c->rto_ms * 2;
                 c->rto_remaining = c->rto_ms;
 
@@ -650,7 +646,7 @@ void tcp_tick(void) {
                 /* Re-check connection after lock re-acquire */
                 if (!c->used || c->state != TCP_ESTABLISHED || c->retrans_len == 0)
                     continue;
-                c->snd_nxt = old_snd_nxt;
+                c->snd_nxt = rseq + rlen;
             } else {
                 c->rto_remaining -= 10;
             }
@@ -660,8 +656,8 @@ void tcp_tick(void) {
         if ((c->state == TCP_FIN_WAIT1 || c->state == TCP_LAST_ACK) &&
             c->fin_rto_remaining > 0) {
             if (c->fin_rto_remaining <= 10) {
-                c->fin_rto_remaining = 2000;
-                if (c->fin_rto_remaining > 60000) c->fin_rto_remaining = 60000;
+                c->fin_rto_ms = (c->fin_rto_ms * 2 > 60000) ? 60000 : (c->fin_rto_ms ? c->fin_rto_ms * 2 : 2000);
+                c->fin_rto_remaining = c->fin_rto_ms;
 
                 spinlock_release(&tcp_lock, flags);
                 tcp_send_pkt(c, TCP_FIN | TCP_ACK, NULL, 0);
@@ -781,10 +777,13 @@ int tcp_conn_connect(tcp_conn_t* c, const void* dst_ip,
         c->local_port = tcp_ephemeral_port++;
     c->state = TCP_SYN_SENT;
     c->remote_port = dst_port;
-    if (c->af == AF_INET)
+    if (c->af == AF_INET) {
         c->remote_ip.v4 = *(const ipv4_addr_t*)dst_ip;
-    else
+        c->local_ip.v4 = ipv4_get_addr();
+    } else {
         kmemcpy(c->remote_ip.v6, dst_ip, 16);
+        ipv6_get_lladdr(c->local_ip.v6);
+    }
 
     uint32_t iss;
     __asm__ volatile("rdtsc" : "=a"(iss) : : "edx");

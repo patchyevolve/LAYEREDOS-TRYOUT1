@@ -12,7 +12,7 @@
 #include "apic.h"
 #include "rcu.h"
 
-static uint64_t next_thread_id = 1;
+uint64_t next_thread_id = 1;
 static uint64_t kernel_cr3 = 0;
 static thread_t* idle_thr = NULL;  /* CPU 0 (BSP) idle thread */
 static thread_t* all_threads_head = NULL;
@@ -28,6 +28,19 @@ spinlock_t sched_queue_lock;
 
 static inline per_cpu_data_t* sched_pcp(void) {
     return per_cpu_data[smp_cpu_id()];
+}
+
+/* Called after switch_context returns on the new thread's stack.
+ * Finalizes the thread retired by this CPU, transitioning it from
+ * THREAD_ZOMBIE to THREAD_TERMINATED so sched_reap_zombies() can
+ * safely free its stack (now fully vacated by the context switch). */
+static inline void sched_finalize_retiring(void) {
+    per_cpu_data_t* pcp = sched_pcp();
+    uint64_t retiring = pcp->retiring_thread;
+    if (retiring) {
+        pcp->retiring_thread = 0;
+        ((thread_t*)(uintptr_t)retiring)->state = THREAD_TERMINATED;
+    }
 }
 
 void all_threads_add(thread_t* t) {
@@ -87,18 +100,33 @@ void sched_reap_zombies(void) {
     thread_t* t = all_threads_head;
     while (t) {
         thread_t* next = t->all_next;
-        if (t->state == THREAD_ZOMBIE || t->state == THREAD_TERMINATED) {
-            if (t == idle_thr || t == current_thread) {
-                t = next;
-                continue;
-            }
+        int do_reap = 0;
+        cpu_flags_t jflags;
+        if (t->state == THREAD_TERMINATED && t != idle_thr && t != current_thread) {
+            spinlock_acquire(&t->join_queue.lock, &jflags);
+            if (t->join_queue.count == 0) do_reap = 1;
+            else spinlock_release(&t->join_queue.lock, jflags);
+        }
+        if (do_reap) {
             all_threads_remove(t);
             if (t->proc)
                 list_del(&t->threads_node);
-            if (t->kernel_stack)
-                pmm_free_pages(VIRT_TO_PHYS((uint64_t)t->kernel_stack),
-                    (t->kernel_stack_size + PAGE_SIZE - 1) / PAGE_SIZE);
-            pmm_free_page(VIRT_TO_PHYS((uint64_t)t));
+            spinlock_release(&t->join_queue.lock, jflags);
+            if (t->kernel_stack) {
+                /* Re-map guard page so pmm can use it.
+                 * Must use vmm_peek_pte (not vmm_walk_pagetable) because
+                 * thread_create cleared the leaf PTE (PAGE_PRESENT=0),
+                 * so vmm_walk_pagetable would return NULL. */
+                uint64_t __guard_phys = t->block_phys + PAGE_SIZE;
+                uint64_t __gv = (uint64_t)PHYS_TO_VIRT(__guard_phys);
+                page_entry_t* __gpte = vmm_peek_pte(vmm_get_kernel_pml4(), __gv);
+                if (__gpte) {
+                    *__gpte = __guard_phys | PAGE_PRESENT | PAGE_WRITE;
+                    asm volatile("invlpg (%0)" : : "r"(__gv) : "memory");
+                }
+                uint32_t __np = (t->kernel_stack_size + PAGE_SIZE - 1) / PAGE_SIZE + 2;
+                pmm_free_pages(t->block_phys, __np);
+            }
         }
         t = next;
     }
@@ -396,10 +424,11 @@ static void sched_balance_push(void) {
     tgt_pcp->rq_total++;
     t->cpu_queue = target;
 
+    int tgt_is_idle = (thread_t*)tgt_pcp->cpu_thread == (thread_t*)tgt_pcp->idle_thread;
     spinlock_release(&sched_queue_lock, qflags);
 
     /* Wake target CPU if idle */
-    if ((thread_t*)tgt_pcp->cpu_thread == (thread_t*)tgt_pcp->idle_thread)
+    if (tgt_is_idle)
         smp_send_reschedule(target);
 }
 
@@ -417,9 +446,13 @@ static thread_t* pick_next(void) {
      * try to steal a higher-priority thread from a loaded sibling. */
     if (prio > 150 && smp_enabled && nr_cpus > 1) {
         thread_t* stolen = sched_steal_thread();
-        if (stolen && stolen->priority < prio)
-            return stolen;
-        /* Stolen was NULL or lower priority — fall through to local. */
+        if (stolen) {
+            if (stolen->priority < prio)
+                return stolen;
+            /* Stolen thread didn't meet priority threshold — re-queue locally */
+            sched_add_thread(stolen);
+        }
+        /* Fall through to local queue. */
     }
 
     cpu_flags_t qflags;
@@ -466,6 +499,38 @@ static inline void sched_sync_current(thread_t* old, thread_t* next) {
     current_thread = next;  /* macro: writes to per-CPU slot when CONFIG_SMP */
 }
 
+static inline void sched_check_stack(thread_t* t) {
+    if (!t->kernel_stack) return;
+    uint64_t rsp;
+    asm volatile("mov %%rsp, %0" : "=r"(rsp));
+    uint64_t base = (uint64_t)t->kernel_stack;
+    uint64_t top = base + t->kernel_stack_size;
+    /* Check for UNDERFLOW: if RSP is within 16 KB below the stack base,
+     * the thread has overflowed its stack.  If RSP is far below the base
+     * (e.g., the thread is running on a bootstrap stack during early init
+     * before its own kernel stack is active), just warn — this is normal
+     * during thread creation transitions. */
+    if (rsp < base) {
+        int64_t gap = base - rsp;
+        if (gap <= (int64_t)t->kernel_stack_size) {
+            kprintf("[SCHED] STACK OVERFLOW on thread '%s' (id=0x%llx): "
+                    "rsp=0x%llx stack=[0x%llx-0x%llx) gap=%lld\n",
+                    t->name, t->id, rsp, base, top, gap);
+            kpanic("Kernel stack overflow detected");
+        } else if (gap <= 0x100000) {
+            kprintf("[SCHED] WARNING: thread '%s' (id=0x%llx) "
+                    "rsp=0x%llx outside stack=[0x%llx-0x%llx) gap=%lld\n",
+                    t->name, t->id, rsp, base, top, gap);
+        }
+    }
+    /* Check for near-bottom: within 256 bytes of the base */
+    if (rsp >= base && rsp - base < 256) {
+        kprintf("[SCHED] WARNING: thread '%s' (id=0x%llx) "
+                "has only %llu bytes of stack remaining\n",
+                t->name, t->id, rsp - base);
+    }
+}
+
 void schedule(void) {
     if (!sched_running || !current_thread) return;
 
@@ -480,6 +545,8 @@ void schedule(void) {
     per_cpu_data_t* pcp = sched_pcp();
     pcp->need_reschedule = 0;
     cpu_flags_t flags = hal_save_irq();
+
+    sched_check_stack(current_thread);
 
     thread_t* next = pick_next();
 
@@ -514,6 +581,12 @@ void schedule(void) {
     hal_set_kernel_stack(kstack_top);
 
     switch_context(&old, &current_thread);
+
+    /* Finalize any thread retired on this CPU — the previous thread's
+     * stack is now fully vacated.  This is reached when a preempted or
+     * yielded thread is switched back to. */
+    sched_finalize_retiring();
+
     hal_restore_irq(flags);
 }
 
@@ -521,24 +594,40 @@ void thread_yield(void) {
     sched_yield_count++;
     cpu_flags_t flags = hal_save_irq();
     current_thread->time_slice_remaining = 0;
-    hal_restore_irq(flags);
     schedule();
+    hal_restore_irq(flags);
 }
 
 thread_t* thread_create(void (*func)(void*), void* arg,
                         int priority, const char* name) {
-    uint64_t tcb_phys = pmm_alloc_page();
-    if (!tcb_phys) return NULL;
-    thread_t* tcb = (thread_t*)PHYS_TO_VIRT(tcb_phys);
+    uint32_t stack_pages = (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    /* Layout: [TCB @ 0] [GUARD (unmapped) @ 1 page] [stack @ pages 2..1+stack_pages]
+     * Total = 1 (TCB) + 1 (guard) + stack_pages */
+    uint32_t total_pages = stack_pages + 2;
+
+    uint64_t block_phys = pmm_alloc_node_pages(total_pages, pmm_current_node());
+    kprintf("[DBG] thread_create \"%s\": block_phys=0x%lx guard=0x%lx stack=0x%lx\n",
+            name ? name : "?", block_phys, block_phys + PAGE_SIZE, block_phys + 2*PAGE_SIZE);
+    if (!block_phys) return NULL;
+
+    /* TCB in the LOW page */
+    thread_t* tcb = (thread_t*)PHYS_TO_VIRT(block_phys);
     kmemset(tcb, 0, sizeof(thread_t));
 
-    uint64_t kstack_phys = pmm_alloc_pages(
-        (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE);
-    if (!kstack_phys) {
-        pmm_free_page((uint64_t)tcb - KERNEL_VMA_BASE);
-        return NULL;
+    /* Guard page between TCB and stack — unmapped from kernel identity map.
+     * Stack overflow into this page triggers a page fault (→ double fault → kpanic)
+     * instead of silently corrupting adjacent data. */
+    uint64_t guard_phys = block_phys + PAGE_SIZE;
+    uint64_t guard_virt = (uint64_t)PHYS_TO_VIRT(guard_phys);
+    page_entry_t* gpte = vmm_walk_pagetable(vmm_get_kernel_pml4(), guard_virt);
+    if (gpte) {
+        uint64_t saved = *gpte;
+        *gpte = 0;
+        asm volatile("invlpg (%0)" : : "r"(guard_virt) : "memory");
+        (void)saved;
     }
-    void* kstack = (void*)PHYS_TO_VIRT(kstack_phys);
+
+    void* kstack = (void*)((uint8_t*)PHYS_TO_VIRT(block_phys) + 2 * PAGE_SIZE);
     kmemset(kstack, 0, THREAD_STACK_SIZE);
     uint64_t kstack_top = (uint64_t)kstack + THREAD_STACK_SIZE;
 
@@ -562,6 +651,7 @@ thread_t* thread_create(void (*func)(void*), void* arg,
     tcb->cpu_affinity = 0xFF;  /* allow all CPUs by default (up to 8) */
     tcb->kernel_stack = kstack;
     tcb->kernel_stack_size = THREAD_STACK_SIZE;
+    tcb->block_phys = block_phys;
     wait_queue_init(&tcb->join_queue);
     kstrncpy(tcb->name, name ? name : "thread", THREAD_NAME_MAX - 1);
 
@@ -573,11 +663,18 @@ thread_t* thread_create(void (*func)(void*), void* arg,
 void thread_exit(int exit_code) {
     if (!current_thread) return;
 
-    current_thread->exit_code = exit_code;
-    current_thread->state = THREAD_ZOMBIE;
-    sched_wake(&current_thread->join_queue);
+    /* Finalize any prior retiring thread on this CPU first (before
+     * publishing a new one).  After the switch_context below,
+     * execution continues wherever the target thread was last
+     * preempted — NOT at the next line — so the finalize must be
+     * called from schedule(), the idle loop, or the next thread_exit. */
+    sched_finalize_retiring();
 
     cpu_flags_t flags = hal_save_irq();
+    current_thread->exit_code = exit_code;
+    current_thread->state = THREAD_ZOMBIE;
+    /* IRQs stay disabled through sched_wake (spinlock save/restore preserves) */
+    sched_wake(&current_thread->join_queue);
 
     thread_t* next = pick_next();
     if (!next) {
@@ -585,6 +682,13 @@ void thread_exit(int exit_code) {
     }
 
     thread_t* old = current_thread;
+
+    /* Publish the retiring thread before switch_context — the reaper
+     * on another CPU won't free the stack until finalize sets TERMINATED
+     * (after the context switch has fully vacated the old stack). */
+    per_cpu_data_t* pcp = sched_pcp();
+    pcp->retiring_thread = (uint64_t)(uintptr_t)old;
+
     set_current_thread(next);
     next->state = THREAD_RUNNING;
     next->time_slice_remaining = THREAD_TIME_SLICE;
@@ -595,6 +699,15 @@ void thread_exit(int exit_code) {
     }
 
     hal_set_kernel_stack((uint64_t)next->kernel_stack + next->kernel_stack_size);
+
+    sched_check_stack(old);
+
+    /* NOTE: switch_context below NEVER returns here — execution
+     * continues wherever the target thread was last saved (e.g., in
+     * schedule() after its own switch_context call, or in
+     * thread_trampoline for brand-new threads).  The ZOMBIE→TERMINATED
+     * transition happens from sched_finalize_retiring() in schedule(),
+     * idle_thread(), or the next thread_exit() on this CPU. */
     switch_context(&old, &current_thread);
     hal_restore_irq(flags);
 }
@@ -602,11 +715,12 @@ void thread_exit(int exit_code) {
 void thread_sleep(uint64_t ms) {
     if (!current_thread) return;
     uint64_t wake_tick = hal_timer_get_ticks() + (ms * hal_timer_get_hz() / 1000);
-
+    cpu_flags_t flags = hal_save_irq();
     current_thread->wakeup_tick = wake_tick;
     current_thread->state = THREAD_SLEEPING;
-
-    thread_yield();
+    current_thread->time_slice_remaining = 0;
+    schedule();
+    hal_restore_irq(flags);
 }
 
 err_t thread_join(thread_t* t, int* exit_code) {
@@ -616,7 +730,9 @@ err_t thread_join(thread_t* t, int* exit_code) {
     for (;;) {
         spinlock_acquire(&t->join_queue.lock, &flags);
         if (t->state == THREAD_ZOMBIE || t->state == THREAD_TERMINATED) {
+            int code = t->exit_code;
             spinlock_release(&t->join_queue.lock, flags);
+            if (exit_code) *exit_code = code;
             break;
         }
         if (current_thread->state == THREAD_READY ||
@@ -629,7 +745,6 @@ err_t thread_join(thread_t* t, int* exit_code) {
         spinlock_release(&t->join_queue.lock, flags);
         schedule();
     }
-    if (exit_code) *exit_code = t->exit_code;
     return ERR_OK;
 }
 
@@ -709,11 +824,6 @@ int check_sleepers(void) {
     while (t) {
         thread_t* next = t->all_next;
         if (t->state == THREAD_SLEEPING && t->wakeup_tick <= now) {
-            t->state = THREAD_READY;
-            t->priority = t->base_priority;
-            t->time_slice_remaining = THREAD_TIME_SLICE;
-            t->age_ticks = 0;
-
             /* Wake on the CPU where the thread was last running */
             int target_cpu = t->cpu_queue;
             int this_cpu = smp_cpu_id();
@@ -723,6 +833,10 @@ int check_sleepers(void) {
                 t = next;
                 continue;
             }
+            t->state = THREAD_READY;
+            t->priority = t->base_priority;
+            t->time_slice_remaining = THREAD_TIME_SLICE;
+            t->age_ticks = 0;
             if (target_cpu != this_cpu && target_cpu >= 0 && target_cpu < nr_cpus
                 && per_cpu_data[target_cpu]) {
                 sched_add_thread_to_cpu_locked(t, target_cpu);
@@ -760,6 +874,11 @@ void idle_thread(void* arg) {
     int this_cpu = smp_cpu_id();
     int has_mwait = hal_cpu_has_mwait();
     for (;;) {
+        /* Finalize any thread retired on this CPU since the last idle
+         * iteration.  Catches threads whose context switch ended in
+         * thread_trampoline (brand-new threads) where the schedule()
+         * after-switch path is not reached. */
+        sched_finalize_retiring();
         /* Check if this CPU has been offlined.  If so, park in a HLT loop
          * until the BSP sets cpu_state back to ONLINE and sends a
          * reschedule IPI to wake us. */
@@ -813,23 +932,26 @@ void sched_timer_tick(void) {
         per_cpu_data_t* _pcp = sched_pcp();
         if (++_pcp->aging_counter >= AGING_INTERVAL) {
             _pcp->aging_counter = 0;
-            cpu_flags_t qflags;
-            if (spinlock_try_acquire(&sched_queue_lock, &qflags)) {
-                thread_t* t = all_threads_head;
-                while (t) {
-                    thread_t* next = t->all_next;
-                    if (t != idle_thr && t->state == THREAD_READY) {
-                        t->age_ticks++;
-                        if (t->age_ticks >= AGING_INTERVAL && t->priority < THREAD_MAX_PRIO) {
-                            sched_remove_thread_locked(t);
-                            t->priority++;
-                            sched_add_thread_locked(t);
-                            t->age_ticks = 0;
+            cpu_flags_t aflags, qflags;
+            if (spinlock_try_acquire(&all_threads_lock, &aflags)) {
+                if (spinlock_try_acquire(&sched_queue_lock, &qflags)) {
+                    thread_t* t = all_threads_head;
+                    while (t) {
+                        thread_t* next = t->all_next;
+                        if (t != idle_thr && t->state == THREAD_READY) {
+                            t->age_ticks++;
+                            if (t->age_ticks >= AGING_INTERVAL && t->priority < THREAD_MAX_PRIO) {
+                                sched_remove_thread_locked(t);
+                                t->priority++;
+                                sched_add_thread_locked(t);
+                                t->age_ticks = 0;
+                            }
                         }
+                        t = next;
                     }
-                    t = next;
+                    spinlock_release(&sched_queue_lock, qflags);
                 }
-                spinlock_release(&sched_queue_lock, qflags);
+                spinlock_release(&all_threads_lock, aflags);
             }
         }
     }
@@ -940,17 +1062,18 @@ thread_t* sched_find_thread_by_tid(uint64_t tid) {
 void sched_set_priority(thread_t* t, int priority) {
     if (!t || priority < 0 || priority > THREAD_MAX_PRIO)
         return;
-    cpu_flags_t flags = hal_save_irq();
+    cpu_flags_t qflags;
+    spinlock_acquire(&sched_queue_lock, &qflags);
     if (t->state == THREAD_READY) {
-        sched_remove_thread(t);
+        sched_remove_thread_locked(t);
         t->priority = priority;
         t->base_priority = priority;
-        sched_add_thread(t);
+        sched_add_thread_locked(t);
     } else {
         t->priority = priority;
         t->base_priority = priority;
     }
-    hal_restore_irq(flags);
+    spinlock_release(&sched_queue_lock, qflags);
 }
 
 void sched_set_thread_affinity(thread_t* t, uint64_t mask) {
@@ -988,7 +1111,14 @@ int sched_kill_thread(uint64_t id) {
     if (!t) return -1;
     if (t->state == THREAD_ZOMBIE || t->state == THREAD_TERMINATED)
         return -1;
+    cpu_flags_t qflags;
+    spinlock_acquire(&sched_queue_lock, &qflags);
+    if (t->state == THREAD_READY)
+        sched_remove_thread_locked(t);
     t->state = THREAD_ZOMBIE;
+    spinlock_release(&sched_queue_lock, qflags);
+    /* Wake joiners outside sched_queue_lock to avoid ABBA deadlock
+     * with thread_join (which holds join_queue.lock then acquires sched_queue_lock). */
     sched_wake(&t->join_queue);
     return 0;
 }

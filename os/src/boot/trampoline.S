@@ -90,10 +90,10 @@ pm_entry:
     .long   0x4210
     movl    %eax, %cr3
 
-    /* Enable Long Mode (EFER.LME = 1) */
+    /* Enable Long Mode (EFER.LME = 1) + NXE (bit 11) */
     movl    $0xC0000080, %ecx
     rdmsr
-    orl     $0x100, %eax
+    orl     $0x900, %eax
     wrmsr
 
     /* Enable paging */

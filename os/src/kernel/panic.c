@@ -15,22 +15,27 @@ void emergency_sync(void) {
 
 void panic_reboot(void) {
     /* Use RDTSC for timeout — works even with interrupts disabled.
-     * tsc_khz may be 0 during very early boot; use a safe fallback loop. */
-    uint64_t start = rdtsc();
+     * Capture rdtsc() ONCE per loop iteration to avoid the "after" value
+     * wrapping past deadline and producing a bogus remaining-seconds. */
+    uint64_t now = rdtsc();
     uint64_t deadline;
     if (tsc_khz > 0) {
-        deadline = start + (uint64_t)5000 * tsc_khz;
+        deadline = now + (uint64_t)5000 * tsc_khz;
     } else {
         /* Approximate: assume ~2 GHz, loop ~10 billion iterations */
-        deadline = start + (uint64_t)10000000000ULL;
+        deadline = now + (uint64_t)10000000000ULL;
     }
     uint64_t sec_tsc = tsc_khz > 0 ? (uint64_t)1000 * tsc_khz : (uint64_t)2000000000ULL;
 
     kprintf("\n[PANIC] Rebooting in 5 seconds...\n");
-    while (rdtsc() < deadline) {
-        uint64_t remaining = (deadline - rdtsc()) / sec_tsc;
-        if (remaining < 5) {
+    uint64_t last_remaining = 6;
+    for (;;) {
+        now = rdtsc();
+        if (now >= deadline) break;
+        uint64_t remaining = (deadline - now) / sec_tsc;
+        if (remaining != last_remaining) {
             kprintf("\r[PANIC] Reboot in %lu seconds...  ", (unsigned long)remaining);
+            last_remaining = remaining;
         }
         asm volatile("pause");
     }

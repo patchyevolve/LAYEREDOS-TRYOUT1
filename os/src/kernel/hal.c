@@ -654,8 +654,28 @@ void hal_poweroff(void) {
 
 void hal_reboot(void) {
     kputs("System reboot.\n");
+
+    /* Method 1: PS/2 keyboard controller reset (legacy, most hardware) */
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) asm("pause");
     outb(0x64, 0xFE);
+    for (volatile int w = 0; w < 100000; w++) asm("pause");
+
+    /* Method 2: RESET register (cold reset) — southbridge, works on QEMU.
+     * 0x0E = CPU reset | System reset | Full reset (clears all state). */
+    outb(0xCF9, 0x0E);
+    for (volatile int w = 0; w < 1000000; w++) asm("pause");
+
+    /* Method 3: Triple fault — load null IDT and trigger an interrupt.
+     * Vector 6 (invalid opcode) avoids int3 breakpoint semantics on some
+     * hypervisors; the null IDT turns any interrupt into triple fault. */
+    {
+        struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = {0, 0};
+        asm volatile("lidt %0" : : "m"(null_idt));
+        asm volatile("ud2");
+    }
+
+    /* If we reach here, reboot failed — give up */
+    kputs("  reboot failed, halting.\n");
     for (;;) { asm volatile("cli; hlt"); }
 }
 
@@ -684,6 +704,13 @@ err_t hal_init(uint64_t mb_info_phys) {
     idt_init();
     pic_remap();
     uart_init();
+
+    /* Reset APIC state — on a warm reset (panic→reboot) memory is preserved
+     * and .bss globals like apic_present retain stale values from the previous
+     * boot.  Without this, hal_irq_eoi would call apic_eoi() with a stale MMIO
+     * pointer before apic_init() has remapped it, causing a page fault. */
+    apic_reset();
+
     hal_timer_init(1000);
     hal_enable_irqs();          // Unmask PIC IRQs
     hal_sti();                  // Enable interrupts (IF=1) so PIT fires

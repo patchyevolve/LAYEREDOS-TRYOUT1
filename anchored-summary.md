@@ -1,5 +1,7 @@
 # OPERtur/TRY1 — Anchored Summary
 
+> **Historical document** — completed 2026-06-07 audit of all 123 issues from AUDIT.md (now deleted). All issues were resolved. See `AGENTS.md` for the complete ongoing record through 2026-07-10.
+
 ## Goal
 - Complete the deep audit and fix of all Stage 1–4 bugs from AUDIT.md, then continue implementing missing functionality.
 

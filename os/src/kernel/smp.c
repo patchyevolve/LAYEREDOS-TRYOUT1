@@ -57,7 +57,10 @@ int smp_nr_cpus(void) {
 static void smp_alloc_per_cpu(void) {
     size_t npages = (sizeof(per_cpu_data_t) + PAGE_SIZE - 1) / PAGE_SIZE;
     for (int i = 0; i < nr_cpus; i++) {
-        uint64_t phys = pmm_alloc_pages(npages);
+        int node = acpi_get_cpu_node(i);
+        uint64_t phys = numa_available
+            ? pmm_alloc_node_pages(npages, node)
+            : pmm_alloc_pages(npages);
         if (!phys) {
             kprintf("[SMP] Failed to allocate per-CPU data for CPU %d\n", i);
             continue;
@@ -67,7 +70,9 @@ static void smp_alloc_per_cpu(void) {
         per_cpu_data[i] = p;
         __per_cpu_offset[i] = (uint64_t)p - (uint64_t)per_cpu_data[0];
         p->cpu_id = i;
-        kprintf("[SMP] per-CPU data for CPU %d at %p (phys %lx)\n", i, (void*)p, phys);
+        p->node_id = node;
+        kprintf("[SMP] per-CPU data for CPU %d at %p (phys %lx) node=%d\n",
+                i, (void*)p, phys, node);
 
         /* Initialize priority bitmap */
         kmemset(p->priority_bitmap, 0, sizeof(p->priority_bitmap));
@@ -83,6 +88,9 @@ void smp_init(void) {
     /* Parse SRAT for NUMA topology */
     acpi_parse_srat();
 
+    /* Parse SLIT for NUMA distance information */
+    acpi_parse_slit();
+
     if (nr_cpus <= 0) {
         nr_cpus = 1;
         kprintf("[SMP] No CPUs found, assuming UP\n");
@@ -95,6 +103,7 @@ void smp_init(void) {
 
     /* BSP gets CPU 0 */
     per_cpu_data[0]->cpu_id = 0;
+    per_cpu_data[0]->node_id = acpi_get_cpu_node(0);
     per_cpu_data[0]->cpu_thread = NULL;  /* no thread running yet */
     per_cpu_data[0]->need_reschedule = 0;
 
@@ -106,6 +115,23 @@ void smp_init(void) {
         cpu_state[i] = (i == 0) ? CPU_STATE_ONLINE : CPU_STATE_OFFLINE;
 
     smp_enabled = (nr_cpus > 1) ? 1 : 0;
+
+    /* Print NUMA topology */
+    if (numa_available) {
+        kprintf("[NUMA] %d node(s), %d memory region(s)\n",
+                numa_node_count, numa_memory_region_count);
+        for (int r = 0; r < numa_memory_region_count; r++)
+            kprintf("[NUMA]   region %d: base=0x%llx len=0x%llx node=%d\n", r,
+                    (unsigned long long)numa_memory_regions[r].base,
+                    (unsigned long long)numa_memory_regions[r].length,
+                    numa_memory_regions[r].node);
+        for (int c = 0; c < nr_cpus; c++)
+            kprintf("[NUMA]   CPU %d -> node %d (distance %d)\n", c,
+                    acpi_get_cpu_node(c),
+                    acpi_node_distance(acpi_get_cpu_node(c), acpi_get_cpu_node(c)));
+    } else {
+        kprintf("[NUMA] No NUMA topology — single node\n");
+    }
 
     kprintf("[SMP] SMP %sabled (%d CPU(s))\n",
         smp_enabled ? "en" : "dis", nr_cpus);
@@ -124,6 +150,7 @@ void ap_entry(per_cpu_data_t* pcp) {
     per_cpu_data[cpu] = pcp;
     per_cpu_data[cpu]->cpu_thread = NULL;
     per_cpu_data[cpu]->need_reschedule = 0;
+    per_cpu_data[cpu]->node_id = acpi_get_cpu_node(cpu);
     per_cpu_data[cpu]->irq_count = 0;
     per_cpu_data[cpu]->context_switches = 0;
 

@@ -82,6 +82,7 @@ typedef struct net_ns {
 
     /* Sockets */
     int net_initialized;
+    spinlock_t sockets_lock;
     struct {
         int        used;
         socket_t*  sock;

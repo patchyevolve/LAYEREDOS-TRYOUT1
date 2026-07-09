@@ -3,16 +3,13 @@
 #include "pmm.h"
 #include "hal.h"
 #include "smp.h"
+#include "acpi.h"
 
-#define PML4_INDEX(v)  (((v) >> 39) & 0x1FF)
-#define PDPT_INDEX(v)  (((v) >> 30) & 0x1FF)
-#define PD_INDEX(v)    (((v) >> 21) & 0x1FF)
-#define PT_INDEX(v)    (((v) >> 12) & 0x1FF)
 
 static uint64_t kernel_pml4 = 0;
 
 uint64_t vmm_alloc_page_table(void) {
-    uint64_t phys = pmm_alloc_page();
+    uint64_t phys = pmm_alloc_node_pages(1, pmm_current_node());
     if (phys) kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
     return phys;
 }
@@ -75,6 +72,34 @@ page_entry_t* vmm_walk_pagetable(uint64_t pml4_phys, uint64_t virt) {
     return &entries[pt_idx];
 }
 
+static page_entry_t* walk_intermediates(uint64_t pml4_phys, uint64_t virt) {
+    page_entry_t* entries;
+    uint64_t table = pml4_phys;
+
+    uint64_t pml4_idx = PML4_INDEX(virt);
+    entries = (page_entry_t*)PHYS_TO_VIRT(table);
+    if (!(entries[pml4_idx] & PAGE_PRESENT)) return NULL;
+    table = entries[pml4_idx] & ~0xFFFULL;
+
+    uint64_t pdpt_idx = PDPT_INDEX(virt);
+    entries = (page_entry_t*)PHYS_TO_VIRT(table);
+    if (!(entries[pdpt_idx] & PAGE_PRESENT)) return NULL;
+    table = entries[pdpt_idx] & ~0xFFFULL;
+
+    uint64_t pd_idx = PD_INDEX(virt);
+    entries = (page_entry_t*)PHYS_TO_VIRT(table);
+    if (!(entries[pd_idx] & PAGE_PRESENT)) return NULL;
+    table = entries[pd_idx] & ~0xFFFULL;
+
+    uint64_t pt_idx = PT_INDEX(virt);
+    entries = (page_entry_t*)PHYS_TO_VIRT(table);
+    return &entries[pt_idx];
+}
+
+page_entry_t* vmm_peek_pte(uint64_t pml4_phys, uint64_t virt) {
+    return walk_intermediates(pml4_phys, virt);
+}
+
 err_t vmm_map_page(uint64_t pml4_phys, uint64_t virt, uint64_t phys,
                    uint64_t flags) {
     if (virt & 0xFFF) return ERR_INVAL;
@@ -83,7 +108,7 @@ err_t vmm_map_page(uint64_t pml4_phys, uint64_t virt, uint64_t phys,
     page_entry_t* pt = get_entry(pml4_phys, virt, 4, 1, flags);
     if (!pt) return ERR_NOMEM;
 
-    *pt = (phys & ~0xFFFULL) | (flags & 0xFFF) | PAGE_PRESENT;
+    *pt = (phys & ~0xFFFULL) | (flags & (0xFFF | PAGE_NX)) | PAGE_PRESENT;
     vmm_flush_tlb_page(virt);
     return ERR_OK;
 }
@@ -132,7 +157,7 @@ err_t vmm_duplicate_user_pages(uint64_t dst_pml4, uint64_t src_pml4) {
                                     ((uint64_t)pt_idx << 12);
                     uint64_t src_phys = src_pt[pt_idx] & ~0xFFFULL;
                     uint64_t flags2 = src_pt[pt_idx] & 0xFFF;
-                    uint64_t new_phys = pmm_alloc_page();
+                    uint64_t new_phys = pmm_alloc_node_pages(1, pmm_current_node());
                     if (!new_phys) { hal_restore_irq(flags); return ERR_NOMEM; }
                     kmemcpy((void*)PHYS_TO_VIRT(new_phys),
                             (void*)PHYS_TO_VIRT(src_phys), PAGE_SIZE);
@@ -150,7 +175,7 @@ void vmm_free_user_pages(uint64_t pml4_phys) {
     for (int pml4_idx = 0; pml4_idx < 256; pml4_idx++) {
         if (!(pml4[pml4_idx] & PAGE_PRESENT)) continue;
         uint64_t pdpt_phys = pml4[pml4_idx] & ~0xFFFULL;
-        if (pdpt_phys == pml4_phys) {
+        if (pdpt_phys == pml4_phys || pdpt_phys == 0) {
             pml4[pml4_idx] = 0;
             continue;
         }
@@ -158,7 +183,7 @@ void vmm_free_user_pages(uint64_t pml4_phys) {
         for (int pdpt_idx = 0; pdpt_idx < 512; pdpt_idx++) {
             if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) continue;
             if (pdpt[pdpt_idx] & PAGE_HUGE) {
-                pmm_free_page(pdpt[pdpt_idx] & ~0xFFFULL);
+                pmm_free_pages(pdpt[pdpt_idx] & ~0x3FFFFFFFULL, 262144);
                 continue;
             }
             uint64_t pd_phys = pdpt[pdpt_idx] & ~0xFFFULL;
@@ -166,7 +191,7 @@ void vmm_free_user_pages(uint64_t pml4_phys) {
             for (int pd_idx = 0; pd_idx < 512; pd_idx++) {
                 if (!(pd[pd_idx] & PAGE_PRESENT)) continue;
                 if (pd[pd_idx] & PAGE_HUGE) {
-                    pmm_free_page(pd[pd_idx] & ~0xFFFULL);
+                    pmm_free_pages(pd[pd_idx] & ~0x1FFFFFULL, 512);
                     continue;
                 }
                 uint64_t pt_phys = pd[pd_idx] & ~0xFFFULL;
@@ -275,7 +300,7 @@ void vmm_split_identity_map(void) {
         if (!(pd[i] & PAGE_HUGE)) continue;
 
         uint64_t base = pd[i] & ~0x1FFFFFULL;
-        uint64_t pt_phys = pmm_alloc_page();
+        uint64_t pt_phys = pmm_alloc_node_pages(1, pmm_current_node());
         if (!pt_phys) {
             kprintf("[VMM] OOM splitting PD[%d], keeping 2MB page\n", i);
             continue;

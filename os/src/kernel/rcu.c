@@ -146,6 +146,7 @@ void rcu_init(void) {
     rcu_thread = thread_create(rcu_kthread_func, NULL,
                                THREAD_DEF_PRIO, "rcu-gp");
     if (rcu_thread) {
+        rcu_thread->cpu_affinity = 1;  /* pin to CPU 0 to avoid migration race */
         sched_add_thread(rcu_thread);
         kprintf("[RCU] Grace-period kthread started\n");
     } else {

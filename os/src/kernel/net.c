@@ -2,6 +2,7 @@
 #include "net.h"
 #include "tcp.h"
 #include "udp.h"
+#include "ipv4.h"
 #include "ipv6.h"
 #include "igmp.h"
 #include "unix.h"
@@ -16,6 +17,14 @@
 
 #define net_initialized (get_current_ns()->net_initialized)
 #define net_sockets (get_current_ns()->net_sockets)
+#define sockets_lock   (get_current_ns()->sockets_lock)
+
+/* Translate kernel-internal AF_* to POSIX userspace AF_* values */
+static int af_to_user(int af_kernel) {
+    if (af_kernel == AF_INET) return 2;   /* POSIX AF_INET */
+    if (af_kernel == AF_INET6) return 10; /* POSIX AF_INET6 */
+    return af_kernel;                      /* AF_UNIX (1) is same */
+}
 
 /* ---- TCP socket operations ---- */
 
@@ -61,7 +70,7 @@ static int tcp_sock_connect(socket_t* s, const sockaddr_t* addr, socklen_t len) 
         if (s->state == SS_CONNECTING) {
             int st = tcp_conn_get_state(c);
             if (st == TCP_ESTABLISHED) { s->state = SS_CONNECTED; return ERR_OK; }
-            if (st == TCP_CLOSED) { c->used = 0; return ERR_AGAIN; }
+            if (st == TCP_CLOSED) { s->state = SS_UNBOUND; return ERR_CONNREFUSED; }
             return ERR_AGAIN;
         }
         s->state = SS_CONNECTING;
@@ -92,7 +101,7 @@ static socket_t* tcp_sock_accept(socket_t* s, sockaddr_t* addr, socklen_t* len) 
 
     /* Create a socket wrapper for the child */
     socket_t* child_sock = socket_alloc(child->af, SOCK_STREAM, 0);
-    if (!child_sock) { child->used = 0; return NULL; }
+    if (!child_sock) { tcp_conn_destroy(child); return NULL; }
 
     /* Free the auto-allocated proto and replace with accepted child */
     tcp_conn_destroy((tcp_conn_t*)child_sock->proto);
@@ -104,18 +113,18 @@ static socket_t* tcp_sock_accept(socket_t* s, sockaddr_t* addr, socklen_t* len) 
         if (child->af == AF_INET) {
             sockaddr_in_t* out = (sockaddr_in_t*)addr;
             socklen_t need = sizeof(sockaddr_in_t);
-            if (*len < need) { child->used = 0; socket_release(child_sock); return NULL; }
+            if (*len < need) { tcp_conn_destroy(child); socket_release(child_sock); return NULL; }
             kmemset(out, 0, need);
-            out->sin_family = AF_INET;
+            out->sin_family = af_to_user(AF_INET);
             out->sin_port = __builtin_bswap16(child->remote_port);
             kmemcpy(out->sin_addr, child->remote_ip.v4.bytes, 4);
             *len = need;
         } else {
             sockaddr_in6_t* out = (sockaddr_in6_t*)addr;
             socklen_t need = sizeof(sockaddr_in6_t);
-            if (*len < need) { child->used = 0; socket_release(child_sock); return NULL; }
+            if (*len < need) { tcp_conn_destroy(child); socket_release(child_sock); return NULL; }
             kmemset(out, 0, need);
-            out->sin6_family = AF_INET6;
+            out->sin6_family = af_to_user(AF_INET6);
             out->sin6_port = __builtin_bswap16(child->remote_port);
             kmemcpy(out->sin6_addr, child->remote_ip.v6, 16);
             *len = need;
@@ -141,8 +150,9 @@ static int tcp_sock_sendto(socket_t* s, const uint8_t* buf, uint32_t len,
 
 static int tcp_sock_recv(socket_t* s, uint8_t* buf, uint32_t size) {
     tcp_conn_t* c = (tcp_conn_t*)s->proto;
+    if (!c) return ERR_INVAL;
     int timeout = s->recv_timeout;
-    if (c && c->recv_timeout > 0) timeout = c->recv_timeout;
+    if (c->recv_timeout > 0) timeout = c->recv_timeout;
     if (timeout <= 0) timeout = s->nonblock ? 0 : 5000;
     return tcp_conn_recv(c, buf, size, timeout);
 }
@@ -159,12 +169,12 @@ static int tcp_sock_recvfrom(socket_t* s, uint8_t* buf, uint32_t size,
             kmemset(src_addr, 0, copy_len);
             if (s->family == AF_INET) {
                 sockaddr_in_t* out = (sockaddr_in_t*)src_addr;
-                out->sin_family = AF_INET;
+                out->sin_family = af_to_user(AF_INET);
                 out->sin_port = __builtin_bswap16(c->remote_port);
                 kmemcpy(out->sin_addr, c->remote_ip.v4.bytes, 4);
             } else {
                 sockaddr_in6_t* out = (sockaddr_in6_t*)src_addr;
-                out->sin6_family = AF_INET6;
+                out->sin6_family = af_to_user(AF_INET6);
                 out->sin6_port = __builtin_bswap16(c->remote_port);
                 if (c->af == AF_INET && !s->ipv6only) {
                     out->sin6_addr[10] = 0xFF;
@@ -290,17 +300,20 @@ static int tcp_sock_getsockname(socket_t* s, sockaddr_t* addr, socklen_t* len) {
     kmemset(addr, 0, need);
     if (s->family == AF_INET) {
         sockaddr_in_t* out = (sockaddr_in_t*)addr;
-        out->sin_family = AF_INET;
+        out->sin_family = af_to_user(AF_INET);
         out->sin_port = __builtin_bswap16(c->local_port);
+        ipv4_addr_t _local = ipv4_get_addr();
+        kmemcpy(out->sin_addr, _local.bytes, 4);
     } else {
         sockaddr_in6_t* out = (sockaddr_in6_t*)addr;
-        out->sin6_family = AF_INET6;
+        out->sin6_family = af_to_user(AF_INET6);
         out->sin6_port = __builtin_bswap16(c->local_port);
         /* If connection is IPv4 over dual-stack, present as ::ffff:x.x.x.x */
         if (c->af == AF_INET && !s->ipv6only) {
+            ipv4_addr_t _local = ipv4_get_addr();
             out->sin6_addr[10] = 0xFF;
             out->sin6_addr[11] = 0xFF;
-            kmemcpy(out->sin6_addr + 12, c->remote_ip.v4.bytes, 4);
+            kmemcpy(out->sin6_addr + 12, _local.bytes, 4);
         }
     }
     *len = need;
@@ -317,12 +330,12 @@ static int tcp_sock_getpeername(socket_t* s, sockaddr_t* addr, socklen_t* len) {
     kmemset(addr, 0, need);
     if (s->family == AF_INET) {
         sockaddr_in_t* out = (sockaddr_in_t*)addr;
-        out->sin_family = AF_INET;
+        out->sin_family = af_to_user(AF_INET);
         out->sin_port = __builtin_bswap16(c->remote_port);
         kmemcpy(out->sin_addr, c->remote_ip.v4.bytes, 4);
     } else {
         sockaddr_in6_t* out = (sockaddr_in6_t*)addr;
-        out->sin6_family = AF_INET6;
+        out->sin6_family = af_to_user(AF_INET6);
         out->sin6_port = __builtin_bswap16(c->remote_port);
         /* If connection is IPv4 over dual-stack, present as ::ffff:x.x.x.x */
         if (c->af == AF_INET && !s->ipv6only) {
@@ -523,22 +536,23 @@ static int udp_sock_recvfrom(socket_t* s, uint8_t* buf, uint32_t size,
 
     uint8_t src_ip[16];
     uint16_t src_port;
-    int ret = udp_endpoint_dequeue(ep, buf, size, &s->family,
-                                      src_ip, &src_port, timeout);
+    int recv_af = AF_INET;
+    int ret = udp_endpoint_dequeue(ep, buf, size, &recv_af,
+                                       src_ip, &src_port, timeout);
     if (ret < 0) return ret;
 
     if (src_addr && addrlen) {
-        if (s->family == AF_INET) {
+        if (recv_af == AF_INET) {
             sockaddr_in_t* out = (sockaddr_in_t*)src_addr;
             kmemset(out, 0, sizeof(sockaddr_in_t));
-            out->sin_family = AF_INET;
+            out->sin_family = af_to_user(AF_INET);
             out->sin_port = __builtin_bswap16(src_port);
             kmemcpy(out->sin_addr, src_ip, 4);
             *addrlen = sizeof(sockaddr_in_t);
         } else {
             sockaddr_in6_t* out = (sockaddr_in6_t*)src_addr;
             kmemset(out, 0, sizeof(sockaddr_in6_t));
-            out->sin6_family = AF_INET6;
+            out->sin6_family = af_to_user(AF_INET6);
             out->sin6_port = __builtin_bswap16(src_port);
             kmemcpy(out->sin6_addr, src_ip, 16);
             *addrlen = sizeof(sockaddr_in6_t);
@@ -660,11 +674,11 @@ static int udp_sock_getsockname(socket_t* s, sockaddr_t* addr, socklen_t* len) {
     kmemset(addr, 0, need);
     if (s->family == AF_INET) {
         sockaddr_in_t* out = (sockaddr_in_t*)addr;
-        out->sin_family = AF_INET;
+        out->sin_family = af_to_user(AF_INET);
         out->sin_port = __builtin_bswap16(ep->port);
     } else {
         sockaddr_in6_t* out = (sockaddr_in6_t*)addr;
-        out->sin6_family = AF_INET6;
+        out->sin6_family = af_to_user(AF_INET6);
         out->sin6_port = __builtin_bswap16(ep->port);
     }
     *len = need;
@@ -718,6 +732,7 @@ socket_t* socket_alloc(int family, int type, int protocol) {
     kmemset(s, 0, sizeof(socket_t));
 
     s->refcount = 1;
+    s->fd = -1;
     s->family = family;
     s->type = type;
     s->state = SS_UNBOUND;
@@ -802,6 +817,7 @@ int sock_close(socket_t* s) {
     if (!s) return ERR_INVAL;
     int ret = ERR_OK;
     if (s->ops && s->ops->close) ret = s->ops->close(s);
+    sock_unregister(s->fd);
     socket_release(s);
     return ret;
 }
@@ -842,27 +858,39 @@ int sock_poll(socket_t* s, int events, int* revents) {
 
 int sock_register(socket_t* s) {
     if (!s) return ERR_INVAL;
+    cpu_flags_t flags;
+    spinlock_acquire(&sockets_lock, &flags);
     for (int i = 0; i < NET_MAX_SOCKETS; i++) {
         if (!net_sockets[i].used) {
             net_sockets[i].used = 1;
             net_sockets[i].sock = s;
+            s->fd = i;
+            spinlock_release(&sockets_lock, flags);
             return i;
         }
     }
+    spinlock_release(&sockets_lock, flags);
     return ERR_NOSPACE;
 }
 
 socket_t* sock_lookup(int fd) {
     if (fd < 0 || fd >= NET_MAX_SOCKETS) return NULL;
-    if (!net_sockets[fd].used) return NULL;
-    return net_sockets[fd].sock;
+    cpu_flags_t flags;
+    spinlock_acquire(&sockets_lock, &flags);
+    socket_t* s = NULL;
+    if (net_sockets[fd].used) s = net_sockets[fd].sock;
+    spinlock_release(&sockets_lock, flags);
+    return s;
 }
 
 int sock_unregister(int fd) {
     if (fd < 0 || fd >= NET_MAX_SOCKETS) return ERR_INVAL;
-    if (!net_sockets[fd].used) return ERR_INVAL;
+    cpu_flags_t flags;
+    spinlock_acquire(&sockets_lock, &flags);
+    if (!net_sockets[fd].used) { spinlock_release(&sockets_lock, flags); return ERR_INVAL; }
     net_sockets[fd].used = 0;
     net_sockets[fd].sock = NULL;
+    spinlock_release(&sockets_lock, flags);
     return ERR_OK;
 }
 

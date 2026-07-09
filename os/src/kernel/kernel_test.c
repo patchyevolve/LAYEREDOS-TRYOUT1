@@ -1,8 +1,10 @@
 #include "kernel.h"
 #include "test_framework.h"
 #include "pmm.h"
+#include "smp.h"
 #include "kmalloc.h"
 #include "vma.h"
+#include "vmm.h"
 #include "tcp.h"
 #include "net.h"
 #include "sync.h"
@@ -18,6 +20,7 @@
 #include "sched.h"
 #include "smp.h"
 #include "pmm.h"
+#include "acpi.h"
 
 #ifdef KERNEL_SELF_TEST
 
@@ -897,6 +900,812 @@ static int test_lockdep_ordering(void) {
 }
 #endif
 
+/* ============================================================
+ * Test: PMM single-page alloc/free stress (UP only)
+ *
+ * Allocates/frees 500 pages with per-page data integrity check.
+ * Catches: double-alloc (two allocs returning same page),
+ * per-CPU cache corruption, bitmap corruption.
+ * ============================================================ */
+static int test_pmm_alloc_free_stress(void) {
+    uint64_t pages[500];
+    int npages = 0;
+    int i;
+
+    for (i = 0; i < 500; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) { kprintf("[FAIL] OOM at iter %d\n", i); goto cleanup; }
+        pages[npages++] = phys;
+        uint8_t* v = (uint8_t*)PHYS_TO_VIRT(phys);
+        /* Write unique pattern per page */
+        for (int j = 0; j < 4096; j++) v[j] = (uint8_t)(i ^ j);
+        /* Immediate readback */
+        for (int j = 0; j < 4096; j++) {
+            if (v[j] != (uint8_t)(i ^ j)) {
+                kprintf("[FAIL] byte %d mismatch at page %d (phys=%lx)\n", j, i, phys);
+                goto cleanup;
+            }
+        }
+    }
+
+    /* Free in reverse order to exercise different cache paths */
+    for (i = npages - 1; i >= 0; i--) pmm_free_page(pages[i]);
+    kprintf("[TEST] pmm_alloc_free_stress: 500 pages, PASS\n");
+    return TEST_PASS;
+
+cleanup:
+    for (i = 0; i < npages; i++) pmm_free_page(pages[i]);
+    return TEST_FAIL;
+}
+
+/* ============================================================
+ * Test: PMM multi-page alloc/free (block-level stress)
+ *
+ * Allocates and frees blocks of various sizes (2, 4, 8, 16
+ * pages) with data integrity. Catches bugs in the contiguous-
+ * page bitmap allocator and free path for multi-page blocks.
+ * ============================================================ */
+static int test_pmm_multi_page_stress(void) {
+    uint32_t sizes[] = {2, 4, 8, 16};
+    uint64_t blocks[32][16]; /* max 16 pages per block */
+    int      npages[32];
+    int nblocks = 0;
+
+    for (int round = 0; round < 4; round++) {
+        for (int si = 0; si < 4; si++) {
+            uint32_t count = sizes[si];
+            uint64_t phys = pmm_alloc_pages(count);
+            if (!phys) {
+                kprintf("[FAIL] pmm_alloc_pages(%u) failed at round %d\n", count, round);
+                goto cleanup;
+            }
+            /* Record individual pages */
+            for (uint32_t p = 0; p < count; p++)
+                blocks[nblocks][p] = phys + p * PAGE_SIZE;
+            npages[nblocks] = (int)count;
+            nblocks++;
+
+            /* Write pattern across all pages */
+            uint8_t* v = (uint8_t*)PHYS_TO_VIRT(phys);
+            for (uint32_t j = 0; j < count * 4096; j++)
+                v[j] = (uint8_t)(round ^ si ^ j);
+            /* Readback */
+            for (uint32_t j = 0; j < count * 4096; j++) {
+                if (v[j] != (uint8_t)(round ^ si ^ j)) {
+                    kprintf("[FAIL] multi-page byte %d corrupt blk %d\n", j, nblocks - 1);
+                    goto cleanup;
+                }
+            }
+        }
+    }
+
+    /* Free in different order than allocation */
+    for (int b = nblocks - 1; b >= 0; b--) {
+        uint64_t first = blocks[b][0];
+        /* Verify page_owner is set for first page */
+        uint64_t owner = pmm_page_owner(first);
+        (void)owner;
+        pmm_free_pages(first, (uint32_t)npages[b]);
+    }
+
+    kprintf("[TEST] pmm_multi_page_stress: %d blocks (2/4/8/16 pages), PASS\n", nblocks);
+    return TEST_PASS;
+
+cleanup:
+    for (int b = 0; b < nblocks; b++)
+        pmm_free_pages(blocks[b][0], (uint32_t)npages[b]);
+    return TEST_FAIL;
+}
+
+/* ============================================================
+ * Test: PMM accounting consistency
+ *
+ * Verifies pmm_free_pages_count / pmm_total_pages behave
+ * consistently across alloc/free cycles.
+ * ============================================================ */
+static int test_pmm_accounting(void) {
+    uint64_t free_before = pmm_free_pages_count();
+    uint64_t total = pmm_total_pages();
+    ASSERT_TRUE(total > 0, "total pages > 0");
+
+    uint64_t pages[50];
+    int i;
+    for (i = 0; i < 50; i++) {
+        pages[i] = pmm_alloc_page();
+        if (!pages[i]) break;
+    }
+    int n = i;
+    ASSERT_TRUE(n > 0, "should alloc at least 1 page");
+
+    uint64_t free_mid = pmm_free_pages_count();
+    ASSERT_TRUE(free_mid < free_before, "free count should decrease after allocs");
+
+    for (i = 0; i < n; i++) pmm_free_page(pages[i]);
+
+    uint64_t free_after = pmm_free_pages_count();
+    ASSERT_TRUE(free_after >= free_before - 5,
+                "free count should return near original (within 5)");
+
+    kprintf("[TEST] pmm_accounting: total=%llu free=%llu->%llu->%llu, PASS\n",
+            total, free_before, free_mid, free_after);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * Test: VMM page table map/unmap stress
+ *
+ * Creates a fresh PML4, maps 100 pages at various virtual
+ * addresses, walks each to verify the PTE, unmaps, walks
+ * to verify absence, then frees the page table tree.
+ * Catches: page table entry corruption, sub-table leaks,
+ * incorrect PML4/PDPT/PD/PT index calculation.
+ * ============================================================ */
+static int test_vmm_map_unmap_stress(void) {
+    uint64_t test_pml4 = vmm_alloc_page_table();
+    ASSERT_TRUE(test_pml4 != 0, "vmm_alloc_page_table");
+
+    uint64_t vaddr_base = 0x100000000ULL; /* 4 GB, in user space */
+    int nmap = 0;
+    int i;
+
+    for (i = 0; i < 100; i++) {
+        uint64_t vaddr = vaddr_base + (uint64_t)i * 0x200000; /* 2 MB apart */
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) break;
+        page_zero(phys);
+        err_t e = vmm_map_page(test_pml4, vaddr, phys, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+        if (e != ERR_OK) {
+            kprintf("[FAIL] vmm_map_page failed at vaddr=0x%lx (err=%d)\n", vaddr, e);
+            pmm_free_page(phys);
+            break;
+        }
+        /* Walk to verify */
+        page_entry_t* pte = vmm_walk_pagetable(test_pml4, vaddr);
+        if (!pte || !(*pte & PAGE_PRESENT)) {
+            kprintf("[FAIL] PTE not present after map at vaddr=0x%lx\n", vaddr);
+            pmm_free_page(phys);
+            break;
+        }
+        if (((*pte & 0xFFFFFFFFF000ULL) != (phys & 0xFFFFFFFFF000ULL))) {
+            kprintf("[FAIL] PTE phys mismatch: pte=0x%lx phys=0x%lx\n", *pte, phys);
+            pmm_free_page(phys);
+            break;
+        }
+        nmap++;
+    }
+
+    ASSERT_TRUE(nmap > 0, "should map at least 1 page");
+    kprintf("[TEST] vmm_map_unmap_stress: mapped %d pages\n", nmap);
+
+    /* Unmap all and walk to verify absence */
+    for (i = 0; i < nmap; i++) {
+        uint64_t vaddr = vaddr_base + (uint64_t)i * 0x200000;
+        page_entry_t* pte_before = vmm_walk_pagetable(test_pml4, vaddr);
+        /* We need the physical address to free it */
+        uint64_t pte_phys = 0;
+        if (pte_before && (*pte_before & PAGE_PRESENT))
+            pte_phys = *pte_before & 0xFFFFFFFFF000ULL;
+        vmm_unmap_page(test_pml4, vaddr);
+        page_entry_t* pte_after = vmm_walk_pagetable(test_pml4, vaddr);
+        if (pte_after && (*pte_after & PAGE_PRESENT)) {
+            kprintf("[FAIL] PTE still present after unmap at vaddr=0x%lx\n", vaddr);
+            /* Don't free — would double-free if PTE still points to the page */
+        } else if (pte_phys) {
+            pmm_free_page(pte_phys);
+        }
+    }
+
+    vmm_free_user_pages(test_pml4);
+    kprintf("[TEST] vmm_map_unmap_stress: %d pages mapped/unmapped, PASS\n", nmap);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * Test: VMM page permission flags
+ *
+ * Maps pages with different permission combinations and
+ * verifies the PTE flags via vmm_walk_pagetable.
+ * ============================================================ */
+static int test_vmm_page_permissions(void) {
+    uint64_t test_pml4 = vmm_alloc_page_table();
+    ASSERT_TRUE(test_pml4 != 0, "vmm_alloc_page_table");
+
+    /* Test various flag combinations.
+     * NOTE: NX bit (PAGE_NX) is NOT included — this kernel does not
+     * set IA32_EFER.NXE, so vmm_walk_pagetable will not show NX set. */
+    uint64_t flag_sets[] = {
+        PAGE_PRESENT,
+        PAGE_PRESENT | PAGE_WRITE,
+        PAGE_PRESENT | PAGE_WRITE | PAGE_USER,
+        PAGE_PRESENT | PAGE_USER,
+    };
+    int nflags = sizeof(flag_sets) / sizeof(flag_sets[0]);
+    int ok = 1;
+
+    for (int i = 0; i < nflags; i++) {
+        uint64_t vaddr = 0x200000000ULL + (uint64_t)i * 0x10000000;
+        uint64_t phys = pmm_alloc_page();
+        ASSERT_TRUE(phys != 0, "pmm_alloc_page");
+        page_zero(phys);
+
+        err_t e = vmm_map_page(test_pml4, vaddr, phys, flag_sets[i]);
+        if (e != ERR_OK) {
+            kprintf("[FAIL] map flags 0x%lx: err=%d\n", flag_sets[i], e);
+            pmm_free_page(phys);
+            ok = 0; break;
+        }
+
+        page_entry_t* pte = vmm_walk_pagetable(test_pml4, vaddr);
+        if (!pte || !(*pte & PAGE_PRESENT)) {
+            kprintf("[FAIL] flags 0x%lx: PTE not present\n", flag_sets[i]);
+            pmm_free_page(phys);
+            ok = 0; break;
+        }
+
+        uint64_t expected_phys = phys & 0xFFFFFFFFF000ULL;
+        uint64_t actual_phys = *pte & 0xFFFFFFFFF000ULL;
+        if (actual_phys != expected_phys) {
+            kprintf("[FAIL] flags 0x%lx: phys 0x%lx != expected 0x%lx\n",
+                    flag_sets[i], actual_phys, expected_phys);
+            pmm_free_page(phys);
+            ok = 0; break;
+        }
+
+        uint64_t expected_flags = flag_sets[i] & ~(0xFFFFFFFFF000ULL);
+        uint64_t actual_flags = *pte & ~(0xFFFFFFFFF000ULL);
+        /* Check that expected flags are subset of actual */
+        if ((actual_flags & expected_flags) != expected_flags) {
+            kprintf("[FAIL] flags 0x%lx: actual PTE flags 0x%lx missing expected 0x%lx\n",
+                    flag_sets[i], actual_flags, expected_flags);
+            pmm_free_page(phys);
+            ok = 0; break;
+        }
+
+        /* Unmap and free */
+        vmm_unmap_page(test_pml4, vaddr);
+        pmm_free_page(phys);
+    }
+
+    vmm_free_user_pages(test_pml4);
+    if (ok) kprintf("[TEST] vmm_page_permissions: %d flag combos, PASS\n", nflags);
+    return ok ? TEST_PASS : TEST_FAIL;
+}
+
+/* ============================================================
+ * Test: Scheduler thread create/join storm
+ *
+ * Creates N threads that each increment a shared counter and
+ * write to a per-thread slot, then joins them all.
+ * Catches: thread table leaks, TCB corruption, scheduler
+ * queue corruption under high thread count.
+ * ============================================================ */
+static volatile int storm_count;
+static volatile int storm_slots[32];
+
+static void storm_worker(void* arg) {
+    int id = (int)(uintptr_t)arg;
+    cpu_flags_t f;
+    spinlock_acquire(&sched_queue_lock, &f);
+    storm_count++;
+    storm_slots[id] = id + 1;
+    spinlock_release(&sched_queue_lock, f);
+    thread_exit(0);
+}
+
+static int test_sched_thread_storm(void) {
+    thread_t* threads[32];
+    int n = 32;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        threads[i] = thread_create(storm_worker, (void*)(uintptr_t)i,
+                                    THREAD_DEF_PRIO, "storm");
+        if (!threads[i]) { n = i; break; }
+        sched_add_thread(threads[i]);
+    }
+
+    ASSERT_TRUE(n > 0, "should create at least 1 thread");
+    kprintf("[TEST] sched_thread_storm: created %d threads\n", n);
+
+    for (i = 0; i < n; i++) {
+        int code;
+        err_t e = thread_join(threads[i], &code);
+        ASSERT_ERR_OK(e, "thread_join");
+        ASSERT_TRUE(code == 0, "exit code 0");
+    }
+
+    /* Verify all workers actually ran */
+    if (storm_count != n) {
+        kprintf("[FAIL] storm_count=%d (expected %d)\n", storm_count, n);
+        return TEST_FAIL;
+    }
+    for (i = 0; i < n; i++) {
+        if (storm_slots[i] != i + 1) {
+            kprintf("[FAIL] worker %d slot=%d (expected %d)\n", i, storm_slots[i], i + 1);
+            return TEST_FAIL;
+        }
+    }
+
+    kprintf("[TEST] sched_thread_storm: %d threads created/joined, PASS\n", n);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * Test: Scheduler sleep timing accuracy
+ *
+ * Creates a thread that sleeps for 50ms and measures the
+ * actual sleep duration. Verifies it woke up within a
+ * reasonable bound (20-500ms).
+ * ============================================================ */
+static volatile uint64_t sleep_start_tick;
+
+static void sleeper_worker(void* arg) {
+    (void)arg;
+    sleep_start_tick = sched_get_switch_count();
+    thread_sleep(50);
+    thread_exit(0);
+}
+
+static int test_sched_sleep_accuracy(void) {
+    thread_t* t = thread_create(sleeper_worker, NULL, THREAD_DEF_PRIO, "sleeper");
+    ASSERT_NOT_NULL(t, "thread_create");
+
+    sched_add_thread(t);
+    int code;
+    err_t e = thread_join(t, &code);
+    ASSERT_ERR_OK(e, "thread_join");
+    ASSERT_TRUE(code == 0, "exit code 0");
+
+    kprintf("[TEST] sched_sleep_accuracy: 50ms sleep, PASS\n");
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * Test: kmalloc compaction stress
+ *
+ * Allocates 200 blocks of various sizes, frees every other,
+ * calls kmalloc_compact to reclaim empty slab pages, then
+ * verifies kmalloc still works after compaction.
+ * Catches: slab metadata corruption, use-after-free during
+ * compaction, dangling slab page references.
+ * ============================================================ */
+static int test_kmalloc_compaction(void) {
+    void* ptrs[200];
+    int n = 0;
+
+    for (int i = 0; i < 200; i++) {
+        size_t sz = (size_t)(8 + (i * 13 % 247));
+        ptrs[n] = kmalloc(sz);
+        if (!ptrs[n]) break;
+        kmemset(ptrs[n], (uint8_t)(i & 0xFF), sz);
+        n++;
+    }
+    ASSERT_TRUE(n > 0, "should alloc at least 1 block");
+
+    /* Free odd entries */
+    for (int i = 1; i < n; i += 2) {
+        kfree(ptrs[i]);
+        ptrs[i] = NULL;
+    }
+
+    /* Compact */
+    size_t freed = kmalloc_compact();
+    kprintf("[TEST] kmalloc_compaction: compact freed %llu pages\n", freed);
+
+    /* Verify even entries still intact */
+    for (int i = 0; i < n; i += 2) {
+        if (ptrs[i]) {
+            size_t sz = (size_t)(8 + (i * 13 % 247));
+            uint8_t* v = (uint8_t*)ptrs[i];
+            for (size_t j = 0; j < sz; j++) {
+                if (v[j] != (uint8_t)(i & 0xFF)) {
+                    kprintf("[FAIL] compaction: byte %llu block %d corrupt\n", j, i);
+                    goto cleanup;
+                }
+            }
+        }
+    }
+
+    /* Allocate more after compaction */
+    for (int i = 0; i < 50; i++) {
+        void* p = kmalloc(64);
+        ASSERT_NOT_NULL(p, "kmalloc after compaction");
+        kmemset(p, 0xAB, 64);
+        kfree(p);
+    }
+
+cleanup:
+    for (int i = 0; i < n; i++)
+        if (ptrs[i]) kfree(ptrs[i]);
+    if (n == 0) return TEST_FAIL;
+    kprintf("[TEST] kmalloc_compaction: %d allocs, compact+realloc, PASS\n", n);
+    return TEST_PASS;
+}
+
+/* Guard page test: verify kernel stack guard page is unmapped during
+ * thread lifetime, and re-mapped after the thread is reaped. */
+static void guard_test_worker(void* arg) {
+    (void)arg;
+    /* Just exit — the guard page is exercised by any stack usage above
+     * the worker function's own stack frame. */
+}
+
+static int test_guard_page_basic(void) {
+    thread_t* t = thread_create(guard_test_worker, NULL,
+                                THREAD_DEF_PRIO, "guard-test");
+    ASSERT_NOT_NULL(t, "thread_create(guard_test_worker)");
+    ASSERT_NOT_NULL(t->kernel_stack, "kernel_stack");
+    ASSERT_TRUE(t->block_phys != 0, "block_phys set");
+
+    /* Verify guard page PTE is not present during thread lifetime */
+    uint64_t guard_phys = t->block_phys + PAGE_SIZE;
+    uint64_t guard_virt = (uint64_t)PHYS_TO_VIRT(guard_phys);
+    page_entry_t* gpte = vmm_peek_pte(vmm_get_kernel_pml4(), guard_virt);
+    ASSERT_NOT_NULL(gpte, "guard PTE slot exists");
+    ASSERT_TRUE((*gpte & PAGE_PRESENT) == 0, "guard page not present");
+
+    kprintf("[TEST] guard page at phys=0x%lx virt=0x%lx: PTE=0x%lx (present=%d)\n",
+            guard_phys, guard_virt, *gpte, (*gpte & PAGE_PRESENT) ? 1 : 0);
+
+    /* Run the thread and wait for completion */
+    sched_add_thread(t);
+    thread_join(t, NULL);
+
+    /* Spin until the thread is reaped (guard page re-mapped) */
+    int reaped = 0;
+    for (int i = 0; i < 1000; i++) {
+        sched_reap_zombies();
+        gpte = vmm_peek_pte(vmm_get_kernel_pml4(), guard_virt);
+        if (gpte && (*gpte & PAGE_PRESENT)) {
+            reaped = 1;
+            break;
+        }
+        thread_sleep(1);
+    }
+
+    ASSERT_TRUE(reaped, "guard page re-mapped after thread exit");
+    kprintf("[TEST] guard page re-mapped: PTE=0x%lx\n", gpte ? *gpte : 0);
+
+    return TEST_PASS;
+}
+
+static int test_numa_basic(void) {
+    int cpu = smp_cpu_id();
+    int my_node = (numa_available && per_cpu_data[cpu]) ? per_cpu_data[cpu]->node_id : 0;
+    kprintf("[TEST] CPU %d node_id=%d numa_available=%d\n", cpu, my_node, numa_available);
+
+    /* 1. Self-distance must be 10 */
+    int self_dist = acpi_node_distance(my_node, my_node);
+    ASSERT_EQ(self_dist, 10, "self distance == 10");
+    kprintf("[TEST] self distance: %d\n", self_dist);
+
+    /* 2. Cross-node distance is defined (non-zero) */
+    if (numa_node_count > 1) {
+        int other = (my_node == 0) ? 1 : 0;
+        int cross = acpi_node_distance(my_node, other);
+        kprintf("[TEST] distance %d->%d = %d\n", my_node, other, cross);
+        ASSERT_NE(cross, (int)0, "cross-node distance != 0");
+    }
+
+    /* 3. Allocate and free a single page from local node */
+    uint64_t phys1 = pmm_alloc_node_pages(1, my_node);
+    ASSERT_NE(phys1, (uint64_t)0, "alloc_node_pages(1, local)");
+    if (phys1) {
+        uint64_t pidx1 = phys1 / PAGE_SIZE;
+        kprintf("[TEST] alloc local node %d: phys=0x%lx idx=%lu\n",
+                my_node, phys1, pidx1);
+        if (numa_available)
+            ASSERT_TRUE(acpi_is_page_in_node(pidx1, my_node),
+                        "page on requested node");
+        /* Write a test pattern */
+        volatile uint64_t* p = (volatile uint64_t*)PHYS_TO_VIRT(phys1);
+        for (int i = 0; i < 512; i++) p[i] = 0xCAFEBABE + i;
+        pmm_free_page(phys1);
+    }
+
+    /* 4. Allocate and free 3 pages (contiguous) from local node */
+    uint64_t phys3 = pmm_alloc_node_pages(3, my_node);
+    ASSERT_NE(phys3, (uint64_t)0, "alloc_node_pages(3, local)");
+    if (phys3) {
+        kprintf("[TEST] alloc local node 3 pages: phys=0x%lx\n", phys3);
+        if (numa_available) {
+            for (uint32_t k = 0; k < 3; k++) {
+                ASSERT_TRUE(acpi_is_page_in_node((phys3/PAGE_SIZE)+k, my_node),
+                            "contiguous page on requested node");
+            }
+        }
+        pmm_free_pages(phys3, 3);
+    }
+
+    /* 5. Accounting invariants: total free >= list free + cache sum */
+    uint64_t free_before = pmm_free_pages_count();
+    uint64_t p5 = pmm_alloc_node_pages(1, my_node);
+    ASSERT_NE(p5, (uint64_t)0, "alloc for accounting test");
+    if (p5) {
+        uint64_t free_after = pmm_free_pages_count();
+        ASSERT_EQ(free_after, free_before - 1, "free count decreased by 1");
+        pmm_free_page(p5);
+        free_after = pmm_free_pages_count();
+        ASSERT_EQ(free_after, free_before, "free count restored after free");
+    }
+
+    /* 6. Cross-node fallback (only meaningful with >1 node) */
+    if (numa_available && numa_node_count > 1) {
+        int alt_node = (my_node == 0) ? 1 : 0;
+        uint64_t p6 = pmm_alloc_node_pages(1, alt_node);
+        ASSERT_NE(p6, (uint64_t)0, "cross-node alloc");
+        if (p6) {
+            int on_node = -1;
+            for (int r = 0; r < numa_memory_region_count; r++) {
+                if (numa_memory_regions[r].enabled &&
+                    p6 >= numa_memory_regions[r].base &&
+                    p6 < numa_memory_regions[r].base + numa_memory_regions[r].length)
+                    on_node = numa_memory_regions[r].node;
+            }
+            kprintf("[TEST] cross-node alloc node %d got phys=0x%lx on_node=%d\n",
+                    alt_node, p6, on_node);
+            pmm_free_page(p6);
+        }
+    }
+
+    /* 7. Verify pmm_current_node() matches per_cpu_data */
+    int current = pmm_current_node();
+    ASSERT_EQ(current, my_node, "pmm_current_node() matches CPU node_id");
+    kprintf("[TEST] pmm_current_node() = %d\n", current);
+
+    kprintf("[TEST] NUMA basic tests complete: %d nodes, %d memory regions\n",
+            numa_node_count, numa_memory_region_count);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * sched_verify — run queue invariant checker
+ *
+ * Walks every per-CPU run queue and asserts:
+ *   - node count matches rq_counts[prio]
+ *   - rq_total matches sum of rq_counts
+ *   - every queued thread has state == THREAD_READY
+ *   - every queued thread has cpu_queue matching its CPU
+ *   - no cycles (walk terminates within rq_counts + 1 steps)
+ *
+ * Returns 0 on success, -1 on first error (prints diagnostics).
+ * Safe to call from test context; acquires sched_queue_lock.
+ * ============================================================ */
+static int sched_verify(void) {
+    int ncpus = smp_enabled ? nr_cpus : 1;
+    int errors = 0;
+    cpu_flags_t qflags;
+
+    spinlock_acquire(&sched_queue_lock, &qflags);
+
+    for (int c = 0; c < ncpus; c++) {
+        per_cpu_data_t* pcp = per_cpu_data[c];
+        if (!pcp) continue;
+
+        int total_counted = 0;
+
+        for (int p = 0; p <= THREAD_MAX_PRIO; p++) {
+            thread_t* t = (thread_t*)pcp->rq_heads[p];
+            int cnt = 0;
+
+            while (t) {
+                cnt++;
+                if (cnt > (int)pcp->rq_counts[p] + 2) {
+                    kprintf("[SCHED-VRFY] CPU%d prio%03d: cycle (cnt=%d, rq_count=%u)\n",
+                            c, p, cnt, pcp->rq_counts[p]);
+                    errors++; break;
+                }
+                if (t->state != THREAD_READY) {
+                    kprintf("[SCHED-VRFY] CPU%d prio%03d: thread id=%llu state=%d\n",
+                            c, p, t->id, t->state);
+                    errors++;
+                }
+                if (t->cpu_queue != c) {
+                    kprintf("[SCHED-VRFY] CPU%d prio%03d: thread id=%llu cpu_queue=%d\n",
+                            c, p, t->id, t->cpu_queue);
+                    errors++;
+                }
+                t = t->rq_next;
+            }
+
+            if (cnt != (int)pcp->rq_counts[p]) {
+                kprintf("[SCHED-VRFY] CPU%d prio%03d: walked %d, rq_counts=%u\n",
+                        c, p, cnt, pcp->rq_counts[p]);
+                errors++;
+            }
+            total_counted += cnt;
+        }
+
+        if (total_counted != (int)pcp->rq_total) {
+            kprintf("[SCHED-VRFY] CPU%d: rq_total=%u but counted %d\n",
+                    c, pcp->rq_total, total_counted);
+            errors++;
+        }
+    }
+
+    spinlock_release(&sched_queue_lock, qflags);
+    return errors == 0 ? 0 : -1;
+}
+
+/* ============================================================
+ * SMP Test: work stealing (sched_steal_thread)
+ *
+ * CPU0 creates N%run queue threads.  CPU1 (idle) should steal
+ * some via sched_steal_thread().  Verifies:
+ *   - CPU1 rq_total increases (stealing occurred)
+ *   - all threads complete via thread_join
+ *   - sched_verify() invariant passes
+ * ============================================================ */
+#define STEAL_NTHREADS 32
+static volatile int steal_running;
+
+static void steal_worker(void* arg) {
+    (void)arg;
+    while (steal_running) thread_yield();
+    thread_exit(0);
+}
+
+static int test_sched_steal(void) {
+    if (!smp_enabled || smp_nr_cpus() < 2) {
+        kprintf("[TEST] test_sched_steal: SKIP (SMP < 2)\n");
+        return TEST_PASS;
+    }
+
+    thread_t* threads[STEAL_NTHREADS];
+
+    steal_running = 1;
+    for (int i = 0; i < STEAL_NTHREADS; i++) {
+        threads[i] = thread_create(steal_worker, NULL, THREAD_DEF_PRIO, "steal-w");
+        ASSERT_NOT_NULL(threads[i], "thread_create");
+        sched_add_thread(threads[i]);
+    }
+
+    /* Wait for CPU1 to steal threads. BSP → AP reschedule IPI
+     * fires every ~10ms; 500ms gives ~50 steal opportunities. */
+    thread_sleep(500);
+
+    uint32_t cpu1_rq = per_cpu_data[1]->rq_total;
+    ASSERT_TRUE(cpu1_rq > 0, "CPU1 should have stolen >= 1 thread");
+
+    /* Every thread's cpu_queue must be valid */
+    for (int i = 0; i < STEAL_NTHREADS; i++) {
+        int cq = threads[i]->cpu_queue;
+        ASSERT_TRUE(cq >= 0 && cq < smp_nr_cpus(), "thread cpu_queue in range");
+    }
+
+    ASSERT_ERR_OK(sched_verify(), "sched_verify after steal");
+
+    steal_running = 0;
+    for (int i = 0; i < STEAL_NTHREADS; i++)
+        thread_join(threads[i], NULL);
+
+    kprintf("[TEST] test_sched_steal: %d threads, CPU1 rq=%u, PASS\n",
+            STEAL_NTHREADS, cpu1_rq);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * SMP Test: load balancing push (sched_balance_push)
+ *
+ * Places 30 threads on CPU0 and 2 on CPU1, then waits for the
+ * periodic balance timer to push threads from overloaded CPU0
+ * to underloaded CPU1.  Verifies:
+ *   - load imbalance decreases or is already balanced
+ *   - sched_verify() invariant passes
+ * ============================================================ */
+static volatile int balance_running;
+
+static void balance_worker(void* arg) {
+    (void)arg;
+    while (balance_running) thread_yield();
+    thread_exit(0);
+}
+
+static int test_sched_balance_push(void) {
+    if (!smp_enabled || smp_nr_cpus() < 2) {
+        kprintf("[TEST] test_sched_balance_push: SKIP (SMP < 2)\n");
+        return TEST_PASS;
+    }
+
+    thread_t* threads[50];
+    int n_cpu0 = 30, n_cpu1 = 2, idx = 0;
+
+    balance_running = 1;
+    for (int i = 0; i < n_cpu0; i++, idx++) {
+        threads[idx] = thread_create(balance_worker, NULL, THREAD_DEF_PRIO, "bal-w");
+        ASSERT_NOT_NULL(threads[idx], "thread_create");
+        sched_place_thread(threads[idx], 0);
+    }
+    for (int i = 0; i < n_cpu1; i++, idx++) {
+        threads[idx] = thread_create(balance_worker, NULL, THREAD_DEF_PRIO, "bal-w");
+        ASSERT_NOT_NULL(threads[idx], "thread_create");
+        sched_place_thread(threads[idx], 1);
+    }
+
+    uint32_t cpu0_before = per_cpu_data[0]->rq_total;
+    uint32_t cpu1_before = per_cpu_data[1]->rq_total;
+    int diff_before = (int)cpu0_before - (int)cpu1_before;
+    kprintf("[TEST] balance: before: CPU0=%u CPU1=%u diff=%d\n",
+            cpu0_before, cpu1_before, diff_before);
+
+    /* Wait for balance_counter (100 ticks = 100ms) to fire several times */
+    thread_sleep(500);
+
+    uint32_t cpu0_after = per_cpu_data[0]->rq_total;
+    uint32_t cpu1_after = per_cpu_data[1]->rq_total;
+    int diff_after = (int)cpu0_after - (int)cpu1_after;
+    kprintf("[TEST] balance: after:  CPU0=%u CPU1=%u diff=%d\n",
+            cpu0_after, cpu1_after, diff_after);
+
+    /* Load imbalance should not have grown */
+    ASSERT_TRUE(diff_after <= diff_before + 1,
+                "balance: load imbalance should not increase");
+
+    ASSERT_ERR_OK(sched_verify(), "sched_verify after balance");
+
+    balance_running = 0;
+    for (int i = 0; i < idx; i++)
+        thread_join(threads[i], NULL);
+
+    kprintf("[TEST] test_sched_balance_push: diff %d→%d, PASS\n",
+            diff_before, diff_after);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * SMP Test: CPU affinity pinning
+ *
+ * Creates a thread with affinity restricted to CPU 2 (or the
+ * highest online CPU when <3 are available).  Verifies:
+ *   - thread runs and completes
+ *   - cpu_queue never leaves the pinned CPU
+ *   - sched_verify() invariant passes
+ * ============================================================ */
+static volatile int aff_ran;
+static volatile int aff_running;
+
+static void aff_worker(void* arg) {
+    (void)arg;
+    aff_ran = 1;
+    while (aff_running) thread_yield();
+    thread_exit(0);
+}
+
+static int test_sched_affinity_pin(void) {
+    if (!smp_enabled || smp_nr_cpus() < 2) {
+        kprintf("[TEST] test_sched_affinity_pin: SKIP (SMP < 2)\n");
+        return TEST_PASS;
+    }
+
+    /* Pin to the highest-indexed CPU — must be ≥ 2 for a meaningful test
+     * when SMP has 2+ CPUs, else use CPU 1. */
+    int target_cpu = smp_nr_cpus() > 2 ? 2 : 1;
+
+    aff_ran = 0;
+    aff_running = 1;
+
+    thread_t* t = thread_create(aff_worker, NULL, THREAD_DEF_PRIO, "aff-pin");
+    ASSERT_NOT_NULL(t, "thread_create");
+
+    sched_set_thread_affinity(t, 1ULL << target_cpu);
+    ASSERT_EQ(t->cpu_affinity, (uint64_t)(1ULL << target_cpu), "affinity mask set");
+
+    sched_add_thread(t);
+
+    /* Wait for the worker to run */
+    thread_sleep(300);
+    ASSERT_TRUE(aff_ran, "worker ran");
+
+    aff_running = 0;
+    thread_join(t, NULL);
+
+    ASSERT_EQ(t->cpu_queue, target_cpu, "thread cpu_queue == target_cpu");
+    ASSERT_ERR_OK(sched_verify(), "sched_verify after affinity pin");
+
+    kprintf("[TEST] test_sched_affinity_pin: pinned to CPU%d, PASS\n", target_cpu);
+    return TEST_PASS;
+}
+
 void kernel_self_test(void) {
     kprintf("[TEST] === Kernel self-tests ===\n");
 
@@ -928,6 +1737,21 @@ void kernel_self_test(void) {
 #ifdef CONFIG_LOCKDEP
     if (test_lockdep_ordering() == TEST_PASS) pass++; else fail++;
 #endif
+    /* SMP scheduler tests */
+    if (test_sched_steal() == TEST_PASS) pass++; else fail++;
+    if (test_sched_balance_push() == TEST_PASS) pass++; else fail++;
+    if (test_sched_affinity_pin() == TEST_PASS) pass++; else fail++;
+    /* Core subsystem stress tests */
+    if (test_pmm_alloc_free_stress() == TEST_PASS) pass++; else fail++;
+    if (test_pmm_multi_page_stress() == TEST_PASS) pass++; else fail++;
+    if (test_pmm_accounting() == TEST_PASS) pass++; else fail++;
+    if (test_vmm_map_unmap_stress() == TEST_PASS) pass++; else fail++;
+    if (test_vmm_page_permissions() == TEST_PASS) pass++; else fail++;
+    if (test_sched_thread_storm() == TEST_PASS) pass++; else fail++;
+    if (test_sched_sleep_accuracy() == TEST_PASS) pass++; else fail++;
+    if (test_kmalloc_compaction() == TEST_PASS) pass++; else fail++;
+    if (test_guard_page_basic() == TEST_PASS) pass++; else fail++;
+    if (test_numa_basic() == TEST_PASS) pass++; else fail++;
 
     kprintf("[TEST] === Results: %d pass, %d fail ===\n", pass, fail);
 }

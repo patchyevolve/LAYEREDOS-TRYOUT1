@@ -56,6 +56,9 @@ typedef struct process_t {
     void* vmas;  /* singly-linked VMA list (vma_t) */
     spinlock_t vma_lock;
 
+    // Page table lock (SMP: serialize concurrent modifications from clone'd threads)
+    spinlock_t pt_lock;
+
     // Network namespace
     struct net_ns* net_ns;
 

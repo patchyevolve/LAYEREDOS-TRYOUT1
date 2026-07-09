@@ -3,6 +3,7 @@
 #include "sched.h"
 #include "process.h"
 #include "kmalloc.h"
+#include "sync.h"
 
 /* The default network namespace (used by all processes initially) */
 net_ns_t init_net_ns;
@@ -40,6 +41,7 @@ net_ns_t* net_ns_alloc(void) {
     if (alloc_arrays(ns) != ERR_OK) { kfree(ns); return NULL; }
     ns->refcount = 1;
     ns->tcp_ephemeral_port = 32768;
+    spinlock_init(&ns->sockets_lock, "sockets_lock");
     return ns;
 }
 
@@ -89,6 +91,7 @@ void net_ns_init(void) {
     init_net_ns.refcount = 1;
     init_net_ns.tcp_ephemeral_port = 49152;
     init_net_ns.icmpv6_next_id = 1;
+    spinlock_init(&init_net_ns.sockets_lock, "sockets_lock");
     kmemcpy(init_net_ns.name, "init", 5);
     net_ns_initialized = 1;
 }

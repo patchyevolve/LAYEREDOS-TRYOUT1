@@ -44,6 +44,8 @@ static err_t elf_map_segment(process_t* proc, const elf64_phdr_t* ph,
     uint64_t first_page = seg_start & PAGE_MASK;
     uint64_t last_page  = ((seg_end + PAGE_SIZE - 1) & PAGE_MASK);
 
+    uint64_t alloc_start = last_page;
+    uint64_t alloc_end = first_page;
     for (uint64_t page = first_page; page < last_page; page += PAGE_SIZE) {
         page_entry_t* existing_pte = vmm_walk_pagetable(cr3, page);
         if (existing_pte && (*existing_pte & PAGE_PRESENT)) {
@@ -64,7 +66,21 @@ static err_t elf_map_segment(process_t* proc, const elf64_phdr_t* ph,
         }
 
         uint64_t phys = pmm_alloc_page();
-        if (!phys) return ERR_NOMEM;
+        if (!phys) {
+            /* Free pages already allocated in this segment */
+            for (uint64_t p = alloc_start; p < alloc_end; p += PAGE_SIZE) {
+                page_entry_t* pte = vmm_walk_pagetable(cr3, p);
+                if (pte && (*pte & PAGE_PRESENT)) {
+                    pmm_free_page(*pte & ~0xFFFULL);
+                    *pte = 0;
+                }
+            }
+            return ERR_NOMEM;
+        }
+
+        if (alloc_start == last_page)
+            alloc_start = page;
+        alloc_end = page + PAGE_SIZE;
 
         kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
 
@@ -83,6 +99,14 @@ static err_t elf_map_segment(process_t* proc, const elf64_phdr_t* ph,
         err_t e = vmm_map_page(cr3, page, phys, pgfl);
         if (e) {
             pmm_free_page(phys);
+            /* Free pages already allocated in this segment */
+            for (uint64_t p = alloc_start; p < alloc_end; p += PAGE_SIZE) {
+                page_entry_t* pte2 = vmm_walk_pagetable(cr3, p);
+                if (pte2 && (*pte2 & PAGE_PRESENT)) {
+                    pmm_free_page(*pte2 & ~0xFFFULL);
+                    *pte2 = 0;
+                }
+            }
             return e;
         }
     }

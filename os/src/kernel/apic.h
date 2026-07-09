@@ -87,6 +87,7 @@ extern int apic_x2apic;
 extern uint32_t apic_id;
 
 /* Core APIC */
+void     apic_reset(void);    /* clear stale state after warm reset */
 err_t    apic_init(void);
 void     apic_enable(void);
 void     apic_disable(void);

@@ -141,6 +141,7 @@ typedef struct sock_ops {
 
 typedef struct socket {
     int          refcount;
+    int          fd;        /* -1 = not registered; >=0 fd in net_sockets[] */
     int          family;    /* AF_INET or AF_INET6 */
     int          type;      /* SOCK_STREAM or SOCK_DGRAM */
     int          state;     /* SS_* */

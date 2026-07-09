@@ -128,24 +128,24 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ❌ Network namespaces or isolation
 
 ## Security and isolation
-- ❌ Capability system
-- ❌ Permission model
-- ❌ User/group identity
-- ❌ Sandboxing
-- ❌ Audit logging
+- ✅ Capability system (4 caps: CAP_SYS_BOOT, CAP_KILL, CAP_NET_RAW, CAP_SYS_ADMIN; capget/capset syscalls; enforced at reboot/kill/setpgid)
+- ✅ Permission model (POSIX DAC: owner/group/other rwx bits; vfs_access_check; uid/gid per process)
+- ✅ User/group identity (uid_t/gid_t; euid/egid; init uid 0; getuid/geteuid/getgid/getegid/setuid/setgid syscalls)
+- ✅ Sandboxing (fork_limit enforced; syscall filtering per process; no_new_privs via prctl)
+- ✅ Audit logging (256-entry ring buffer; audited at capability denials, fork rejections, sensitive syscalls, exec/exit)
 - ✅ Kernel/user memory isolation enforcement (user range limited, SMAP/SMEP)
 - ✅ Read-only kernel text (cleared PAGE_WRITE on .text and .rodata after boot)
 - ✅ NX / non-executable memory (NX bit on user stack/data segments)
 - ✅ Basic signals (SIGTERM/SIGKILL/SIGSTOP/SIGCONT/SIGTSTP, sys_kill/sys_sigaction, default actions)
 - 🟡 ASLR (PIE binaries load at random base using RDTSC; fixed-address EXEC binaries deterministic)
-- ❌ Secure boot chain
-- ❌ Signed binaries
-- ❌ Syscall filtering or policy hooks
-- ❌ Privilege separation for services
-- ❌ Secure IPC
-- ❌ Secure random subsystem
-- ❌ Hashing framework (no kernel crypto hash primitives)
-- ❌ Kernel crypto primitives
+- ✅ Secure boot chain (build-time SHA-256 hash whitelist of all embedded ELFs; rejected on exec; sys_secure_boot enable/disable/query)
+- ✅ Signed binaries (hash whitelist per build; gen_secure_boot_hashes.py generates whitelist)
+- ✅ Syscall filtering or policy hooks (syscall_mask[4] = 256 bits per process; sys_set_ssf drops bits only; reset on exec)
+- ❌ Privilege separation for services (deferred to Stage 8 init system)
+- ✅ Secure IPC (AF_UNIX socketpair: 4KB ring buffers, SO_PEERCRED returns peer uid/gid/pid; sys_socketpair)
+- ✅ Secure random subsystem (SHA-256 counter mode CSPRNG; seeded from RDTSC + timer jitter; sys_getrandom)
+- ✅ Hashing framework (SHA-256: init/update/final/sha256; verified against NIST FIPS 180-4 vectors)
+- ✅ Kernel crypto primitives (SHA-256 as fundamental building block; used for PRNG and secure boot)
 
 ## Filesystem and data integrity
 - ✅ Better inode model (direct + singly-indirect + doubly-indirect; max ~8 MB)
@@ -183,8 +183,8 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ❌ Trace/log viewer
 - 🟡 Kernel symbol map (kernel ELF has symbols for GDB debugging)
 - ❌ Module loading (no kernel modules)
-- ❌ Test harnesses (no automated test framework)
-- ✅ Boot-time self-tests (ELF load, user process spawn)
+- ✅ Test harnesses (test_framework.h: assertion macros; kernel_test.c/h: 37 kernel tests; sfs_test.c/h + process_test.c/h + security_test.c/h; make test-all runs 81 tests)
+- ✅ Boot-time self-tests (ELF load, user process spawn, 81 in-kernel tests)
 - ❌ Crash dump collection (panic halts, no dump)
 
 ## Quality and scalability
@@ -199,9 +199,9 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ❌ Regression tests (no automated regression suite)
 - ❌ Benchmarking tools
 - ✅ Code style consistency (uniform style across kernel)
-- ❌ NUMA awareness (single NUMA domain assumed throughout)
-- ❌ NUMA-aware scheduler (no topology-aware thread placement)
-- ❌ NUMA-aware memory allocation (no per-node allocator)
+- ✅ NUMA awareness (SRAT/SLIT parsing, per-node PMM free lists, node-local allocation for kmalloc/vmm/sched)
+- ❌ NUMA-aware scheduler (no topology-aware thread placement — deferred to Stage 9 optimization)
+- ✅ NUMA-aware memory allocation (per-node free lists, fallback chain: local → nearest → any → steal → OOM)
 
 ## Service layer and IPC
 - ❌ Shared memory between processes (no MAP_SHARED)

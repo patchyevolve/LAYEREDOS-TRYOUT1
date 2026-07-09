@@ -5,7 +5,7 @@
 make -C os clean && make -C os -j4          # debug build
 make -C os release                           # release build (stripped, -Os)
 make -C os test-net                          # run 5 regression tests (~120s)
-make -C os test-all                          # all 76 tests (~180s)
+make -C os test-all                          # all 81 tests (~180s)
 make -C os test-security                     # run 19 security tests (~120s)
 ```
 
@@ -130,16 +130,22 @@ Implement one at a time, in order. Each gets its own test(s). If `make test-all`
 | 5 | **RCU** — minimal `call_rcu` + grace-period kthread | ~300 lines, rcu.c/h | callback fires after GP, concurrent read-safe | **DONE** |
 | 6 | **Panic recovery** — panic_reboot timer, kmsg dump, emergency_sync | ~150 lines, hal.c | inject panic, verify reboot within 5s | **DONE** |
 | 7 | **CPU hotplug** — online/offline, data migration | ~400 lines, smp.c | offline CPU 1, run on CPU 0, online CPU 1 | **DONE** |
-| 8 | **NUMA awareness** — SRAT/SLIT, node-local allocation | ~200 lines, acpi.c/pmm.c | allocate on remote node, verify locality | |
+| 8 | **NUMA awareness** — SRAT/SLIT, node-local allocation | ~200 lines, acpi.c/pmm.c | allocate on remote node, verify locality | **DONE** |
 - **Generic RST handling**: RST aborts the connection immediately (state=CLOSED, closed=1) but does NOT set `used=0` — the connection slot stays allocated for `tcp_find_conn` matching (prevents stray SYN+ACK from matching freed slots). Slot freed by `tcp_conn_connect` poll loop or `tcp_conn_destroy()`.
 - **TIME_WAIT 2MSL policy**: 60 seconds (60000 ms) RFC-suggested 2MSL interval. Tick granularity: 10ms (NIC poll thread interval).
 - **Data retransmission buffer**: Only the last TCP_MSS-sized chunk is buffered. On RTO, the buffered chunk is retransmitted from its original sequence number. This handles the common case (single-segment sends like echo tests) correctly; multi-segment sends retransmit from the latest unacknowledged segment.
 - **Lock-safe retransmission in tcp_tick()**: `tcp_tick()` releases `tcp_lock` before calling `tcp_send_pkt()` to avoid deadlock when NDP/ARP resolution triggers `eth_rx_poll()` (which could re-enter TCP). After re-acquiring, state is re-validated before updates.
 - **FIN retransmission**: Uses separate `fin_rto_remaining` timer (1s initial, 2s backoff, 60s cap). Timer cleared on state transition out of FIN_WAIT1/LAST_ACK.
 
+### Done (this session, 2026-07-10): SMP gap #8 — NUMA awareness
+- **SRAT x2APIC type 2** — `srat_x2apic_affinity_t` struct, `case 2:` handler in `acpi_parse_srat()` mapping x2APIC entries to NUMA nodes.
+- **PMM per-node free lists** — Replaced single `free_list`/`global_free_count` with `node_free_lists[MAX_NUMA_NODES]`, `node_free_counts[]`, `list_free_count`. `pmm_numa_init()` redistributes after SRAT. Fallback chain: per-CPU cache → local node → nearest node (SLIT) → any node → steal → OOM.
+- **Consumers wired** — `kmalloc.c`, `vmm.c` (3 sites), `sched.c` all call `pmm_alloc_node_pages(pmm_current_node())`.
+- **`test_numa_basic()` expanded** — self/cross-node distance, single + 3-page alloc/free, accounting invariants, cross-node fallback, `pmm_current_node()`.
+- **Test count**: 81/81 pass (5 net + 10 storage + 37 kernel + 6 SFS + 4 process + 19 security). 82/82 with lockdep.
+
 ## Next Steps
-- Stage 7.6: Task scheduling on AP (work stealing, load balancing)
-- Stage 8: Service Layer
+- Stage 8: Service Layer (IPC, virtual filesystems, init system)
 - Stage 9: Quality, Testing and Scalability
 - Make `make test` timing more robust (retry on timeout, test-runner.sh polish)
 
@@ -154,6 +160,8 @@ Implement one at a time, in order. Each gets its own test(s). If `make test-all`
 - `eth_rx_poll()` called from both NIC poll thread (10ms) and blocking APIs.
 - All spinlocks use `cpu_flags_t` (CLI/STI) for mutual exclusion on single-core.
 - **QEMU SMP timer quirk**: With &gt;1 vCPU + any PCI network device, QEMU stops delivering APIC/PIT timer interrupts after AP comes online. Workaround (removed): previously scanned PCI config space for network devices to skip AP bring-up — not needed; SMP works correctly with current code.
+- **EFER.NXE must be set before mapping pages with NX**: The kernel boot code (`boot.S`) and AP trampoline (`trampoline.S`) configure `IA32_EFER` MSR (0xC0000080). Bit 11 (NXE) enables the NX (No-Execute) bit in page table entries (bit 63). The VMM audit H1 fix (`vmm.c:86`) changed `vmm_map_page` from `flags & 0xFFF` to `flags & (0xFFF | PAGE_NX)`, so NX is now propagated to PTEs. Without NXE set, the CPU treats bit 63 as reserved → reserved-bit page fault.
+- **rcu-gp thread pinned to CPU 0** (`rcu.c:149`): `cpu_affinity = 1` prevents a pre-existing scheduler migration race where `rsp` (TCB offset 0) gets corrupted on 4-CPU TCG when the RCU kthread migrates between CPUs during `check_sleepers` wakeup. All system kthreads that don't need to run on all CPUs should be similarly pinned.
 
 ## Relevant Files
 - `os/src/kernel/gpt.c` / `gpt.h`: GPT partition parser, partition wrapper block device
@@ -820,5 +828,61 @@ All 5 pass without a network backend:
 | `os/src/kernel/smp.c` | Rewrote `smp_cpu_offline`/`smp_cpu_online` — no more INIT/SIPI; parking-based online; `smp_handle_offline` migrates current thread |
 | `os/src/kernel/sched.c` | `idle_thread()` parking loop for offlined CPUs; `sched_queue_lock` made non-static |
 | `os/src/kernel/sched.h` | `extern spinlock_t sched_queue_lock` declaration |
+
+## Session summary (2026-07-09): Full-system audit — 12 high/critical bugs fixed across TCP, socket layer, scheduler
+
+### Done (this session)
+- **Three-layer audit**: Completed systematic bug audits of TCP stack (`tcp.c`), socket layer (`net.c`), and scheduler (`sched.c`) — 12 high/critical bugs found and fixed.
+- **TCP critical fix**: IPv6 RST sent NULL source address for pseudo-header checksum (`tcp.c:237`), causing guaranteed page fault on any IPv6 connection refusal. Fixed using `ipv6_get_lladdr()`.
+- **TCP hardcoded IP fixes** (`tcp.c:118,231,125-128`): Added `local_ip` field to `tcp_conn_t`; `tcp_handle_common` now receives & saves `dst_ip` from handlers; `tcp_send_pkt` and RST paths use `conn->local_ip` instead of hardcoded `10.0.2.15` / link-local. Also sets `local_ip` in `tcp_conn_connect` via `ipv4_get_addr()` / `ipv6_get_lladdr()`.
+- **TCP snd_nxt leak** (`tcp.c:639-653`): Retransmission path modified `snd_nxt` before lock-drop; on state change during lock-drop, `snd_nxt` was never restored. Restructured to not overwrite `snd_nxt` until after re-acquire.
+- **TCP FIN RTO backoff** (`tcp.c:663-664`): Added `fin_rto_ms` persistent field with exponential backoff (capped at 60s), replacing hardcoded 2000ms.
+- **TCP accept errpath double-destroy** (`net.c:108,117`): OOM leak fixed — replaced bare `used=0` with `tcp_conn_destroy()`.
+- **NULL check in `tcp_sock_recv`** (`net.c:144`): Added guard matching `tcp_sock_send` — recv after close on TCP socket no longer page faults.
+- **`c->used=0` on non-blocking connect RST** (`net.c:65`): Replaced `c->used=0` (dangling proto) with `s->state = SS_UNBOUND; return ERR_CONNREFUSED`.
+- **`af_to_user()` translation** Addressed: All 12 `sin_family`/`sin6_family` writes in getsockname/getpeername/recvfrom now translate kernel AF values (4/6) to POSIX values (2/10) for userspace.
+- **Socket table SMP lock** (`net.c:858-895`): Added `sockets_lock` spinlock to `net_ns_t`; `sock_register`/`sock_unregister`/`sock_lookup` all acquire it, preventing concurrent fd-table races.
+- **`udp_sock_recvfrom` family leak** (`net.c:539`): Changed from `&s->family` to local `recv_af` so a single IPv6 datagram doesn't permanently change the socket's address family.
+- **Scheduler `sched_reap_zombies` UAF fix** (`sched.c:108-115`): Reaper now acquires `t->join_queue.lock` before checking count — prevents TCB free while `thread_join` holds the same lock reading `exit_code`.
+- **Scheduler `check_sleepers` strand** (`sched.c:812`): Moved `t->state = THREAD_READY` to after `sched_queue_lock` acquisition — when lock contention caused `try_acquire` failure, thread was left in READY state with no run queue entry (lost forever).
+- **Scheduler ABBA deadlock** (`sched_kill_thread`, `sched.c:1100-1105`): Moved `sched_wake(&t->join_queue)` outside `sched_queue_lock` critical section — breaks the `join_queue.lock`→`sched_queue_lock` vs `sched_queue_lock`→`join_queue.lock` cycle.
+- **`tcp_sock_getsockname` wrong IP** (`net.c:285-307`): Uses `ipv4_get_addr()` for local address instead of remote IP; fills in IPv4 mapped address for dual-stack sockets.
+- **`pick_next` stolen-thread leak** (`sched.c:433-438`): Re-queues stolen thread instead of silently dropping when not better than local best.
+- **All 76 tests pass** (5 net + 10 storage + 32 kernel + 6 SFS + 4 process + 19 security).
+
+### Key files changed
+| File | Change |
+|------|--------|
+| `os/src/kernel/tcp.h` | Added `local_ip` union, `fin_rto_ms` field to `tcp_conn_t` |
+| `os/src/kernel/tcp.c` | IPv6 RST fix (use `ipv6_get_lladdr`), hardcoded IPv4→`conn->local_ip`, snd_nxt leak fix, FIN RTO backoff, `tcp_handle_common` receives `dst_ip` |
+| `os/src/kernel/ipv4.c` | `ipv4_get_addr()` (existing API used for local_ip) |
+| `os/src/kernel/net.c` | `af_to_user()` added; `sock_register/unregister/lookup` locked; `tcp_sock_recv` NULL check; non-blocking connect RST→ERR_CONNREFUSED; `udp_sock_recvfrom` uses local `recv_af`; getsockname/getpeername/recvfrom AF fields translated; `tcp_sock_getsockname` local IP fix |
+| `os/src/kernel/net_ns.h` | Added `sockets_lock` spinlock to `net_ns_t` |
+| `os/src/kernel/net_ns.c` | `sockets_lock` init in `net_ns_init` and `net_ns_alloc` |
+| `os/src/kernel/sched.c` | `sched_reap_zombies` acquires `join_queue.lock` before free; `check_sleepers` moves state change after lock; `sched_kill_thread` releases `sched_queue_lock` before `sched_wake`; `pick_next` re-queues dropped stolen thread |
+
+
+
+### Done (this session)
+- **Root cause of `sock_send` page fault at `0xD100002708`**: `sock_close` called `socket_release(s)` (which kfrees the socket) without calling `sock_unregister`, leaving a stale dangling pointer in `net_sockets[fd]`. A subsequent `sock_send` to the same fd (from `sys_sendto` fallthrough) dereferenced freed memory. Fixed by adding `fd` field to `socket_t`, having `sock_close` call `sock_unregister(s->fd)` before releasing, and removing the now-redundant `sock_unregister` from `sys_close`.
+- **Double `sock_register` in AF_UNIX accept**: `unix_sock_accept` called `sock_register(client)` redundantly — `sys_accept` already handles registration. Removed duplicate from `unix.c:276`.
+- **TCP accept OOM leak**: `tcp_sock_accept` used bare `child->used = 0` to discard unaccepted connections, leaking `tcp_conn_t` resources allocated under `tcp_lock`. Replaced with proper `tcp_conn_destroy(child)` at all three error-exit sites (`net.c:95,107,116`).
+- **`tcp_sock_getsockname` wrong IP**: Was copying the **remote** IP instead of the **local** IP from the mapped IPv4-mapped-IPv6 address. Now uses `ipv4_get_addr()` for the local address; also fills in local address for pure AF_INET case (`net.c:285-307`).
+- **`pick_next` thread leak** (`sched.c:433-438`): When proactive steal found a thread that wasn't better than the local best, it was dropped entirely without being re-queued. Now calls `sched_add_thread(stolen)` to return it to the run queue.
+- **`thread_join` UAF race** (`sched_reap_zombies`, `sched.c:103`): `sched_reap_zombies` could free a TERMINATED thread's TCB while a joiner was about to re-acquire `t->join_queue.lock` after being woken by `sched_wake`. Fixed by adding `!t->join_queue.count` guard — the reaper skips threads that have anyone waiting on their join queue, ensuring the TCB stays alive until the joiner extracts the exit code.
+- **All 76 tests pass** (5 net + 10 storage + 32 kernel + 6 SFS + 4 process + 19 security).
+
+### Key files changed
+| File | Change |
+|------|--------|
+| `os/src/kernel/net.h` | Added `fd` field to `socket_t` |
+| `os/src/kernel/net.c:845-854` | `sock_register` sets `s->fd = i` |
+| `os/src/kernel/net.c:801-807` | `sock_close` calls `sock_unregister(s->fd)` before `socket_release` |
+| `os/src/kernel/net.c:95,107,116` | `tcp_sock_accept`: `used=0` → `tcp_conn_destroy(child)` |
+| `os/src/kernel/net.c:285-307` | `tcp_sock_getsockname`: remote IP → local IP via `ipv4_get_addr()` |
+| `os/src/kernel/syscall.c:291-298` | Removed redundant `sock_unregister` from `sys_close` |
+| `os/src/kernel/unix.c:276` | Removed duplicate `sock_register` in `unix_sock_accept` |
+| `os/src/kernel/sched.c:103` | `sched_reap_zombies`: added `!t->join_queue.count` guard |
+| `os/src/kernel/sched.c:433-438` | `pick_next`: re-queue stolen thread instead of dropping |
 
 

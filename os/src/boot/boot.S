@@ -150,7 +150,7 @@ start:
 
     movl $0xC0000080, %ecx
     rdmsr
-    orl $(1 << 8), %eax
+    orl $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
     movl %cr0, %eax
@@ -167,6 +167,23 @@ start:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
+
+    /* Clear BSS — on a warm reset (panic→reboot) QEMU preserves physical RAM
+     * and the multiboot loader's BSS-clearing does not re-run.  Stale pointers
+     * in BSS (free_list, all_threads_head, run queues, etc.) cause crashes.
+     *
+     * We use the page-table area in .boot.data as a temporary stack — those
+     * tables are no longer needed after switching to long mode. */
+    movabsq $pml4_table, %rbx
+    addq    $16384, %rbx            /* end of page-table region (12 KB) + padding */
+    movq    %rbx, %rsp
+
+    movabsq $_bss_start, %rdi
+    movabsq $_bss_end, %rcx
+    subq    %rdi, %rcx
+    xorl    %eax, %eax
+    cld
+    rep     stosb
 
     movabsq $stack_top, %rsp
 

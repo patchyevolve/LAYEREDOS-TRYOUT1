@@ -50,6 +50,7 @@ typedef struct tcp_conn {
     int         af;
     tcp_state_t state;
     uint16_t    local_port;
+    union { ipv4_addr_t v4; uint8_t v6[16]; } local_ip;
     union { ipv4_addr_t v4; uint8_t v6[16]; } remote_ip;
     uint16_t    remote_port;
     uint32_t    snd_nxt;
@@ -96,6 +97,7 @@ typedef struct tcp_conn {
     uint32_t rto_ms;
     uint32_t rto_remaining;
     uint32_t fin_rto_remaining;
+    uint32_t fin_rto_ms;
 } tcp_conn_t;
 
 /* ---- Stable transport API (sockets will wrap this) ---- */

@@ -23,6 +23,11 @@ static inline void page_zero(uint64_t phys) {
         p[i] = 0;
 }
 
-/* NUMA-aware page allocation - node hint (0 = default) */
+/* Rebuild per-node free lists after SRAT parsing.
+ * Called from acpi_parse_srat() when NUMA topology is discovered. */
+void pmm_numa_init(void);
+
+/* Get the NUMA node for the current CPU (0 if NUMA not available). */
+int pmm_current_node(void);
 
 #endif

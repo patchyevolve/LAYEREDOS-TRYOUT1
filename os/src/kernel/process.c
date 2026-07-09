@@ -8,6 +8,7 @@
 #include "hal.h"
 #include "vfs.h"
 #include "kmalloc.h"
+#include "vma.h"
 
 /* ASLR helpers */
 #define ASLR_STACK_PAGES 0x100
@@ -64,6 +65,10 @@ process_t* process_create(const char* name, pid_t ppid) {
 
     process_t* proc = &process_table[slot];
     kmemset(proc, 0, sizeof(process_t));
+    proc->syscall_mask[0] = ~0ULL;
+    proc->syscall_mask[1] = ~0ULL;
+    proc->syscall_mask[2] = ~0ULL;
+    proc->syscall_mask[3] = ~0ULL;
     proc->pid = next_pid++;
     proc->ppid = ppid;
     proc->pgid = proc->pid;
@@ -75,6 +80,7 @@ process_t* process_create(const char* name, pid_t ppid) {
     kmemset(proc->signal_actions, 0, sizeof(proc->signal_actions));
     spinlock_init(&proc->signal_lock, "signal_lock");
     spinlock_init(&proc->vma_lock, "vma_lock");
+    spinlock_init(&proc->pt_lock, "pt_lock");
     wait_queue_init(&proc->exit_waiters);
     proc->fork_limit = -1;
     proc->cwd[0] = '/';
@@ -307,17 +313,12 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
         *(uint64_t*)(tramp + 0x0F8) = prog_vaddr;
     }
 
-    thread_t* tcb = (thread_t*)PHYS_TO_VIRT(pmm_alloc_page());
-    if (!tcb) return ERR_NOMEM;
+    uint32_t __stack_pages = (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t __block_phys = pmm_alloc_pages(__stack_pages + 1);
+    if (!__block_phys) return ERR_NOMEM;
+    thread_t* tcb = (thread_t*)PHYS_TO_VIRT(__block_phys);
     kmemset(tcb, 0, sizeof(thread_t));
-
-    uint64_t kstack_phys = pmm_alloc_pages(
-        (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE);
-    if (!kstack_phys) {
-        pmm_free_page((uint64_t)tcb - KERNEL_VMA_BASE);
-        return ERR_NOMEM;
-    }
-    void* kstack = (void*)PHYS_TO_VIRT(kstack_phys);
+    void* kstack = (void*)((uint8_t*)PHYS_TO_VIRT(__block_phys) + PAGE_SIZE);
     kmemset(kstack, 0, THREAD_STACK_SIZE);
     uint64_t kstack_top = (uint64_t)kstack + THREAD_STACK_SIZE;
 
@@ -338,11 +339,11 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
 
-    *(--sp) = (uint64_t)user_thread_entry;
+    *(--sp) = (uint64_t)fork_child_entry;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
 
-    tcb->id = 0;
+    tcb->id = __sync_fetch_and_add(&next_thread_id, 1);
     tcb->rsp = (uint64_t)sp;
     tcb->cr3 = cr3;
     tcb->state = THREAD_CREATED;
@@ -432,6 +433,7 @@ err_t process_exit(process_t* proc, int exit_code) {
             pml4v[255] = 0;
         }
 
+        vma_cleanup(proc);
         vmm_free_user_pages(proc->cr3);
         pmm_free_page(proc->cr3);
         proc->cr3 = 0;
@@ -547,6 +549,8 @@ void signal_process(process_t* proc) {
         switch (signal_default_action(sig)) {
             case SIGACT_TERM: {
                 kprintf("[SIGNAL] pid %d TERMINATED by signal %d (exit_code=%d)\n", proc->pid, sig, 128 + sig);
+                /* Decrement all remaining threads so process_exit frees page tables */
+                proc->thread_count = 0;
                 process_exit(proc, 128 + sig);
                 return;
             }

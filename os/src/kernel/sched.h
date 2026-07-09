@@ -7,12 +7,12 @@
 #endif
 
 #define THREAD_NAME_MAX   64
-#define THREAD_STACK_SIZE 16384
+#define THREAD_STACK_SIZE 32768
 #define THREAD_IDLE_PRIO  0
 #define THREAD_DEF_PRIO   128
 #define THREAD_MAX_PRIO   255
 #define THREAD_TIME_SLICE 10
-#define AGING_INTERVAL    50  /* boost ready thread every 50 ticks if starved */
+#define AGING_INTERVAL    20  /* boost ready thread every 20 ticks if starved (~400ms per boost) */
 
 typedef enum {
     THREAD_CREATED = 0,
@@ -61,6 +61,7 @@ typedef struct thread {
     struct process_t*   proc;         /* owning process */
     uint8_t             cpu_queue;    /* which CPU's run queue this thread is on */
     uint64_t            cpu_affinity; /* bitmask of allowed CPUs (bit 0 = CPU 0) */
+    uint64_t            block_phys;   /* physical base of TCB+guard+stack block */
 #ifdef CONFIG_LOCKDEP
     void*               held_locks[8];       /* lock addresses held by this thread */
     const char*         held_names[8];       /* lock names */
@@ -141,6 +142,7 @@ int   sched_kill_thread(uint64_t id);
 void  sched_set_thread_affinity(thread_t* t, uint64_t mask);
 void  sched_place_thread(thread_t* t, int cpu);
 int   sched_migrate_cpu(int from_cpu, int to_cpu);
+extern uint64_t next_thread_id;
 extern spinlock_t sched_queue_lock;
 
 #endif

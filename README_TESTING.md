@@ -8,10 +8,13 @@ This directory now contains comprehensive testing documentation and analysis for
 **The main reference document** - Read this first!
 
 **Contents:**
-- Complete catalog of all 25 existing tests
+- Complete catalog of all 81 existing tests (as of 2026-07-10)
   - 5 network tests
   - 10 storage tests
-  - 6 threading tests
+  - 37 kernel tests
+  - 6 SFS tests
+  - 4 process tests
+  - 19 security tests
   - 2 integration test scripts
 - Analysis of major coverage gaps
 - Proposed 50+ new tests organized by priority
@@ -84,10 +87,10 @@ This directory now contains comprehensive testing documentation and analysis for
 
 ## 📊 Quick Stats
 
-| Metric | Current | Proposed | Gap |
+| Metric | Current (Jul 10) | Proposed | Gap |
 |--------|---------|----------|-----|
-| **Total Tests** | 25 | 89+ | 64 |
-| **Unit Tests** | 21 | 71+ | 50 |
+| **Total Tests** | 81 | 89+ | 8+ |
+| **Unit Tests** | 77 (kernel:37 + storage:10 + SFS:6 + process:4 + security:19 + net:5) | 71+ | — |
 | **Integration Tests** | 2 | 12+ | 10 |
 | **Stress Tests** | 0 | 5+ | 5 |
 | **Code Coverage** | ~15% | ~60% | +45% |

@@ -133,7 +133,7 @@ void kmalloc_init(void) {
 }
 
 static slab_page_t* slab_new_page(int idx) {
-    uint64_t phys = pmm_alloc_page();
+    uint64_t phys = pmm_alloc_node_pages(1, pmm_current_node());
     if (!phys) return NULL;
     uint64_t virt = PHYS_TO_VIRT(phys);
     kmemset((void*)virt, 0, PAGE_SIZE);

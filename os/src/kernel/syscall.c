@@ -148,6 +148,7 @@ int strncpy_from_user(void* dst, const void* src, size_t max) {
 
 static uint64_t sys_exit(int_frame_t* frame) {
     int exit_code = (int)frame->rdi;
+    kputchar('X');
     if (current_thread && current_thread->proc) {
         process_t* proc = current_thread->proc;
         unsigned long old = __sync_fetch_and_sub(&proc->thread_count, 1);
@@ -167,7 +168,6 @@ static uint64_t sys_write(int_frame_t* frame) {
     const char* buf = (const char*)frame->rsi;
     size_t count = (size_t)frame->rdx;
 
-    /* Check if this is a socket fd */
     socket_t* s = sock_lookup(fd);
     if (s) {
         char kbuf[512];
@@ -193,7 +193,6 @@ static uint64_t sys_write(int_frame_t* frame) {
             return (uint64_t)(int64_t)ERR_FAULT;
         int64_t ret = vfs_write(fd, kbuf, chunk);
         if (ret < 0) {
-            /* If write to fd 0/1/2 and no fd is open, fall through to UART */
             if (fd >= 0 && fd <= 2) {
                 for (size_t i = 0; i < (written ? written : chunk); i++)
                     kputchar(kbuf[i]);
@@ -258,14 +257,20 @@ static uint64_t sys_sbrk(int_frame_t* frame) {
         uint64_t start_page = old_brk & PAGE_MASK;
         uint64_t end_page   = (new_brk + PAGE_SIZE - 1) & PAGE_MASK;
         uint64_t cr3_val = proc->cr3;
+        cpu_flags_t _ptf_brk;
+        spinlock_acquire(&proc->pt_lock, &_ptf_brk);
         for (uint64_t addr = start_page; addr < end_page; addr += PAGE_SIZE) {
             page_entry_t* pte = vmm_walk_pagetable(cr3_val, addr);
             if (pte && (*pte & PAGE_PRESENT)) continue;
             uint64_t phys = pmm_alloc_page();
-            if (!phys) return (uint64_t)-1;
+            if (!phys) {
+                spinlock_release(&proc->pt_lock, _ptf_brk);
+                return (uint64_t)-1;
+            }
             kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
             vmm_map_page(cr3_val, addr, phys, PAGE_USER | PAGE_WRITE);
         }
+        spinlock_release(&proc->pt_lock, _ptf_brk);
         proc->user_stack_top = new_brk;
     }
     return old_brk;
@@ -294,7 +299,6 @@ static uint64_t sys_close(int_frame_t* frame) {
     socket_t* s = sock_lookup(fd);
     if (s) {
         KDEBUG("[SYSCALL] close(fd=%d) socket\n", fd);
-        sock_unregister(fd);
         sock_close(s);
         return 0;
     }
@@ -365,6 +369,7 @@ static uint64_t sys_execve(int_frame_t* frame) {
     vfs_close(fd);
     if ((uint64_t)total < sz) { kfree(buf); return (uint64_t)(int64_t)ERR_IO; }
     if (proc->cr3) {
+        ((uint64_t*)PHYS_TO_VIRT(proc->cr3))[255] = 0;
         vmm_free_user_pages(proc->cr3);
         uint64_t new_cr3 = pmm_alloc_page();
         if (!new_cr3) { kfree(buf); return (uint64_t)(int64_t)ERR_NOMEM; }
@@ -436,20 +441,25 @@ static uint64_t sys_fork(int_frame_t* frame) {
     }
     if (pp->cr3 && cp->cr3) {
         err_t e = vmm_duplicate_user_pages(cp->cr3, pp->cr3);
-        if (e) return (uint64_t)(int64_t)e;
+        if (e) {
+            ((uint64_t*)PHYS_TO_VIRT(cp->cr3))[255] = 0;
+            vmm_free_user_pages(cp->cr3);
+            pmm_free_page(cp->cr3);
+            cp->cr3 = 0;
+            return (uint64_t)(int64_t)e;
+        }
     }
     cp->entry_point = pp->entry_point;
     cp->user_stack_top = pp->user_stack_top;
     cp->user_code_start = pp->user_code_start;
     cp->user_code_size = pp->user_code_size;
     vma_duplicate(cp);
-    thread_t* ct = (thread_t*)PHYS_TO_VIRT(pmm_alloc_page());
-    if (!ct) return (uint64_t)(int64_t)ERR_NOMEM;
+    uint32_t __sp2 = (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t __blk2 = pmm_alloc_pages(__sp2 + 1);
+    if (!__blk2) return (uint64_t)(int64_t)ERR_NOMEM;
+    thread_t* ct = (thread_t*)PHYS_TO_VIRT(__blk2);
     kmemset(ct, 0, sizeof(thread_t));
-    uint64_t ks_phys = pmm_alloc_pages(
-        (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE);
-    if (!ks_phys) { pmm_free_page((uint64_t)ct - KERNEL_VMA_BASE); return (uint64_t)(int64_t)ERR_NOMEM; }
-    void* ks = (void*)PHYS_TO_VIRT(ks_phys);
+    void* ks = (void*)((uint8_t*)PHYS_TO_VIRT(__blk2) + PAGE_SIZE);
     kmemset(ks, 0, THREAD_STACK_SIZE);
     uint64_t kt = (uint64_t)ks + THREAD_STACK_SIZE;
     uint64_t* sp = (uint64_t*)kt;
@@ -504,6 +514,7 @@ static uint64_t sys_fork(int_frame_t* frame) {
     *(--sp) = 0; /* r12 */
     *(--sp) = 0; /* rbx */
     *(--sp) = 0; /* rbp (closest to sp) */
+    ct->id = __sync_fetch_and_add(&next_thread_id, 1);
     ct->rsp = (uint64_t)sp;
     ct->cr3 = cp->cr3;
     ct->state = THREAD_CREATED;
@@ -622,17 +633,12 @@ static uint64_t sys_clone(int_frame_t* frame) {
     uint64_t child_stack_user = frame->rsi;
     (void)flags;
 
-    thread_t* ct = (thread_t*)PHYS_TO_VIRT(pmm_alloc_page());
-    if (!ct) return (uint64_t)(int64_t)ERR_NOMEM;
+    uint32_t __sp2 = (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t __blk2 = pmm_alloc_pages(__sp2 + 1);
+    if (!__blk2) return (uint64_t)(int64_t)ERR_NOMEM;
+    thread_t* ct = (thread_t*)PHYS_TO_VIRT(__blk2);
     kmemset(ct, 0, sizeof(thread_t));
-
-    uint64_t ks_phys = pmm_alloc_pages(
-        (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE);
-    if (!ks_phys) {
-        pmm_free_page((uint64_t)ct - KERNEL_VMA_BASE);
-        return (uint64_t)(int64_t)ERR_NOMEM;
-    }
-    void* ks = (void*)PHYS_TO_VIRT(ks_phys);
+    void* ks = (void*)((uint8_t*)PHYS_TO_VIRT(__blk2) + PAGE_SIZE);
     kmemset(ks, 0, THREAD_STACK_SIZE);
     uint64_t kt = (uint64_t)ks + THREAD_STACK_SIZE;
     uint64_t* sp = (uint64_t*)kt;
@@ -674,6 +680,7 @@ static uint64_t sys_clone(int_frame_t* frame) {
     *(--sp) = 0; /* rbx */
     *(--sp) = 0; /* rbp (closest to sp) */
 
+    ct->id = __sync_fetch_and_add(&next_thread_id, 1);
     ct->rsp = (uint64_t)sp;
     ct->cr3 = proc->cr3; /* Same address space */
     ct->state = THREAD_CREATED;
@@ -910,12 +917,16 @@ static uint64_t sys_mmap(int_frame_t* frame) {
     }
 
     uint64_t vaddr;
+    vma_t* v = NULL;
     if (flags & 0x10) { /* MAP_FIXED */
         if (addr & 0xFFF) return (uint64_t)(int64_t)ERR_INVAL;
         if (addr < USER_VIRT_START || addr + page_len > USER_VIRT_END)
             return (uint64_t)(int64_t)ERR_INVAL;
-        /* Remove VMA-backed mappings and unmap any direct page mappings */
-        vma_remove(proc, addr, page_len);
+        /* Atomically replace VMAs (remove + add under single vma_lock) */
+        v = vma_replace(proc, addr, page_len, prot, flags, node, offset);
+        if (!v) return (uint64_t)(int64_t)ERR_NOMEM;
+        vaddr = addr;
+        /* Unmap any direct (non-VMA) page mappings */
         for (uint64_t p = addr; p < addr + page_len; p += PAGE_SIZE) {
             page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
             if (pte && (*pte & PAGE_PRESENT)) {
@@ -924,28 +935,34 @@ static uint64_t sys_mmap(int_frame_t* frame) {
                 vmm_unmap_page(proc->cr3, p);
             }
         }
-        vaddr = addr;
     } else {
         vaddr = proc->mmap_brk;
         proc->mmap_brk += page_len;
         if (proc->mmap_brk > 0x7FFF0000) return (uint64_t)(int64_t)ERR_NOMEM;
+        /* Create VMA */
+        v = vma_add(proc, vaddr, vaddr + page_len, prot, flags, node, offset);
+        if (!v) return (uint64_t)(int64_t)ERR_NOMEM;
     }
-
-    /* Create VMA */
-    vma_t* v = vma_add(proc, vaddr, vaddr + page_len, prot, flags, node, offset);
-    if (!v) return (uint64_t)(int64_t)ERR_NOMEM;
 
     if (is_anon) {
         /* Anonymous: allocate pages immediately (existing behavior) */
         uint64_t pgfl = PAGE_USER;
         if (prot & 0x2) pgfl |= PAGE_WRITE;
-        for (uint64_t p = vaddr; p < vaddr + page_len; p += PAGE_SIZE) {
-            page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
-            if (pte && (*pte & PAGE_PRESENT)) continue;
-            uint64_t phys = pmm_alloc_page();
-            if (!phys) return (uint64_t)(int64_t)ERR_NOMEM;
-            kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-            vmm_map_page(proc->cr3, p, phys, pgfl);
+        {
+            cpu_flags_t _ptf_mmap;
+            spinlock_acquire(&proc->pt_lock, &_ptf_mmap);
+            for (uint64_t p = vaddr; p < vaddr + page_len; p += PAGE_SIZE) {
+                page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
+                if (pte && (*pte & PAGE_PRESENT)) continue;
+                uint64_t phys = pmm_alloc_page();
+                if (!phys) {
+                    spinlock_release(&proc->pt_lock, _ptf_mmap);
+                    return (uint64_t)(int64_t)ERR_NOMEM;
+                }
+                kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+                vmm_map_page(proc->cr3, p, phys, pgfl);
+            }
+            spinlock_release(&proc->pt_lock, _ptf_mmap);
         }
     }
     /* File-backed: demand-paged via page fault handler */
@@ -987,15 +1004,20 @@ static uint64_t sys_mprotect(int_frame_t* frame) {
         spinlock_release(&proc->vma_lock, _vf);
     }
 
-    /* Update page table entries */
-    for (uint64_t p = addr; p < end; p += PAGE_SIZE) {
-        page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
-        if (!pte || !(*pte & PAGE_PRESENT)) continue;
-        uint64_t base = *pte & ~0xFFFULL;
-        uint64_t flags = PAGE_USER | PAGE_PRESENT;
-        if (prot & 0x2) flags |= PAGE_WRITE;
-        *pte = base | flags;
-        vmm_flush_tlb_page(p);
+    /* Update page table entries (under pt_lock for SMP safety) */
+    {
+        cpu_flags_t _ptf_mprot;
+        spinlock_acquire(&proc->pt_lock, &_ptf_mprot);
+        for (uint64_t p = addr; p < end; p += PAGE_SIZE) {
+            page_entry_t* pte = vmm_walk_pagetable(proc->cr3, p);
+            if (!pte || !(*pte & PAGE_PRESENT)) continue;
+            uint64_t base = *pte & ~0xFFFULL;
+            uint64_t flags = PAGE_USER | PAGE_PRESENT;
+            if (prot & 0x2) flags |= PAGE_WRITE;
+            *pte = base | flags;
+            vmm_flush_tlb_page(p);
+        }
+        spinlock_release(&proc->pt_lock, _ptf_mprot);
     }
     return 0;
 }

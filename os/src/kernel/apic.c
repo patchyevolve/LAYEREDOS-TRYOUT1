@@ -74,6 +74,17 @@ void apic_write(unsigned reg, uint32_t val) {
     asm volatile("mfence" ::: "memory");
 }
 
+/* Reset APIC state to safe defaults — called early in hal_init() to
+ * clear any stale values that may persist across a warm reset (QEMU
+ * preserves RAM across the reset, so .bss/.data globals retain their
+ * pre-reset values until explicitly reinitialised). */
+void apic_reset(void) {
+    apic_present = 0;
+    apic_x2apic = 0;
+    apic_id = 0;
+    apic_mmio = NULL;
+}
+
 void apic_eoi(void) {
     apic_write(APIC_REG_EOI, 0);
 }

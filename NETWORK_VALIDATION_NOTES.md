@@ -217,9 +217,11 @@
 
 ---
 
-## 3. CURRENT FAILURES
+## 3. CURRENT FAILURES — ALL RESOLVED
 
-### 3.1 UDP echo test: udp_echo.elf produces no output
+> All items in this section were resolved in the 2026-06-11 session. The root cause was `sched_remove_thread()` run queue corruption when called on a thread not currently in the queue. Fix: added guard in `sched_remove_thread()` to return early if thread is not in queue (rq_prev==NULL && rq_next==NULL && q->head != t).
+
+### 3.1 UDP echo test: udp_echo.elf produces no output (RESOLVED)
 
 **Observed behavior:**
 - udp_echo.elf is spawned (pid=5) on the connector QEMU instance.
@@ -298,7 +300,9 @@
 
 ---
 
-## 5. BUG INVESTIGATION: sched_remove_thread run queue corruption
+## 5. BUG INVESTIGATION: sched_remove_thread run queue corruption — ALL RESOLVED
+
+> All bugs in this section were fixed in the 2026-06-11 session and later hardened in the 2026-07-09 full-system audit. See AGENTS.md for details.
 
 ### 5.1 Bug Description
 

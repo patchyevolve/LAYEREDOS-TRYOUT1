@@ -1,3 +1,9 @@
+# Session Resume — Historical Archives
+
+This file documents early session work (2026-06-08 through 2026-06-09). See `AGENTS.md` for the complete chronological record of all subsequent sessions through 2026-07-10.
+
+---
+
 # Session Resume — 2026-06-08
 
 ## What Was Done

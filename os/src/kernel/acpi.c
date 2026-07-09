@@ -20,6 +20,7 @@ int numa_node_count = 0;
 numa_memory_region_t numa_memory_regions[MAX_MEMORY_AFFINITIES];
 int numa_memory_region_count = 0;
 int numa_cpu_to_node[MAX_CPUS];
+uint8_t numa_distance[MAX_NUMA_NODES][MAX_NUMA_NODES];
 
 /* Find RSDP by scanning BIOS memory area */
 static rsdp_t* acpi_find_rsdp(void) {
@@ -341,6 +342,20 @@ int acpi_parse_srat(void) {
                     }
                     break;
                 }
+                case 2: { /* x2APIC Affinity */
+                    srat_x2apic_affinity_t* xa = (srat_x2apic_affinity_t*)entry_ptr;
+                    if (xa->flags & 1) {
+                        uint32_t apic_id = xa->apic_id;
+                        int node = (int)xa->proximity_domain;
+                        for (int c = 0; c < cpu_count; c++) {
+                            if (cpu_info[c].apic_id == apic_id) {
+                                numa_cpu_to_node[c] = node;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
                 case 1: { /* Memory Affinity */
                     srat_memory_affinity_t* ma = (srat_memory_affinity_t*)entry_ptr;
                     if ((ma->flags & 3) == 1) { /* bit 0 = enabled, bit 1 = hotpluggable */
@@ -376,12 +391,119 @@ int acpi_parse_srat(void) {
             }
             kprintf("\n");
 
+            /* Redistribute PMM free pages to per-node lists */
+            pmm_numa_init();
+
             return numa_node_count;
         }
     }
 
     kprintf("[ACPI] SRAT not found — no NUMA topology\n");
     return -1;
+}
+
+int acpi_parse_slit(void) {
+    if (!acpi_available) return -1;
+
+    /* Initialize distance matrix with default values */
+    int max_nodes = (numa_node_count > 0) ? numa_node_count : 1;
+    for (int i = 0; i < MAX_NUMA_NODES; i++)
+        for (int j = 0; j < MAX_NUMA_NODES; j++)
+            numa_distance[i][j] = 0;
+
+    /* If only 1 node, self-distance is 10 */
+    if (max_nodes <= 1) {
+        numa_distance[0][0] = 10;
+        return 0;
+    }
+
+    rsdp_t* rsdp = acpi_find_rsdp();
+    if (!rsdp) return -1;
+
+    uint32_t entry_count;
+    sdt_header_t* root_table;
+    int use_xsdt = 0;
+
+    if (rsdp->revision >= 2 && rsdp->xsdt_addr) {
+        root_table = acpi_map_table(rsdp->xsdt_addr);
+        if (!root_table) return -1;
+        entry_count = (root_table->length - sizeof(sdt_header_t)) / 8;
+        use_xsdt = 1;
+    } else if (rsdp->rsdt_addr) {
+        root_table = acpi_map_table(rsdp->rsdt_addr);
+        if (!root_table) return -1;
+        entry_count = (root_table->length - sizeof(sdt_header_t)) / 4;
+    } else {
+        return -1;
+    }
+
+    if (acpi_checksum(root_table, root_table->length) != 0)
+        return -1;
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint64_t entry_phys;
+        if (use_xsdt) {
+            uint64_t* entries = (uint64_t*)((uintptr_t)root_table + sizeof(sdt_header_t));
+            entry_phys = entries[i];
+        } else {
+            uint32_t* entries = (uint32_t*)((uintptr_t)root_table + sizeof(sdt_header_t));
+            entry_phys = entries[i];
+        }
+
+        sdt_header_t* tbl = acpi_map_table(entry_phys);
+        if (!tbl) continue;
+
+        if (tbl->signature[0] == 'S' && tbl->signature[1] == 'L' &&
+            tbl->signature[2] == 'I' && tbl->signature[3] == 'T') {
+            if (acpi_checksum(tbl, tbl->length) != 0) {
+                kprintf("[ACPI] SLIT checksum failed\n");
+                continue;
+            }
+
+            kprintf("[ACPI] SLIT found: length=%u, revision=%u\n",
+                    tbl->length, (uint32_t)tbl->revision);
+
+            /* SLIT: header + matrix[num_nodes][num_nodes] of uint8_t distances */
+            int nodes_in_slit = max_nodes;
+            uint8_t* matrix = (uint8_t*)((uintptr_t)tbl + sizeof(sdt_header_t));
+            int matrix_size = nodes_in_slit * nodes_in_slit;
+            if ((int)tbl->length < (int)sizeof(sdt_header_t) + matrix_size) {
+                kprintf("[ACPI] SLIT too short: have %u need %u\n",
+                        tbl->length, (uint32_t)(sizeof(sdt_header_t) + matrix_size));
+                continue;
+            }
+
+            for (int row = 0; row < nodes_in_slit && row < MAX_NUMA_NODES; row++)
+                for (int col = 0; col < nodes_in_slit && col < MAX_NUMA_NODES; col++)
+                    numa_distance[row][col] = matrix[row * nodes_in_slit + col];
+
+            kprintf("[ACPI] SLIT:");
+            for (int r = 0; r < nodes_in_slit && r < MAX_NUMA_NODES; r++) {
+                kprintf(" node %d:", r);
+                for (int c = 0; c < nodes_in_slit && c < MAX_NUMA_NODES; c++)
+                    kprintf(" %d", numa_distance[r][c]);
+            }
+            kprintf("\n");
+
+            return 0;
+        }
+    }
+
+    /* SLIT not found: set default distance (10 self, 20 remote) */
+    for (int i = 0; i < max_nodes; i++)
+        for (int j = 0; j < max_nodes; j++)
+            numa_distance[i][j] = (i == j) ? 10 : 20;
+
+    return -1;
+}
+
+int acpi_node_distance(int from, int to) {
+    if (!numa_available)
+        return 10;
+    if (from < 0 || from >= MAX_NUMA_NODES || to < 0 || to >= MAX_NUMA_NODES)
+        return 0;
+    uint8_t d = numa_distance[from][to];
+    return (d != 0) ? (int)d : (from == to) ? 10 : 20;
 }
 
 /* Get the NUMA node for a given CPU index.

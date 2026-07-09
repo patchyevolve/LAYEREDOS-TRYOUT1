@@ -99,7 +99,9 @@ KERNEL_C_SRCS += $(SRC_DIR)/kernel/security_test.c
 endif
 KERNEL_S_SRCS = $(filter-out \
                     $(SRC_DIR)/boot/user_program.S \
-                    $(SRC_DIR)/boot/cat_program.S, \
+                    $(SRC_DIR)/boot/cat_program.S \
+                    $(SRC_DIR)/boot/minimal_test.S \
+                    $(SRC_DIR)/boot/exit_only.S, \
                     $(wildcard $(SRC_DIR)/boot/*.S)) \
                 $(wildcard $(SRC_DIR)/kernel/*.S)
 
@@ -108,7 +110,7 @@ KERNEL_S_OBJS = $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(KERNEL_S_SRCS))
 KERNEL_OBJS   = $(KERNEL_C_OBJS) $(KERNEL_S_OBJS)
 
 # ---- User ELF binaries (embedded as .rodata in kernel) ----
-USER_PROGRAMS   = user_program cat_program hello-c hello-dyn tcp_echo-c udp_echo-c exit_only thread_test-c https_get-c netns_mini-c
+USER_PROGRAMS   = user_program cat_program hello-c hello-dyn tcp_echo-c udp_echo-c exit_only thread_test-c https_get-c netns_mini-c minimal_test
 USER_ELF_BINS   = $(addprefix $(BUILD_DIR)/, $(addsuffix .elf, $(USER_PROGRAMS)))
 USER_EMBEDDED   = $(addsuffix _embedded.o, $(basename $(USER_ELF_BINS)))
 DYNSO_BINS      = $(BUILD_DIR)/ld.so $(BUILD_DIR)/lib/ldso/libdyn.so
@@ -442,7 +444,7 @@ test-kernel:
 	@timeout 120 $(QEMU) -kernel $(KERNEL_ELF) -nographic \
 		-m 512M -no-reboot -no-shutdown \
 		-nic none -device e1000 > /tmp/qemu_test_kernel.txt 2>&1 || true
-	@grep -a 'kmalloc_free\|kmalloc_edge\|vma_add_find\|tcp_conn_create\|tcp_conn_bind_listen\|socket_lifecycle\|spinlock_acquire\|tcp_retransmission\|mutex_lock\|udp_endpoint_multi\|block_cache_eviction\|rwlock_basic\|seqlock_basic\|lockdep_ordering\|ata_concurrent\|kmag_concurrent\|ap_timer\|watchdog_lockup\|Results:' /tmp/qemu_test_kernel.txt || true
+	@grep -a 'kmalloc_free\|kmalloc_edge\|vma_add_find\|tcp_conn_create\|tcp_conn_bind_listen\|socket_lifecycle\|spinlock_acquire\|tcp_retransmission\|mutex_lock\|udp_endpoint_multi\|block_cache_eviction\|rwlock_basic\|seqlock_basic\|lockdep_ordering\|ata_concurrent\|kmag_concurrent\|ap_timer\|watchdog_lockup\|sched_steal\|sched_balance_push\|sched_affinity_pin\|Results:' /tmp/qemu_test_kernel.txt || true
 
 test-sfs:
 	$(MAKE) clean >/dev/null 2>&1

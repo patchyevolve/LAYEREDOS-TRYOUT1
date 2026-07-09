@@ -272,14 +272,7 @@ socket_t* unix_sock_accept(socket_t* s, sockaddr_t* addr, socklen_t* len) {
                 }
             }
 
-            /* Register the client socket in the caller's fd table */
-            int fd = sock_register(client);
-            if (fd < 0) {
-                socket_release(client);
-                return NULL;
-            }
-
-            /* Return a new socket_t* for the wrapper; the fd lookup sees client */
+            /* Return the client socket; sys_accept() registers it in the fd table */
             return client;
         }
         if (s->nonblock) { spinlock_release(&lst->lock, _lflags); return NULL; }

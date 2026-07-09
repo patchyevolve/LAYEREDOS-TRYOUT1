@@ -140,6 +140,15 @@ typedef struct __attribute__((packed)) {
     uint32_t flags;  /* bit 0 = enabled */
 } srat_lapic_affinity_t;
 
+/* SRAT - x2APIC Affinity (type 2) */
+typedef struct __attribute__((packed)) {
+    madt_entry_header_t hdr;
+    uint16_t reserved;
+    uint32_t proximity_domain;
+    uint32_t apic_id;
+    uint32_t flags;  /* bit 0 = enabled */
+} srat_x2apic_affinity_t;
+
 /* Parsed memory region — maps a physical range to a NUMA node */
 typedef struct {
     uint64_t base;
@@ -153,9 +162,15 @@ extern int numa_node_count;
 extern numa_memory_region_t numa_memory_regions[MAX_MEMORY_AFFINITIES];
 extern int numa_memory_region_count;
 extern int numa_cpu_to_node[MAX_CPUS];
+extern uint8_t numa_distance[MAX_NUMA_NODES][MAX_NUMA_NODES];
 
 int acpi_parse_srat(void);
+int acpi_parse_slit(void);
 int acpi_get_cpu_node(int cpu_idx);
+
+/* Get NUMA distance (0=undefined, 10=self, larger=farther).
+ * Returns 10 for local, or the SLIT value if available. */
+int acpi_node_distance(int from, int to);
 
 /* Check if a physical page at page_idx belongs to the given NUMA node.
  * Returns 1 if yes, 0 if no or if NUMA is not available. */

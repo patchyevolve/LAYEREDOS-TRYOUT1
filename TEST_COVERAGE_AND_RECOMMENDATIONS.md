@@ -1,7 +1,7 @@
 # 🧪 Comprehensive Testing Analysis & Recommendations
 **OPERtur/TRY1 - OS/Kernel Implementation**  
-**Date:** June 13, 2026  
-**Status:** Complete test audit with suggestions
+**Date:** June 13, 2026 *(last updated 2026-07-10 — test count audit)*  
+**Status:** Historical reference — codebase has significantly evolved since this audit
 
 ---
 
@@ -17,7 +17,17 @@ The codebase contains **~14 existing unit tests** organized into 3 test suites, 
 
 ---
 
-## 📊 Current Test Coverage
+## 📊 Current Test Coverage *(as of 2026-07-10: 81 total tests)*
+
+> **Note:** This document was written on 2026-06-13 when 25 tests existed. The test count has since grown to **81 tests** across 6 suites:
+> - **5** network tests (`net_test.c`)
+> - **10** storage tests (`storage_test.c`)
+> - **37** kernel tests (`kernel_test.c`) — added SMP, NUMA, rwlock, seqlock, lockdep, concurrent alloc, panic recovery, CPU hotplug, RCU, watchdog, scheduler balance/steal/affinity, PMM concurrent, ATA concurrent
+> - **6** SFS tests (`sfs_test.c`)
+> - **4** process tests (`process_test.c`)
+> - **19** security tests (`security_test.c`)
+>
+> All 81 pass in a single `make test-all` build. See `AGENTS.md` for full history.
 
 ### Existing Test Suites
 
@@ -542,8 +552,9 @@ teardown: Free all resources, reset state
 
 ---
 
-**Report Completed:** June 13, 2026  
-**Total Tests Existing:** 25  
-**Tests Recommended:** 50+  
+**Report Completed:** June 13, 2026 *(historical — see AGENTS.md for current state)*  
+**Total Tests Existing (Jun 13):** 25  
+**Total Tests Existing (Jul 10):** 81  
+**Tests Recommended:** 50+ (many now implemented)  
 **Critical Gap Priority:** Memory Safety, Concurrency, Error Paths
 

@@ -283,8 +283,19 @@ static void kdump_stack(void) {
     __asm__ volatile ("mov %%rbp, %0" : "=r"(rbp));
     int depth = 0;
     while (rbp && depth < 32) {
+        /* Validate frame pointer before dereferencing:
+         * must be in kernel virtual address space and 8-byte aligned */
+        if ((uint64_t)rbp < 0xFFFFFFFFC0000000ULL ||
+            ((uint64_t)rbp) & 7) {
+            kprintf("  [%d] <corrupted frame pointer %p>\n", depth, (void*)rbp);
+            break;
+        }
         uint64_t rip = rbp[1];
-        kprintf("  [%d] %p\n", depth, (void*)rip);
+        /* Filter obvious garbage: return address should be in kernel space */
+        if (rip >= 0xFFFFFFFFC0000000ULL && rip < 0xFFFFFFFFE0000000ULL)
+            kprintf("  [%d] %p\n", depth, (void*)rip);
+        else
+            kprintf("  [%d] %p (spurious)\n", depth, (void*)rip);
         rbp = (uint64_t*)rbp[0];
         depth++;
     }
@@ -297,6 +308,13 @@ extern void emergency_sync(void) __attribute__((weak));
 extern void panic_reboot(void) __attribute__((weak));
 
 void kpanic(const char* msg, ...) {
+    /* Re-entrancy guard: if we fault while panicking, just halt */
+    static volatile int panicking = 0;
+    if (__sync_lock_test_and_set(&panicking, 1)) {
+        (void)msg;
+        for (;;) { asm volatile("cli; hlt"); }
+    }
+
     __builtin_va_list ap;
     __builtin_va_start(ap, msg);
     kprintf("\n====== KERNEL PANIC ======\n");

@@ -51,6 +51,7 @@ typedef struct {
     volatile int need_reschedule;
     volatile uint64_t idle_wake_hint;
     int         cpu_id;
+    int         node_id;         /* NUMA node for this CPU (-1 if unknown) */
     uint64_t    cpu_khz;         /* calibrated APIC frequency */
     uint64_t    irq_count;
     uint64_t    context_switches;
@@ -70,6 +71,12 @@ typedef struct {
     uint8_t ist_stack0[8192] __attribute__((aligned(16)));  /* IST1: #DF */
     uint8_t ist_stack1[8192] __attribute__((aligned(16)));  /* IST2: #PF */
     uint8_t user_stack0[16384] __attribute__((aligned(16)));
+
+    /* Thread being retired on this CPU — set by thread_exit() before
+     * switch_context, cleared by sched_finalize_retiring() after
+     * switch_context returns.  Prevents sched_reap_zombies() from
+     * freeing the stack while the exiting CPU is still using it. */
+    volatile uint64_t retiring_thread;   /* kernel-virtual addr of thread_t */
 
     /* Per-CPU PMM cache (atomic flag avoids sync.h include) */
     volatile uint64_t pmm_cache_lock;    /* 0 = free, 1 = held */
