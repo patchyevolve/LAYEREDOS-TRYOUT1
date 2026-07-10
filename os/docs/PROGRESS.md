@@ -204,7 +204,7 @@ Legend: ✅ Implemented | 🟡 Partial | ❌ Not implemented
 - ✅ NUMA-aware memory allocation (per-node free lists, fallback chain: local → nearest → any → steal → OOM)
 
 ## Service layer and IPC
-- ❌ Shared memory between processes (no MAP_SHARED)
+- 🟡 Shared memory between processes (file-backed MAP_SHARED works with write-back on munmap; anonymous MAP_SHARED between processes not implemented)
 - ❌ Message queues (no POSIX or custom message queue)
 - ❌ Event queues (no epoll/kqueue-style multiplexing)
 - ❌ Kernel event bus exposed to userspace

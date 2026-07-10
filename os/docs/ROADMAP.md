@@ -265,7 +265,7 @@
 ### Security Hardening
 
 - 🟡 **ASLR** — PIE binaries load at random base (0x40000000-0x60000000 using RDTSC); stack base randomized. Fixed-address EXEC binaries use deterministic addresses.
-- ✅ **Secure boot** — Build-time SHA-256 hash whitelist of all embedded ELF binaries (10 known hashes). On exec, binary content is hashed and checked against whitelist; unknown binaries rejected with ERR_PERM. Default enabled; can be disabled via syscall. `secure_boot` syscall (67) for enable/disable/query.
+- ✅ **Secure boot** — Build-time SHA-256 hash whitelist of all embedded ELF binaries (13 known hashes: 11 user programs + ld.so + libdyn.so). On exec, binary content is hashed and checked against whitelist; unknown binaries rejected with ERR_PERM. Default enabled; can be disabled via syscall. `secure_boot` syscall (67) for enable/disable/query.
 - ✅ **setuid on exec** — `sys_execve` stats the ELF and sets `proc->euid` to file owner if `S_ISUID` is set (unless `no_new_privs` is active).
 
 ### Existing Security
@@ -273,7 +273,7 @@
 - ✅ **Kernel/user isolation** — CPL3 user-mode cannot access CPL0 kernel pages; SMAP/SMEP enabled where the CPU supports them.
 - ✅ **Read-only kernel text** — Kernel `.text` section mapped with write-protect bit; accidental overwrites of code produce a page-fault panic.
 - ✅ **NX memory** — All data pages (heap, stack, user data) marked NX; execution from data regions triggers a protection fault.
-- ✅ **Basic signals** — SIGKILL and SIGSEGV are delivered correctly; broader signal infrastructure is still under construction.
+- ✅ **Signal delivery** — SIGTERM/SIGKILL/SIGSTOP/SIGCONT/SIGTSTP/SIGCHLD/SIGINT/SIGQUIT/SIGTTIN/SIGTTOU defined and delivered via sys_kill/sys_sigaction/signal_send; default actions (term/stop/cont/ignore/coredump); custom handler delivery via sigframe_t on user stack; signal delivery via TTY work queue. Broader signal infrastructure (sigmask, sigsuspend, sigaltstack, RT signals) still under construction.
 
 ### Cryptography
 
@@ -321,7 +321,7 @@
 - `os/src/include/unistd.h` — uid/gid getter decls, getrandom, set_syscall_filter, socketpair, prctl, ucred_t
 - `os/src/lib/libuser/unistd.c` — Userspace wrappers for all 11 new syscalls
 - `os/src/include/test_framework.h` — ASSERT_FALSE, ASSERT_NE macros
-- `os/src/kernel/security_test.c` — 18 tests total: cap, fork_limit, audit, uid/gid, DAC, syscall_filter, sha256, getrandom, socketpair, no_new_privs, secure_boot
+- `os/src/kernel/security_test.c` — 19 tests total: bad_fd, null_buf, user_ptr, file_perm, mem_isolation, canary, vfs_mode, cap, fork_limit, audit, uid/gid, DAC, syscall_filter, sha256, getrandom, unix_buf_direct, socketpair, no_new_privs, secure_boot
 - `os/src/kernel/process.c` — secure_boot_check in process_exec
 - `os/src/kernel/main.c` — secure_boot_init call
 - `os/Makefile` — secure boot hash generation target; include path update
@@ -1363,15 +1363,15 @@ software packages.
 
 ### Exit Criteria
 
-- [x] **8.1:** Two processes share memory via `shmget`/`shmat`; message queue
+- [ ] **8.1:** Two processes share memory via `shmget`/`shmat`; message queue
   round-trip works; eventfd triggers POLLIN; epoll monitors 10 fds
   simultaneously.
-- [x] **8.2:** `cat /proc/meminfo` returns valid numbers; `ls /sys/class/net`
+- [ ] **8.2:** `cat /proc/meminfo` returns valid numbers; `ls /sys/class/net`
   shows network interfaces.
-- [x] **8.3:** `init` reads `/etc/init.conf`, starts 3 services, restarts
+- [ ] **8.3:** `init` reads `/etc/init.conf`, starts 3 services, restarts
   a crashed one, and shuts down cleanly on SIGTERM.
-- [x] **8.4:** Kernel event bus delivers `EVENT_PROCESS_EXIT` to a subscriber.
-- [x] **8.5:** `pkg install foo.pkg` extracts files, updates index;
+- [ ] **8.4:** Kernel event bus delivers `EVENT_PROCESS_EXIT` to a subscriber.
+- [ ] **8.5:** `pkg install foo.pkg` extracts files, updates index;
   `pkg remove foo` removes them.
 - [ ] All components are self-tested via in-kernel or userspace tests.
 - [ ] System boots with `init` as PID 1; shell is a service.
