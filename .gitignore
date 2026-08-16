@@ -5,3 +5,4 @@ os/build/
 os/*.log
 auditofpmmvmmsched.txt
 os/src/boot/minimal_test.S
+os/iso/

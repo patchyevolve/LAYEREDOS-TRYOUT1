@@ -72,6 +72,11 @@ typedef struct {
     uint8_t ist_stack1[8192] __attribute__((aligned(16)));  /* IST2: #PF */
     uint8_t user_stack0[16384] __attribute__((aligned(16)));
 
+    /* RDTSC-based periodic check timestamps (per-CPU to avoid shared
+     * static variable races on TCG where vCPUs can interleave). */
+    uint64_t last_check_rdtsc;
+    uint64_t last_balance_rdtsc;
+
     /* Thread being retired on this CPU — set by thread_exit() before
      * switch_context, cleared by sched_finalize_retiring() after
      * switch_context returns.  Prevents sched_reap_zombies() from

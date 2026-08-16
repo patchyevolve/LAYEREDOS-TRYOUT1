@@ -30,7 +30,6 @@ err_t hal_timer_init(uint32_t hz);
 uint64_t hal_timer_get_ticks(void);
 uint64_t hal_timer_get_ns(void);
 uint32_t hal_timer_get_hz(void);
-
 char hal_uart_getchar(void);
 int  hal_uart_data_available(void);
 err_t hal_uart_rx_init(void);
@@ -45,6 +44,7 @@ int hal_smap_enabled(void);
 int hal_is_qemu_tcg(void);
 int hal_is_qemu(void);
 void hal_init_cpu_gdt_tss(int cpu);
+void hal_switch_stack(uint64_t new_rsp);
 
 extern uint64_t isr_vectors[256];
 
