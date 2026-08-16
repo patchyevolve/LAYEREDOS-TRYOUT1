@@ -326,17 +326,12 @@ static int test_journal_log_commit(void) {
     /* Read back replayed block */
     test_bdev.read(&test_bdev, 200, 1, actual);
 
-    /* Journal data entries store 496 bytes (BLOCK_SIZE - 16 for headers/checksum).
-     * Verify the restored portion matches, and trailing bytes remain zero. */
-    if (kmemcmp(actual, ref, 496) != 0) {
-        kprintf("[TEST] journal_log_commit: FAIL — data mismatch (first 496 bytes)\n");
+    /* DATA entries carry a full 512-byte block copy (descriptor slot +
+     * raw data slot), so recovery must restore every byte — including
+     * the tail 16 bytes that a 496-byte payload would have missed. */
+    if (kmemcmp(actual, ref, BLOCK_SIZE) != 0) {
+        kprintf("[TEST] journal_log_commit: FAIL — data mismatch (full block)\n");
         return TEST_FAIL;
-    }
-    for (int i = 496; i < BLOCK_SIZE; i++) {
-        if (actual[i] != 0) {
-            kprintf("[TEST] journal_log_commit: FAIL — trailing byte %d not zero\n", i);
-            return TEST_FAIL;
-        }
     }
 
     kprintf("[TEST] journal_log_commit: PASS\n");
@@ -375,16 +370,13 @@ static int test_journal_multi_txn(void) {
     e = journal_recover(&test_bdev, 0, &was_dirty);
     if (e != ERR_OK || was_dirty != 1) return TEST_FAIL;
 
-    /* Verify each block was replayed correctly */
+    /* Verify each block was replayed correctly (full 512 bytes) */
     for (int txn = 0; txn < 3; txn++) {
         kmemset(actual, 0, BLOCK_SIZE);
         test_bdev.read(&test_bdev, 100 + txn, 1, actual);
         uint8_t expected = (uint8_t)(txn + 1);
-        for (int i = 0; i < 496; i++) {
+        for (int i = 0; i < BLOCK_SIZE; i++) {
             if (actual[i] != expected) return TEST_FAIL;
-        }
-        for (int i = 496; i < BLOCK_SIZE; i++) {
-            if (actual[i] != 0) return TEST_FAIL;
         }
     }
 
@@ -404,10 +396,11 @@ static int test_journal_full(void) {
     if (e != ERR_OK) return TEST_FAIL;
 
     /* Fill journal with as many transactions as possible.
-     * Each txn uses 2 entry slots (DATA + COMMIT). JENT_COUNT=255,
-     * so we can fit 127 full transactions before COMMIT has no space. */
+     * Each txn uses 3 entry slots (DATA descriptor + DATA block + COMMIT).
+     * JENT_COUNT=255, so we can fit 84 full transactions before COMMIT
+     * has no space. */
     int txn_count = 0;
-    while (txn_count < 130) {
+    while (txn_count < 90) {
         uint32_t seq;
         e = journal_start_txn(&test_bdev, 0, &seq);
         if (e != ERR_OK) break;
@@ -450,11 +443,96 @@ static int test_journal_full(void) {
     if (e != ERR_OK || was_dirty != 1) return TEST_FAIL;
 
     test_bdev.read(&test_bdev, 200, 1, actual);
-    for (int i = 0; i < 496; i++) {
+    for (int i = 0; i < BLOCK_SIZE; i++) {
         if (actual[i] != 0xAA) return TEST_FAIL;
     }
 
     kprintf("[TEST] journal_full: PASS (%d txns before checkpoint)\n", txn_count);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * Test 11: Journal checkpoint replays committed data
+ *
+ * Regression test for the crash-consistency gap: journal_checkpoint()
+ * used to advance the JSB head past committed entries WITHOUT copying
+ * their data to the final blocks, so a crash after checkpoint lost
+ * committed metadata that only existed in the journal (or the write-back
+ * cache). Checkpoint must replay the full 512-byte copies to their
+ * target blocks and flush them before freeing journal space.
+ * ============================================================ */
+static int test_journal_checkpoint_replay(void) {
+    uint8_t ref[BLOCK_SIZE];
+    uint8_t actual[BLOCK_SIZE];
+
+    block_sync_dev(&test_bdev);
+    err_t e = journal_init(&test_bdev, 0);
+    if (e != ERR_OK) return TEST_FAIL;
+
+    uint32_t seq;
+    e = journal_start_txn(&test_bdev, 0, &seq);
+    if (e != ERR_OK) return TEST_FAIL;
+
+    /* Distinctive tail bytes (last 16) to prove the full block is
+     * carried through checkpoint, not just the first 496 bytes */
+    for (int i = 0; i < BLOCK_SIZE; i++) ref[i] = (uint8_t)(i ^ 0x5A);
+
+    e = journal_log(&test_bdev, 0, seq, 250, ref);
+    if (e != ERR_OK) return TEST_FAIL;
+    e = journal_log(&test_bdev, 0, seq, 251, ref);
+    if (e != ERR_OK) return TEST_FAIL;
+    e = journal_commit(&test_bdev, 0, seq);
+    if (e != ERR_OK) return TEST_FAIL;
+
+    /* Scrub the target blocks on disk — only the journal holds the data */
+    kmemset(actual, 0, BLOCK_SIZE);
+    test_bdev.write(&test_bdev, 250, 1, actual);
+    test_bdev.write(&test_bdev, 251, 1, actual);
+
+    /* Checkpoint must replay both committed entries to their targets */
+    e = journal_checkpoint(&test_bdev, 0);
+    if (e != ERR_OK) {
+        kprintf("[TEST] journal_checkpoint_replay: FAIL — checkpoint returned %d\n", e);
+        return TEST_FAIL;
+    }
+
+    test_bdev.read(&test_bdev, 250, 1, actual);
+    if (kmemcmp(actual, ref, BLOCK_SIZE) != 0) {
+        kprintf("[TEST] journal_checkpoint_replay: FAIL — block 250 not replayed\n");
+        return TEST_FAIL;
+    }
+    test_bdev.read(&test_bdev, 251, 1, actual);
+    if (kmemcmp(actual, ref, BLOCK_SIZE) != 0) {
+        kprintf("[TEST] journal_checkpoint_replay: FAIL — block 251 not replayed\n");
+        return TEST_FAIL;
+    }
+
+    /* Journal must be empty after checkpoint: recovery finds nothing */
+    int was_dirty = -1;
+    e = journal_recover(&test_bdev, 0, &was_dirty);
+    if (e != ERR_OK || was_dirty != 0) {
+        kprintf("[TEST] journal_checkpoint_replay: FAIL — journal not emptied\n");
+        return TEST_FAIL;
+    }
+
+    /* Space reclaimed: a fresh transaction must work after checkpoint */
+    e = journal_start_txn(&test_bdev, 0, &seq);
+    if (e != ERR_OK) return TEST_FAIL;
+    e = journal_log(&test_bdev, 0, seq, 249, ref);
+    if (e != ERR_OK) return TEST_FAIL;
+    e = journal_commit(&test_bdev, 0, seq);
+    if (e != ERR_OK) return TEST_FAIL;
+    kmemset(actual, 0, BLOCK_SIZE);
+    test_bdev.write(&test_bdev, 249, 1, actual);
+    e = journal_recover(&test_bdev, 0, &was_dirty);
+    if (e != ERR_OK || was_dirty != 1) return TEST_FAIL;
+    test_bdev.read(&test_bdev, 249, 1, actual);
+    if (kmemcmp(actual, ref, BLOCK_SIZE) != 0) {
+        kprintf("[TEST] journal_checkpoint_replay: FAIL — post-checkpoint txn lost\n");
+        return TEST_FAIL;
+    }
+
+    kprintf("[TEST] journal_checkpoint_replay: PASS\n");
     return TEST_PASS;
 }
 
@@ -536,6 +614,7 @@ void storage_self_test(void) {
     if (test_journal_log_commit() == TEST_PASS) pass++; else fail++;
     if (test_journal_multi_txn() == TEST_PASS) pass++; else fail++;
     if (test_journal_full() == TEST_PASS) pass++; else fail++;
+    if (test_journal_checkpoint_replay() == TEST_PASS) pass++; else fail++;
     if (test_snapshot_take_info() == TEST_PASS) pass++; else fail++;
 
     kprintf("[TEST] === Results: %d pass, %d fail ===\n", pass, fail);

@@ -12,11 +12,15 @@ typedef struct __attribute__((packed)) {
     uint32_t checksum;
 } jsb_t;
 
+/* DATA entry descriptor. The full 512-byte copy of the target block is
+ * stored in the raw slot immediately following this descriptor, so a DATA
+ * entry consumes 2 journal slots. This journals the complete block (the old
+ * in-entry data[496] payload silently dropped the last 16 bytes). */
 typedef struct __attribute__((packed)) {
     uint32_t type;
     uint32_t seq;
     uint32_t block;
-    uint8_t  data[496];
+    uint8_t  pad[496];
     uint32_t checksum;
 } jent_data_t;
 
@@ -117,6 +121,12 @@ err_t journal_recover(block_dev_t* bdev, uint32_t start, int* was_dirty) {
             continue;
         }
 
+        if (type == JENT_DATA) {
+            /* DATA entries span 2 slots (descriptor + raw block copy) */
+            i = jent_next(jent_next(i));
+            continue;
+        }
+
         if (type == JENT_COMMIT) {
             int scan = (int)jsb.head;
             while (scan != i) {
@@ -124,13 +134,14 @@ err_t journal_recover(block_dev_t* bdev, uint32_t start, int* was_dirty) {
                 bdev->read(bdev, JENT_BLOCK(start, scan), 1, sbuf);
                 jent_data_t* sde = (jent_data_t*)sbuf;
                 if (sde->type == JENT_DATA && sde->seq == seq) {
-                    uint8_t block_buf[BLOCK_SIZE];
-                    bdev->read(bdev, sde->block, 1, block_buf);
-                    kmemcpy(block_buf, sde->data, sizeof(sde->data));
-                    bdev->write(bdev, sde->block, 1, block_buf);
+                    uint8_t dblk[BLOCK_SIZE];
+                    bdev->read(bdev, JENT_BLOCK(start, jent_next(scan)), 1, dblk);
+                    bdev->write(bdev, sde->block, 1, dblk);
                     recovered++;
+                    scan = jent_next(jent_next(scan));
+                } else {
+                    scan = jent_next(scan);
                 }
-                scan = jent_next(scan);
             }
         }
         i = jent_next(i);
@@ -164,25 +175,30 @@ err_t journal_log(block_dev_t* bdev, uint32_t start, uint32_t seq, uint32_t bloc
     err_t e = bdev->read(bdev, JSB_BLOCK(start), 1, &jsb);
     if (e) return e;
 
-    if (jspace(&jsb) < 2) return ERR_NOSPACE;
+    /* A DATA entry uses 2 slots (descriptor + full block copy); the
+       COMMIT entry that follows this txn needs 1 more. */
+    if (jspace(&jsb) < 3) return ERR_NOSPACE;
 
     jent_data_t de;
+    kmemset(&de, 0, sizeof(de));
     de.type = JENT_DATA;
     de.seq = seq;
     de.block = block;
-    kmemset(de.data, 0, sizeof(de.data));
-    kmemcpy(de.data, data, sizeof(de.data));
     de.checksum = 0;
     de.checksum = journal_checksum((const uint32_t*)&de, JENT_DATA_WORDS);
 
     int slot = (int)jsb.tail;
     e = bdev->write(bdev, JENT_BLOCK(start, slot), 1, &de);
     if (e) return e;
+    /* Raw copy of the full target block in the next slot */
+    e = bdev->write(bdev, JENT_BLOCK(start, jent_next(slot)), 1, data);
+    if (e) return e;
 
-    /* Barrier: flush journal entry to storage before updating JSB */
+    /* Barrier: flush both journal entry slots before updating JSB */
     block_flush(bdev, JENT_BLOCK(start, slot), 1);
+    block_flush(bdev, JENT_BLOCK(start, jent_next(slot)), 1);
 
-    jsb.tail = (uint32_t)jent_next((int)jsb.tail);
+    jsb.tail = (uint32_t)jent_next(jent_next((int)jsb.tail));
     jsb.checksum = 0;
     jsb.checksum = journal_checksum((const uint32_t*)&jsb, JSB_WORDS);
     e = bdev->write(bdev, JSB_BLOCK(start), 1, &jsb);
@@ -226,9 +242,11 @@ err_t journal_checkpoint(block_dev_t* bdev, uint32_t start) {
 
     if (jsb.head == jsb.tail) return ERR_OK;
 
+    /* Pass 1: find the slot after the last COMMIT entry.
+     * DATA entries span 2 slots — never parse the raw data slot
+     * as an entry (its bytes could alias any type value). */
     uint32_t scan = jsb.head;
     uint32_t last_commit = jsb.head;
-
     while (scan != jsb.tail) {
         uint8_t buf[BLOCK_SIZE];
         e = bdev->read(bdev, JENT_BLOCK(start, scan), 1, buf);
@@ -237,14 +255,41 @@ err_t journal_checkpoint(block_dev_t* bdev, uint32_t start) {
         if (hdr[0] == JENT_COMMIT) {
             last_commit = (uint32_t)jent_next((int)scan);
         }
-        scan = (uint32_t)jent_next((int)scan);
+        if (hdr[0] == JENT_DATA)
+            scan = (uint32_t)jent_next(jent_next((int)scan));
+        else
+            scan = (uint32_t)jent_next((int)scan);
     }
 
-    if (last_commit != jsb.head) {
-        jsb.head = last_commit;
-        jsb.checksum = 0;
-        jsb.checksum = journal_checksum((const uint32_t*)&jsb, JSB_WORDS);
-        bdev->write(bdev, JSB_BLOCK(start), 1, &jsb);
+    if (last_commit == jsb.head) return ERR_OK;
+
+    /* Pass 2: replay every committed data entry to its final block
+     * (full 512-byte copy from the raw slot) and force it to storage
+     * BEFORE dropping the journal entry. Only advance head once the
+     * replay is complete, so a crash mid-checkpoint leaves the journal
+     * intact for recovery. */
+    scan = jsb.head;
+    while (scan != last_commit) {
+        uint8_t buf[BLOCK_SIZE];
+        e = bdev->read(bdev, JENT_BLOCK(start, scan), 1, buf);
+        if (e) return e;
+        uint32_t* hdr = (uint32_t*)buf;
+        if (hdr[0] == JENT_DATA) {
+            uint8_t dblk[BLOCK_SIZE];
+            jent_data_t* de = (jent_data_t*)buf;
+            e = bdev->read(bdev, JENT_BLOCK(start, jent_next((int)scan)), 1, dblk);
+            if (e) return e;
+            e = bdev->write(bdev, de->block, 1, dblk);
+            if (e) return e;
+            block_flush(bdev, de->block, 1);
+            scan = (uint32_t)jent_next(jent_next((int)scan));
+        } else {
+            scan = (uint32_t)jent_next((int)scan);
+        }
     }
-    return ERR_OK;
+
+    jsb.head = last_commit;
+    jsb.checksum = 0;
+    jsb.checksum = journal_checksum((const uint32_t*)&jsb, JSB_WORDS);
+    return bdev->write(bdev, JSB_BLOCK(start), 1, &jsb);
 }
