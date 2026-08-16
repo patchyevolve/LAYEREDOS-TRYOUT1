@@ -232,6 +232,14 @@ $(KERNEL_ELF): $(LINK_OBJS) linker.ld
 	$(POST_LD)
 	@$(SIZE) $@
 
+# Build-time SFS root filesystem image
+ROOT_SFS = $(BUILD_DIR)/root.sfs
+
+$(ROOT_SFS): $(SECURE_BOOT_ELFS) tools/mksfs.py
+	@echo "[SFS] Building root filesystem image..."
+	@python3 tools/mksfs.py
+	@echo "[SFS] Root filesystem: $(ROOT_SFS)"
+
 # ============================================================
 # Convenience targets
 # ============================================================
@@ -472,6 +480,24 @@ test-security:
 		-m 512M -no-reboot -no-shutdown \
 		-nic none -device e1000 > /tmp/qemu_test_security.txt 2>&1 || true
 	@grep -a 'syscall_bad_fd\|syscall_null_buf\|user_ptr_checks\|file_permissions\|process_memory_isolation\|stack_canary\|vfs_fd_mode_enforcement\|Results:' /tmp/qemu_test_security.txt || true
+
+ISO_DIR = iso
+
+rootfs: $(ROOT_SFS)
+
+iso: $(KERNEL_ELF)
+	@mkdir -p $(ISO_DIR)/boot/grub
+	cp $(KERNEL_ELF) $(ISO_DIR)/boot/kernel.elf
+	cp boot/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	@if command -v grub-mkrescue >/dev/null 2>&1; then \
+		grub-mkrescue -o opertur.iso $(ISO_DIR) && \
+		rm -rf $(ISO_DIR) && \
+		echo "[ISO] Created opertur.iso"; \
+	else \
+		echo "[ISO] grub-mkrescue not found."; \
+		echo "  Run: sudo apt install grub-pc-bin xorriso"; \
+		echo "  Then: grub-mkrescue -o opertur.iso $(ISO_DIR)"; \
+	fi
 
 test-all:
 	$(MAKE) clean >/dev/null 2>&1
