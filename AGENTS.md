@@ -4,8 +4,8 @@
 ```
 make -C os clean && make -C os -j4          # debug build
 make -C os release                           # release build (stripped, -Os)
-make -C os test-net                          # run 5 regression tests (~120s)
-make -C os test-all                          # all 81 tests (~180s)
+make -C os test-net                          # run 6 regression tests (~120s)
+make -C os test-all                          # all 89 tests (~180s)
 make -C os test-security                     # run 19 security tests (~120s)
 ```
 
@@ -16,10 +16,88 @@ make -C os test-security                     # run 19 security tests (~120s)
 4. **If the system boots and all tests pass, the change is done.** No follow-up changes without explicit instruction.
 5. **SMP production gaps** (below) are the priority queue. Work them in order, one at a time.
 
+## Pre-Change Checklist — READ BEFORE ANY KERNEL EDIT
+Before modifying any `.c`/`.h` file, the AI MUST:
+1. **Read `DEPENDENCIES.md`** for every module touched — check imports, exports, shared state, lock ordering
+2. **Read `INVARIANTS.md`** — verify the change violates none of the listed invariants
+3. **Check lock ordering**: If introducing a new lock acquisition, validate it against all documented orderings. Run with `ENABLE_LOCKDEP=1` if possible.
+4. **Check stack size**: Any new stack allocation must be < 8 KB. If > 8 KB, heap-allocate or use static.
+5. **Check per-CPU state**: Any per-CPU timestamp/flag/counter must be in `per_cpu_data_t`, not a shared static.
+6. **Check APIC state**: On TCG, x2APIC is disabled. All APIC access goes through MMIO. `apic_mmio` must be mapped. `apic_write()` is a no-op without it.
+
+## Post-Change Verification
+After any change (before declaring done):
+1. **Build debug**: `make -j4` — must compile cleanly
+2. **Build release**: `make release` — must compile cleanly
+3. **Run test-all**: `make test-all` — all tests pass
+4. **Invariant checks**: Enabled by default in debug builds. Any `[INVARIANT]` panic in the output is a regression.
+5. **SMP multi-CPU test**: If the change touches scheduler, PMM, memory, or APIC code, verify on KVM 2-CPU + KVM 4-CPU + TCG 2-CPU + TCG 4-CPU.
+
 ## Goal
 - Close SMP production gaps one at a time, in order, with a test for each.
 
 ## Progress
+### Done (this session, 2026-08-17) — Bare-metal Phase 3.4: MSI/MSI-X (q35-validated, KVM + TCG)
+- **PCI capability layer** (`pci.c`/`pci.h`): `pci_find_cap()` (config capability-chain walk), `pci_msix_probe()` (MSI-X table BAR/offset/size validation), `pci_msix_enable()` (programs all table entries addr=`0xFEE00000|apic_id<<12`, data=0x48, unmasked; sets msgctl enable bit 15, clears function mask 14), `pci_msi_enable()` (64-bit + 32-bit MSI). `pci_map_mmio_page()` (renamed from `pci_ecam_map_page`) maps MSI-X table pages lazily.
+- **Vector/IRQ allocation**: dedicated PCI MSI-X vector 0x48 (72), irq 40 (`PCI_MSIX_VECTOR`/`PCI_MSIX_IRQ`) — free of PIC (0x20-0x2F), IPIs (0x41-0x44), syscall 0x80. IDT stubs `ISR_NOERR 72..79` + `isr_vectors` entries added (isr.S); `interrupt_handler` maps vec 72 → irq 40 → handler.
+- **e1000 driver** (`e1000.c`/`e1000.h`): probes MSI-X first, falls back to MSI, else legacy INTx+PIC. Minimal `e1000_msix_isr` (acks ICR + counts; poll thread still drains RX — no eth_rx_poll from ISR to avoid eth_lock spin in ISR context). e1000e specifics: IMS must include **ICR_RXQ0 (bit 20**, not RXT0); IVAR programmed for both real 82574 (`0x1700 = 0x00888880`, valid=0x80) and QEMU model (`0xE4 = 0x00088888`, valid=0x8) — each no-op on the other platform.
+- **hal.c CPUID detection fixed** (pre-existing, real bug): TCG signature ebx constant had G/C swapped (0x54434754 → **0x54474354**) and `hal_is_qemu()` never checked the TCG signature — under TCG the driver silently used Intel MDIC bits (igb link never came up) and skipped the QEMU IVAR write. Both `hal_is_qemu()`/`hal_is_qemu_tcg()` now check the 0x40000000 signature directly (some QEMU TCG builds omit the leaf-1 hypervisor bit). Fix restores igb/e1000e TCG link-up + DHCP.
+- **pci_config_read alignment traps documented**: reads use `offset & 0xFC`; fields at odd offsets (STATUS caps bit, MSI-X msgctl, MSI msgctl) live in the upper half of the aligned word — read with `>> 16`, write via read-modify-write preserving cap id/next.
+- **Test `test_pci_msix`** (kernel_test.c): q35-gated (SKIPPED→PASS on i440fx); verifies cap walk, table spec constraints, driver-programmed entry 0 (addr/data/ctl), msgctl enable bits, MSI cap presence, `e1000_msix_active()` + `e1000_msix_count() > 0`. Full PASS on q35 KVM (8 interrupts) and TCG; 90/90 test-all; debug + release clean.
+- **Verified matrix**: e1000e KVM/TCG + igb KVM/TCG — MSI-X enabled, interrupt received, DHCP DORA complete, no faults; classic e1000 — legacy path unchanged, DHCP OK. 90/90 tests (6 net + 11 storage + 44 kernel + 6 SFS + 4 process + 19 security).
+- **Next**: 4.x phases per BARE_METAL_PLAN (4.1 xHCI, 4.2 UEFI stub, 4.3 framebuffer) — or real-PC validation of 3.1/3.4.
+
+### Done (this session, 2026-08-16) — Bare-metal Phase 3.3: PCIe ECAM (q35-validated)
+- **ACPI MCFG parsing** (`acpi.h`/`acpi.c`): `mcfg_header_t`/`mcfg_alloc_t` structs, `acpi_parse_mcfg()` walking RSDT/XSDT (same pattern as SRAT/MADT), fills `mcfg_base_addr`/`mcfg_segment`/`mcfg_start_bus`/`mcfg_end_bus`. QEMU q35: base=0xB0000000, segment 0, bus 0-255.
+- **ECAM config access** (`pci.c`/`pci.h`): old 0xCF8/0xCFC bodies renamed `pci_config_read_legacy`/`write_legacy`; `pci_config_read/write` now dispatch to MMIO ECAM when the bus is in the MCFG range. ECAM access maps its 4 KB page lazily via `vmm_walk_pagetable`/`vmm_map_page` (pattern copied from `acpi_map_table`); no lock needed — a 32-bit MMIO access is atomic, `pci_lock` remains only on the legacy protocol path. `pci_ecam_init()` (called from `pci_init()`, which runs after `acpi_init`/`vmm_init` in main.c) activates ECAM only when MCFG exists — i440fx and other legacy platforms are untouched.
+- **Test `test_pci_ecam`** (kernel_test.c): bidirectional equivalence — legacy-only re-enumeration (bus 0 + bridge secondaries, forced `pci_config_read_legacy`) vs the ECAM-enumerated `pci_devices[]`: same device count, every device matches vendor/device/class/subclass in both directions. On platforms without MCFG it logs SKIPPED and still counts PASS.
+- **Verified**: q35 KVM — `[ACPI] ECAM: base=0xB0000000 bus=0-255`, 3/3 devices identical via ECAM and legacy, e1000 binds at 00:02.0 through ECAM and completes full DHCP DORA. i440fx (test-all) — legacy path, `test_pci_ecam` SKIPPED. 89/89 tests pass (6 net + 11 storage + 43 kernel + 6 SFS + 4 process + 19 security). Debug + release builds clean.
+- **Next**: Phase 3.4 MSI/MSI-X (q35-validatable; needed for NVMe/NIC IRQ routing on bare metal).
+
+### Partial (this session, 2026-08-16) — Bare-metal networking Phase 3.1: e1000e/igb support, QEMU-validated only (real PC untested)
+- **E1000 driver extended to e1000e (82574L, 0x10D3) and igb (82576, 0x10C9) families** (`e1000.c`/`e1000.h`): model table `e1000_model_for_devid()` keyed by devid → family + feature flags (`MODEL_IGB`: advanced descriptors, TIPG 0x0060200A, paperback, per-queue TXDCTL0/RXDCTL0, 64-bit PCI BAR; `MODEL_E1000E`: MDIC autoneg restart only). Fallback to `MODEL_E1000` (82540EM/82545EM) for unknown devids so existing behavior is untouched.
+- **Advanced TX descriptor layout fixed** (QEMU igb == Linux/Intel): `buffer_addr` must be at offset 0 (8B), `cmd_type_len` at offset 8 (len[15:0]|DEXT 0x20000000|DTYP_DATA 0x00300000|EOP 0x01000000|IFCS 0x02000000|RS 0x08000000), `olinfo_status` at offset 12. QEMU `igb_txdesc_writeback` requires the RS bit and zeroes the whole 16B descriptor with DD (bit0) written at offset 12 — the DD poll in `e1000_send` now reads offset 12 via `(volatile uint32_t*)((uint8_t*)&atx[tx_next] + 12)` (also avoids `-Werror=address-of-packed-member`), and ring init pre-marks `olinfo_status = E1000_TXD_STAT_DD` (was wrongly set in `cmd_type_len`).
+- **Advanced RX descriptor layout fixed**: `pkt_addr@0` (8B), `status_error@8` (u32; DD=bit0, EOP=bit1), `length@12` (u16), `vlan@14` (u16); removed stale `arx[idx].pkt_info = 0;`.
+- **QEMU MDIC OP-bit swap discovered and handled**: QEMU v10.2.2 `hw/net/e1000x_regs.h` defines `E1000_MDIC_OP_WRITE=0x04000000`/`OP_READ=0x08000000` — SWAPPED vs. Intel/Linux (`OP_READ=0x04000000`/`OP_WRITE=0x08000000`). A guest MDIC write using Intel bits is interpreted by QEMU as a PHY READ (readback `0x18201140` = `(val^data)|phy[addr]`), so ANRESTART never reached the PHY. `e1000_phy_autoneg_restart()` now picks `op_write = hal_is_qemu() ? 0x04000000u : E1000_MDIC_OP_WRITE` via `hal_is_qemu()` (CPUID leaf-1 ECX bit 31 + leaf 0x40000000 signatures, `hal.c:118-137`).
+- **QEMU igb link-up requires a guest ANRESTART**: a guest soft reset (CTRL.RST) calls `timer_del(autoneg_timer)` in the model, so the link stays down until a guest MDIC write of BMCR.ANRESTART (PHY addr 1, `E1000_MDIC_PHY_SHIFT`=21) re-arms autoneg (completes +500ms via `timer_new_ms`). The driver now does this unconditionally on igb and e1000e (harmless on e1000e/classic; real Intel hardware has no such quirk — a hardware reset starts autoneg natively).
+- **Verified on QEMU (KVM, `-netdev user`)**: igb, e1000e, and classic e1000 all reach link up + full DHCP DORA (OFFER 10.0.2.15/24 gw 10.0.2.2, ACK). Two-QEMU socket-backend exchange shows symmetric TPT=8/GPRC=8 on igb and e1000 sides (driver TX+RX fine; the two-QEMU echo auto-test itself is pre-existing flaky — stock e1000-e1000 also fails in this environment).
+- **Regression test added**: `test_e1000_model_table` (net_test.c, Test 6) — devid→model mapping for 82540EM/82545EM/82574L/82576, unknown-devid fallback, family flags.
+- **Verification**: 88/88 tests pass (6 net + 11 storage + 42 kernel + 6 SFS + 4 process + 19 security). Debug + release builds clean. All temporary DBG prints removed.
+- **Next bare-metal session caveats** (recorded in BARE_METAL_PLAN.md 3.1): real I219-V/I210 PHYs (K1/I217 etc.) may need per-PHY MDI/KMRN tuning beyond ANRESTART; MSI/MSI-X (3.4) still pending; PCIe ECAM (3.3) pending.
+
+### Done (this session, 2026-08-16) — Journal crash-consistency gap closed
+- **`journal_checkpoint()` now replays committed data to final blocks before freeing journal space** (`journal.c`). Previously it advanced the JSB head past the last COMMIT entry without copying the data entries to their target blocks — committed metadata existed only in the journal (or the write-back cache), so a crash after checkpoint lost it. Now: pass 1 scans head→tail to find the slot after the last COMMIT; pass 2 replays every committed DATA entry (full 512-byte copy) to `de->block` via direct `bdev->write` + `block_flush` barrier; head is advanced ONLY after the replay completes (a crash mid-checkpoint leaves the journal intact for `journal_recover`).
+- **DATA entries now carry the full 512-byte block** — the old `jent_data_t.data[496]` payload silently dropped the last 16 bytes of every logged block (recovery patched stale tails over meaningful data: cross-block dirents start at byte 476, inode 5 spans 440–528). New layout: descriptor slot (type/seq/block/checksum) + raw full-block copy in the next slot; a DATA entry consumes 2 slots, COMMIT 1. `journal_log` requires `jspace >= 3` (data + data + commit); `journal_recover` and `journal_checkpoint` scans advance 2 slots per DATA entry (the raw slot must never be parsed as an entry). `journal_full` test now fits 84 txns (was 127).
+- **`tools/mksfs.py` journal reservation fixed**: `journal_blocks = 64` → `256` to match kernel `JOURNAL_BLOCKS`. The old image declared 4032 usable blocks while the kernel reserves the last 256 (3840–4095) for its journal — a near-full filesystem could have allocated data blocks inside the kernel's journal region and been clobbered. Image now: 4096 blocks, 3840 usable, `data_start` recomputed; disk boot shows `[SFS] Mounted on 'ata0' (3840 blocks, 1024 inodes)`.
+- **New regression test** `test_journal_checkpoint_replay` (storage_test.c): log 2 blocks, commit, scrub targets on disk, checkpoint → asserts full 512-byte replay (incl. tail bytes), journal emptied (recover finds nothing), and a fresh txn works after. Fails on the old checkpoint, passes with the fix. All 496-byte test assertions updated to full-block.
+- **Verification**: 87/87 tests pass (5 net + 11 storage + 42 kernel + 6 SFS + 4 process + 19 security). Debug + release builds clean. Disk boot with rebuilt image: `[JOURNAL] No valid JSB, skipping recovery` + mount 3840 blocks + `/etc/rc` created/sourced. The `[SFS] WARN: free unclaimed block` seen during SFS self-tests was proven pre-existing via stash-build comparison (old kernel produces the identical warning at block 209/idx 1).
+
+### Done (this session, 2026-08-04) — Phase 2.3: Ramdisk is now optional (fallback only) for SFS
+- **`tools/mksfs.py` dirent layout bug fixed**: The image builder chunked root dirents into 7-entry groups and `ljust()`-padded each chunk to a full 512-byte block, inserting zero padding *between* chunks. The kernel computes dirent byte offsets as `index * 68` and expects a contiguous stream (it already handles dirents spanning block boundaries). Result: only the first 7 root entries (indices 0–6) were readable; entries 7+ (libdyn.so, hello-dyn.elf, version.txt, welcome.txt) were silently invisible, `readdir(7)` hit `de->inode == 0` and stopped, and any appended dirent (e.g. `/etc`) beyond byte 476 was unfindable. Fix: pack dirents contiguously, pad only the final block.
+- **`mksfs.py` image completeness**: Added `ld.so`, `libdyn.so`, `hello-dyn.elf`, `version.txt`, `welcome.txt` to the build-time image (previously only kernel-embedded at boot). Text boot files passed as raw bytes (no path lookup).
+- **`main.c` boot copy gated**: `booted_from_disk` flag set by the SFS probe; the "Copy boot files from ramdisk into SFS" block (11 ELF/text copies) now runs **only** on the ramdisk fallback path. Disk boot skips it entirely — files already exist in the image.
+- **`/etc/rc` creation made idempotent**: `if (!vfs_find("/etc/rc"))` guard — created once on first boot, persisted on disk, skipped on later boots. Verified persistence across reboots; shell sources `/etc/rc` on disk boot.
+- **Debugging notes**: The boot-time `[ATA_DBG] READ DRQ fail lba=0` I saw was `gpt_scan()` probing the phantom `ata2` (0-block secondary drive) — reads work fine; harmless pre-existing behavior. ATA PIO writes work (disk mutations persisted). SFS writes are write-back cached (`block.c`); the latent crash-consistency gap (checkpoint dropped journal entries without replaying them to final blocks) is now **FIXED** — see the 2026-08-16 session summary above.
+- **Verification**: 86/86 tests pass (`make test-all`, ramdisk fallback path unchanged). Disk boot (`-drive file=build/root.sfs,format=raw,if=ide`) lists all 11 files, creates/persists `/etc/rc`, boots to shell. Debug + release builds clean.
+- **Phase 2.3 status**: **DONE** — the 2 MB ramdisk remains only as a fallback when no disk SFS is found. Next in plan: Phase 3.1 (networking on bare metal).
+
+### Done (this session, 2026-07-12) — TCG 4-CPU scheduler corruption from redundant smp_cpu_id() calls
+- **Root cause — `pick_next()` and `sched_balance_push()` called `smp_cpu_id()` internally instead of using `schedule()`'s cached value** (`sched.c`). The scheduler comment at `sched.c:558` says "Cache CPU ID once — ALL subsequent accesses to per-CPU data use this value. On TCG, smp_cpu_id() can return different values across successive calls within the same schedule() invocation because apic_read(APIC_REG_ID) may be non-deterministic with 4 TCG vCPUs." But `pick_next()` and `sched_balance_push()` each called `smp_cpu_id()` again, breaking the contract. On TCG 4-CPU, `smp_cpu_id()` could return a different CPU index, causing:
+  - `pick_next()` to scan the wrong CPU's run queue → returning a garbage `next` pointer that was freed/never-initialized
+  - `sched_balance_push()` to remove threads from the wrong CPU's queue and insert into its own → run queue corruption
+  - `cur=pcp[2]->cpu_thread` showing per-CPU data base address (`0xC0028000`) instead of a thread pointer because `sched_init_ap()` had written the idle thread to the wrong `per_cpu_data[]` slot
+  - Manifesting as `next=0x81E8FFFFFE66E8E7 cpu=134` (non-canonical pointer) or GP fault on exec from stack
+- **Fix — pass cached `pcp` and `this_cpu` through the call chain** (`sched.c`):
+  - `pick_next(pcp)` — takes `per_cpu_data_t*` parameter, gets `this_cpu` from `pcp->cpu_id`, removed internal `sched_pcp()` call
+  - `sched_steal_thread(this_cpu)` — takes `int this_cpu`, removed `smp_cpu_id()` call
+  - `sched_balance_push(this_cpu, pcp)` — takes both cached values, removed `smp_cpu_id()` + `sched_pcp()` calls
+  - `schedule()` — caches `sched_cpu` at entry, passes `pcp` and `sched_cpu` throughout
+  - `thread_exit()` — updated `pick_next(pcp_exit)` call
+  - `sched_timer_tick()` — passes `_pcp->cpu_id, _pcp` to `sched_balance_push()`
+- **Additional safety net** (`schedule()`): Added validation that `next` pointer is canonical, and that `next->rsp` is within `next->kernel_stack` range before `switch_context`. These would catch future TCB corruption as an early kpanic with diagnostics instead of a silent GP fault.
+- **Verification**: 81/81 tests pass on all 4 SMP configurations: KVM 2-CPU, KVM 4-CPU, TCG 2-CPU, TCG 4-CPU. Release build clean.
+- **Test count**: 81/81 pass (5 net + 10 storage + 37 kernel + 6 SFS + 4 process + 19 security) on all platforms.
+
 ### Done (prev sessions)
 - All Phases 1–17 complete: E1000, IPv4/IPv6, TCP full state machine, sockets API, DNS, DHCP, SLAAC, NTP, TCP reliability, multicast, SO_RCVTIMEO/SO_SNDTIMEO, TCP_NODELAY, poll(), IPv4-mapped IPv6, MLDv1/IGMP, heap compaction, production hardening.
 - SFS cross-block dirent bug, sfs_readlink/writelink rename, E1000 KDEBUG cleanup, test timing/sleep hardened, test-runner.sh, SFS stack→heap buffer migration, GPT partition support, stack protector enabled.
@@ -54,6 +132,16 @@ make -C os test-security                     # run 19 security tests (~120s)
   - **Fork limit** (`process_t`): `fork_count`/`fork_limit` fields. `sys_fork` rejects when `limit >= 0 && count >= limit`. `fork_limit=-1` means unlimited (default for init). Limit inherited on fork; count decremented on child exit.
   - **3 new security tests**: `test_cap_system`, `test_fork_limit`, `test_audit_log`. 10/10 security tests pass. Total: 52 tests across all suites.
    - **ROADMAP.md**: Stage 6 marked `~100%`, all 5 exit criteria checked.
+
+### Done (this session, 2026-07-17) — Disk SFS boot from ATA drive (Phase 2.2 complete)
+
+- **ATA PIO read fixed** — two bugs found and fixed (`ata.c`):
+  - **LBA mode bit**: The `DRIVE` register was written with `0xA0`/`0xB0` (non-LBA mode), which caused all PIO reads to fail with ABORT (error 0x04). Changed to `0xE0 | (drive & 1)` to set bit 6 (LBA enable).
+  - **IRQ dependency removed**: The old `ata_pio_transfer_irq` used `ata_irq_wait` which blocks on `sched_block` waiting for an ATA IRQ. On KVM SMP, the I/O APIC is inaccessible via MMIO (returns version=0), so the kernel falls back to the legacy PIC. But with the local APIC enabled, PIC interrupts may not be routed through ExtINTA, so the ATA IRQ never fires. Replaced with pure polling (`ata_pio_poll` + `ata_poll_drq`) that waits for DRQ by reading the status register in a busy loop. No scheduler dependency — works even with `IF=0` during early boot.
+  - **gpt_scan()** now succeeds too (it calls `parent->read` directly, which calls the same polling path).
+- **mksfs.py checksum fix** (`tools/mksfs.py`): Used 2's complement negation (`~ck + 1`) instead of XOR, mismatching the kernel's `sfs_sb_checksum()` (which XORs all uint32_t). SFS superblock checksum on disk images is now correct.
+- **Result**: `qemu-system-x86_64 -kernel kernel.elf -drive file=root.sfs,format=raw,if=ide` boots directly from the ATA disk image. `[BOOT] Found SFS on 'ata0', mounting...` confirms root-on-disk.
+- **86/86 tests pass**, release build clean.
 
 ### Session summary (2026-06-18): Network namespaces, veth, SHA-256, kmalloc bug fix
 - **net_ns_t struct + refactoring** (`net_ns.h`/`net_ns.c`): Per-namespace state (route, ARP/NDP, TCP/UDP, sockets, dispatch handlers). All network modules refactored via `#define` macros expanding to `get_current_ns()->field`.
@@ -117,6 +205,11 @@ make -C os test-security                     # run 19 security tests (~120s)
 - **Debug prints removed**: Removed noisy per-iteration DBG prints from `test_smp_pmm_concurrent` and the join loop, for cleaner test output.
 - **Test count**: 68/68 pass (5 net + 10 storage + 24 kernel + 6 SFS + 4 process + 19 security).
 
+### Done (this session, 2026-07-10) — SMP sched_balance_push mid-list corruption fixed
+- **`sched_balance_push` mid-list removal bug fixed** (`sched.c:419-426`): The dequeue code assumed `t` was always at `rq_heads[low_prio]`, but the scan loop can return a thread from the middle when the head thread has this-CPU-only affinity. When `t` was not at the head, the dequeue replaced `rq_heads` with `t->rq_next` (orphaning predecessor threads) and set `rq_next->rq_prev = NULL` (breaking the backward chain). The result: `rq_counts` tracked 29 threads but only 13 were walkable in the linked list. Replaced with proper `rq_prev->rq_next = t->rq_next` / `rq_next->rq_prev = t->rq_prev` pattern matching `sched_remove_thread_locked`.
+- **RDTSC-based periodic `sched_balance_push` in `schedule()`**: Added ~100ms RDTSC check in `schedule()` so load balancing fires even when the APIC/PIT timer stops on KVM SMP after AP bring-up. Without this, `sched_balance_push` never fires on KVM, leaving idle CPUs with no work and causing the balance test's post-500ms diff to grow (age boost moves threads CPU1→CPU0).
+- **Result**: 81/81 tests pass on both KVM SMP and TCG SMP (0 failures).
+
 ## SMP Production Gaps — Priority Queue
 
 Implement one at a time, in order. Each gets its own test(s). If `make test-all` fails, revert.
@@ -144,10 +237,19 @@ Implement one at a time, in order. Each gets its own test(s). If `make test-all`
 - **`test_numa_basic()` expanded** — self/cross-node distance, single + 3-page alloc/free, accounting invariants, cross-node fallback, `pmm_current_node()`.
 - **Test count**: 81/81 pass (5 net + 10 storage + 37 kernel + 6 SFS + 4 process + 19 security). 82/82 with lockdep.
 
-## Next Steps
-- Stage 8: Service Layer (IPC, virtual filesystems, init system)
-- Stage 9: Quality, Testing and Scalability
-- Make `make test` timing more robust (retry on timeout, test-runner.sh polish)
+## Next Steps — Bare-Metal Boot (see `os/docs/BARE_METAL_PLAN.md`)
+Service Stage work (IPC, init system) is **set aside**. Current priority is booting on real x86-64 hardware.
+
+| # | Item | Status |
+|---|------|--------|
+| 1.1 | VGA text-mode console | DONE |
+| 1.2 | PS/2 keyboard | DONE |
+| 1.3 | GRUB/ISO make target | DONE (multiboot2 header + make iso target) |
+| 1.4 | ACPI FADT reset_reg for reboot | DONE (acpi_fadt_reset() + wired into hal_reboot) |
+| 2.1 | Root device discovery | **DONE** |
+| 2.2 | Move ELFs to disk SFS from ramdisk (build-time image + boot-time mount) | **DONE** |
+| 2.3 | Remove ramdisk dependency (ramdisk is now optional — fallback only) | **DONE** |
+| 3.1–4.3 | Networking, USB, UEFI, framebuffer | 3.1 **PARTIAL** — e1000e/igb QEMU-validated only (link up + DHCP DORA); real-PC validation + per-PHY tuning pending; 3.2 RTL8169 deferred (no QEMU model); 3.3 PCIe ECAM **DONE** (q35-validated); 3.4 MSI/MSI-X, 4.x pending |
 
 ## Critical Context
 - **RST during connect**: If listener hasn't set up listening socket yet, SYN gets RST (sent for both IPv4 and IPv6). `tcp_conn_connect` detects `state==TCP_CLOSED` on first poll iteration, returns `ERR_AGAIN` (fast-fail, ~50ms). `ERR_AGAIN = -7` → userspace errno=7 (E2BIG). Kernel retries binary up to 3 times; single RST event is benign due to QEMU socket backend race on simultaneous boot.
@@ -884,5 +986,59 @@ All 5 pass without a network backend:
 | `os/src/kernel/unix.c:276` | Removed duplicate `sock_register` in `unix_sock_accept` |
 | `os/src/kernel/sched.c:103` | `sched_reap_zombies`: added `!t->join_queue.count` guard |
 | `os/src/kernel/sched.c:433-438` | `pick_next`: re-queue stolen thread instead of dropping |
+
+### Done (this session, 2026-07-16) — epoll (epoll_create1/ctl/wait) + pipe fd flags fix
+
+- **epoll implementation** (`epoll.h`/`epoll.c`): Three syscalls — `epoll_create1(91)`, `epoll_ctl(92)`, `epoll_wait(93)`. Uses synchronous polling with RDTSC-based timeout (no async callback infrastructure). Level-triggered only. Per-epoll-instance item table (16 entries). `copy_from_user`/`copy_to_user` dual-path helpers work from both kernel self-test and userspace contexts.
+- **VFS poll** (`vfs.h`/`vfs.c`): Added `poll` op to `vfs_file_ops_t` and `vfs_poll()` for dispatching poll to the right filesystem.
+- **Pipe poll** (`pipe.c`): `pipe_poll()` — returns POLLIN when `p->count > 0`, POLLOUT when `p->count < PIPE_BUF_SIZE`.
+- **TTY poll** (`tty.c`): `tty_vfs_poll()` — returns POLLIN when input ring non-empty, POLLOUT always.
+- **PTY poll** (`pty.c`): `pty_master_poll()`/`pty_slave_poll()` — mirror TTY logic per end.
+- **Pipe fd flags bug fix** (`pipe.c`): Both pipe ends were created with `flags=0` (O_RDONLY), causing `vfs_write` to reject writes to the write end. Fixed write end to `O_WRONLY`. Added `#include "fcntl.h"`.
+- **Syscall wiring**: syscalls 91 (epoll_create1), 92 (epoll_ctl), 93 (epoll_wait) with `SYSCALL_COUNT=94`.
+- **Userspace API**: `epoll_create1()`/`epoll_ctl()`/`epoll_wait()` wrappers in `unistd.h`/`unistd.c`.
+- **Test**: `test_epoll_basic` — creates pipe, registers read end with epoll, verifies 0 events before write, verifies POLLIN after write, verifies data removal on EPOLL_CTL_DEL.
+- **Test count**: 82/82 pass (5 net + 10 storage + 40 kernel + 6 SFS + 4 process + 19 security).
+
+| File | Change |
+|------|--------|
+| `os/src/include/epoll.h` | **New** — EPOLLIN/OUT/ERR/ET, epoll_event, epoll_create1/ctl/wait declarations |
+| `os/src/kernel/epoll.c` | **New** — Full epoll implementation: create internal context, ADD/MOD/DEL items, wait with RDTSC timeout loop |
+| `os/src/kernel/vfs.h` | Added `poll` to `vfs_file_ops_t`, `vfs_poll()` declaration |
+| `os/src/kernel/vfs.c` | Added `vfs_poll()` — fd lookup, node-ops dispatch, default pollout fallback |
+| `os/src/kernel/pipe.c` | Added `pipe_poll()`; fixed write-end fd flags from 0→O_WRONLY; added `fcntl.h` include |
+| `os/src/kernel/tty.c` | Added `tty_vfs_poll()` — input ring check |
+| `os/src/kernel/pty.c` | Added `pty_master_poll()`, `pty_slave_poll()` |
+| `os/src/kernel/syscall.c` | `sys_epoll_create1/ctl/wait` handlers; `SYSCALL_COUNT=94` |
+| `os/src/include/syscall_defs.h` | Added `SYS_EPOLL_CREATE1=91`, `SYS_EPOLL_CTL=92`, `SYS_EPOLL_WAIT=93` |
+| `os/src/include/unistd.h` | epoll userspace declarations |
+| `os/src/lib/libuser/unistd.c` | `epoll_create1()`, `epoll_ctl()`, `epoll_wait()` wrappers |
+| `os/src/kernel/main.c` | Added `epoll_init()` call in boot sequence |
+| `os/src/kernel/kernel_test.c` | `test_epoll_basic` — pipe+epoll round-trip test |
+
+### Done (this session, 2026-07-17) — POSIX shared memory (shm_open/shm_unlink)
+
+- **`get_page` VFS op** (`vfs.h`): Added `uint64_t (*get_page)(vfs_node_t*, uint64_t offset)` to `vfs_file_ops_t` — returns the physical page backing a file at a given offset. Enables true shared memory where multiple processes mmap the same physical page.
+- **VMA fault handler** (`vma.c:256-277`): For MAP_SHARED + `get_page` available, maps the object's physical page directly instead of allocating a new page + reading content. Removes the per-process copy that breaks sharing.
+- **VMA shared unmap** (`vma.c:108-114`): Skips writeback and page-free when the node has `get_page` — the page belongs to the shm object, not the process.
+- **shm module** (`shm.c`/`shm.h`): Internal 32-entry shm object table. Each object holds a name, refcount, size, and page array. Ops: `get_page` returns the owning object's physical page; `truncate` allocates/frees pages; `read`/`write` access page data. `shm_open` creates a `vfs_node_t` + fd; `shm_unlink` marks deleted (pages freed when last fd closes).
+- **Syscalls**: `SYS_SHM_OPEN=94`, `SYS_SHM_UNLINK=95`, `SYSCALL_COUNT=96`. Userspace wrappers.
+- **O_EXCL added** (`fcntl.h`): `#define O_EXCL 0200`.
+- **test_shm_basic**: Creates, truncates, writes, reads, re-opens by name (persistence), O_EXCL rejection, unlink, post-unlink access, get_page direct phys page verification.
+- **Test count**: 83/83 pass (5 net + 10 storage + 41 kernel + 6 SFS + 4 process + 19 security).
+
+| File | Change |
+|------|--------|
+| `os/src/include/shm.h` | **New** — shm_object_t, sys_shm_open/sys_shm_unlink declarations |
+| `os/src/kernel/shm.c` | **New** — 335-line shm implementation: object table, ops, open/unlink |
+| `os/src/kernel/vfs.h` | Added `get_page` to `vfs_file_ops_t` |
+| `os/src/kernel/vma.c` | Direct page mapping via get_page for MAP_SHARED; skip writeback+free for get_page-backed pages |
+| `os/src/include/fcntl.h` | Added O_EXCL constant |
+| `os/src/include/syscall_defs.h` | SYS_SHM_OPEN=94, SYS_SHM_UNLINK=95, SYSCALL_COUNT=96 |
+| `os/src/kernel/syscall.c` | sys_shm_open_wrapper/sys_shm_unlink_wrapper handlers |
+| `os/src/kernel/main.c` | shm_init() call in boot sequence |
+| `os/src/include/unistd.h` | shm_open/shm_unlink declarations |
+| `os/src/lib/libuser/unistd.c` | shm_open/shm_unlink userspace wrappers |
+| `os/src/kernel/kernel_test.c` | test_shm_basic — 11-step shared memory round-trip |
 
 
