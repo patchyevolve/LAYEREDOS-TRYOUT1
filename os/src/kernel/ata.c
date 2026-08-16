@@ -58,41 +58,6 @@ static void ata_irq_handler(int_frame_t* frame, void* data) {
     sched_wake(&drives[drive_idx].wq);
 }
 
-/* Block on the drive's wait queue until IRQ fires or BSY clears */
-static int ata_irq_wait(ata_drive_t* drive, int timeout_ms) {
-    uint64_t deadline = 0;
-    if (timeout_ms > 0) {
-        deadline = hal_timer_get_ticks() +
-                   (uint64_t)timeout_ms * hal_timer_get_hz() / 1000;
-    }
-
-    drive->irq_received = 0;
-
-    cpu_flags_t flags = hal_save_irq();
-    outb(drive->ctrl, 0x00); /* enable ATA interrupts (clear nIEN) */
-
-    while (!drive->irq_received) {
-        uint8_t status = inb(drive->base + ATA_REG_STATUS);
-        if (!(status & ATA_STATUS_BSY)) {
-            drive->irq_status = status;
-            drive->irq_received = 1;
-            break;
-        }
-
-        sched_block(&drive->wq);
-
-        if (timeout_ms > 0 && hal_timer_get_ticks() > deadline) {
-            hal_restore_irq(flags);
-            return -1;
-        }
-    }
-
-    hal_restore_irq(flags);
-    if (drive->irq_status & ATA_STATUS_ERR)
-        return -1;
-    return 0;
-}
-
 /* Polling-based IDENTIFY for use during init before IRQs are unmasked */
 static void ata_identify_drive(ata_drive_t* d, uint16_t base, uint8_t drive) {
     outb(base + ATA_REG_DRIVE, drive ? 0xB0 : 0xA0);
@@ -187,7 +152,68 @@ err_t ata_init(void) {
     return ERR_OK;
 }
 
-/* IRQ-driven PIO transfer */
+/* Wait for DRQ or error by polling status (no IRQ dependency).
+   Returns 0 on DRQ ready, -1 on error, -2 on timeout. */
+static int ata_poll_drq(uint16_t base, uint64_t timeout_ms) {
+    uint64_t deadline = hal_timer_get_ticks()
+              + timeout_ms * hal_timer_get_hz() / 1000;
+    for (;;) {
+        uint8_t s = inb(base + ATA_REG_STATUS);
+        if (s & ATA_STATUS_DRQ)   return 0;
+        if (s & ATA_STATUS_ERR)   return -1;
+        if (hal_timer_get_ticks() > deadline) return -2;
+        for (volatile int _ = 0; _ < 100; _++) asm volatile("pause");
+    }
+}
+
+/* PIO transfer using pure polling — no IRQ or scheduler dependency.
+   The caller must hold ata_global_lock. */
+static int ata_pio_poll(uint16_t base, uint8_t drive, uint64_t lba,
+                        uint8_t count, void* buf, int write) {
+    uint16_t* word_buf = (uint16_t*)buf;
+    int sector_words = ATA_SECTOR_SIZE / 2;
+
+    /* Select drive with LBA mode enabled (bit 6) and drive select (bit 4) */
+    outb(base + ATA_REG_DRIVE, 0xE0 | (drive & 1));
+
+    /* Wait for BSY=0 before issuing command */
+    for (int w = 0; w < 100000; w++) {
+        if (!(inb(base + ATA_REG_STATUS) & ATA_STATUS_BSY)) break;
+    }
+
+    /* Set sector count and LBA bits (LBA28) */
+    outb(base + ATA_REG_SECCOUNT, count);
+    outb(base + ATA_REG_LBA0, (uint8_t)(lba));
+    outb(base + ATA_REG_LBA1, (uint8_t)(lba >> 8));
+    outb(base + ATA_REG_LBA2, (uint8_t)(lba >> 16));
+
+    /* Send command */
+    outb(base + ATA_REG_CMD, write ? ATA_CMD_WRITE_PIO : ATA_CMD_READ_PIO);
+
+    for (int s = 0; s < count; s++) {
+        if (ata_poll_drq(base, ATA_IRQ_TIMEOUT_MS) != 0)
+            return -1;
+
+        for (int i = 0; i < sector_words; i++) {
+            if (write)
+                outw(base + ATA_REG_DATA, word_buf[s * sector_words + i]);
+            else
+                word_buf[s * sector_words + i] = inw(base + ATA_REG_DATA);
+        }
+    }
+
+    if (write) {
+        /* Flush write cache */
+        outb(base + ATA_REG_CMD, ATA_CMD_FLUSH);
+    }
+
+    /* Final status check */
+    uint8_t status = inb(base + ATA_REG_STATUS);
+    if (status & ATA_STATUS_ERR) return -1;
+    return count * ATA_SECTOR_SIZE;
+}
+
+/* IRQ-driven PIO transfer with polling fallback */
 static int ata_pio_transfer_irq(uint16_t base, uint8_t drive, uint64_t lba,
                                 uint8_t count, void* buf, int write) {
     err_t e = mutex_lock(&ata_global_lock, 10000);
@@ -205,55 +231,14 @@ static int ata_pio_transfer_irq(uint16_t base, uint8_t drive, uint64_t lba,
 
     ata_drive_t* drv = &drives[drive_idx];
 
-    /* Select drive */
-    outb(base + ATA_REG_DRIVE, drive ? 0xB0 : 0xA0);
-
-    /* Set sector count and LBA */
-    outb(base + ATA_REG_SECCOUNT, count);
-    outb(base + ATA_REG_LBA0, (uint8_t)(lba));
-    outb(base + ATA_REG_LBA1, (uint8_t)(lba >> 8));
-    outb(base + ATA_REG_LBA2, (uint8_t)(lba >> 16));
-
-    /* Send command */
-    outb(base + ATA_REG_CMD, write ? ATA_CMD_WRITE_PIO : ATA_CMD_READ_PIO);
-
-    uint16_t* word_buf = (uint16_t*)buf;
-
-    for (int s = 0; s < count; s++) {
-        if (write) {
-            /* Wait for drive ready to accept data */
-            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) {
-                mutex_unlock(&ata_global_lock);
-                return -1;
-            }
-
-            /* Write sector data */
-            for (int i = 0; i < 256; i++)
-                outw(base + ATA_REG_DATA, word_buf[s * 256 + i]);
-        } else {
-            /* Wait for data ready */
-            if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) {
-                mutex_unlock(&ata_global_lock);
-                return -1;
-            }
-
-            /* Read sector data */
-            for (int i = 0; i < 256; i++)
-                word_buf[s * 256 + i] = inw(base + ATA_REG_DATA);
-        }
-    }
-
-    /* For writes, flush write cache */
-    if (write) {
-        outb(base + ATA_REG_CMD, ATA_CMD_FLUSH);
-        if (ata_irq_wait(drv, ATA_IRQ_TIMEOUT_MS)) {
-            mutex_unlock(&ata_global_lock);
-            return -1;
-        }
-    }
+    /* Use pure polling path — IRQ-driven PIO is unreliable on KVM where
+     * the I/O APIC is inaccessible and legacy PIC may not deliver ATA
+     * interrupts through the local APIC's ExtINTA mechanism. */
+    outb(drv->ctrl, 0x02); /* set nIEN to mask ATA interrupts */
+    int ret = ata_pio_poll(base, drive, lba, count, buf, write);
 
     mutex_unlock(&ata_global_lock);
-    return count * ATA_SECTOR_SIZE;
+    return ret;
 }
 
 int ata_read_sectors(uint8_t drive, uint64_t lba, uint8_t count, void* buf) {

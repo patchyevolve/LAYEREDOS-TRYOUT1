@@ -78,6 +78,7 @@ typedef struct sfs_fs {
 
 err_t sfs_mount(block_dev_t* bdev);
 err_t sfs_format(block_dev_t* bdev);
+int   sfs_probe(block_dev_t* bdev);  /* returns 1 if valid SFS, 0 if not */
 int   sfs_get_block_size(void);
 err_t sfs_read_inode(sfs_fs_t* fs, int inum, sfs_inode_t* inode);
 err_t sfs_write_inode(sfs_fs_t* fs, int inum, const sfs_inode_t* inode);

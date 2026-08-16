@@ -8,6 +8,10 @@
 #include "watchdog.h"
 #include "rcu.h"
 #include "lockdep.h"
+#include "futex.h"
+#include "epoll.h"
+#include "shm.h"
+#include "sysfs.h"
 #include "kmalloc.h"
 #include "syscall.h"
 #include "process.h"
@@ -23,6 +27,7 @@
 #include "block.h"
 #include "tmpfs.h"
 #include "devfs.h"
+#include "procfs.h"
 #include "tty.h"
 #include "pty.h"
 #include "elf.h"
@@ -191,6 +196,19 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     boot_report("Layer 2 (SCHED) - Scheduler & Threading");
     sched_init();
 
+    /* Switch from the BSS-embedded boot stack to the init thread's own kernel
+     * stack.  The boot stack sits inside the BSS section — right where the
+     * kernel heap begins — so kmalloc from any context (timer, device)
+     * would silently corrupt local variables if we stayed on the BSS stack
+     * once interrupts are enabled. */
+    if (current_thread && current_thread->kernel_stack) {
+        uint64_t init_stack = (uint64_t)current_thread->kernel_stack
+                            + current_thread->kernel_stack_size - 128;
+        kprintf("[SCHED] Switching to init thread's kernel stack @ %p\n",
+                (void*)init_stack);
+        hal_switch_stack(init_stack);
+    }
+
     boot_report("Lockdep — Lock Dependency Validator");
     lockdep_init();
 
@@ -214,6 +232,8 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     ata_init();
     pci_init();
     vfs_init();
+    futex_init();
+    epoll_init();
     tty_init();
     pty_init();
     ramdisk_init();
@@ -323,14 +343,40 @@ void kmain(uint64_t magic, uint64_t mb_info) {
 #ifdef STORAGE_SELF_TEST
     storage_self_test();
 #endif
+    /* Probe for existing SFS on any block device (disk boot) */
+    int booted_from_disk = 0;
+    {
+        block_dev_t* root_dev = NULL;
+        int count = block_count();
+        for (int i = 0; i < count; i++) {
+            block_dev_t* d = block_get(i);
+            if (kstrcmp(d->name, "ramdisk") == 0) continue;
+            if (sfs_probe(d)) { root_dev = d; break; }
+        }
+        if (root_dev) {
+            kprintf("[BOOT] Found SFS on '%s', mounting...\n", root_dev->name);
+            sfs_mount(root_dev);
+            booted_from_disk = 1;
+        } else {
+            kprintf("[BOOT] No SFS found on any block device, formatting ramdisk...\n");
+            sfs_format(block_find("ramdisk"));
+            sfs_mount(block_find("ramdisk"));
+        }
+    }
+
+    /* Mount virtual filesystems before self-tests so procfs/devfs/tmpfs are available */
+    {
+        vfs_fs_t* tmpfs_vfs = NULL;
+        tmpfs_mount(&tmpfs_vfs);
+    }
+    devfs_mount();
+    procfs_mount();
+    sysfs_mount();
+    shm_init();
+
 #ifdef KERNEL_SELF_TEST
     kernel_self_test();
 #endif
-    kprintf("[BOOT] Formatting SFS on ramdisk...\n");
-    sfs_format(block_find("ramdisk"));
-    kprintf("[BOOT] Mounting SFS on ramdisk...\n");
-    sfs_mount(block_find("ramdisk"));
-
 #ifdef SFS_SELF_TEST
     sfs_self_test();
 #endif
@@ -341,8 +387,10 @@ void kmain(uint64_t magic, uint64_t mb_info) {
     security_self_test();
 #endif
 
+    /* Copy boot files from ramdisk into SFS (ramdisk fallback only;
+       disk SFS images already contain these files at build time) */
+    if (!booted_from_disk) {
     kprintf("[BOOT] Copy boot files from ramdisk into SFS...\n");
-    /* Copy boot files from ramdisk into SFS */
     kprintf("[BOOT] SFS copy: hello.elf\n");
     {
         extern char _binary_build_user_program_elf_start[];
@@ -485,11 +533,11 @@ void kmain(uint64_t magic, uint64_t mb_info) {
         }
     }
     kprintf("[BOOT] Copied boot files to SFS\n");
+    } /* !booted_from_disk */
 
-    /* Create /etc directory */
+    /* Create /etc/rc startup script (idempotent — skip if already present) */
+    if (!vfs_find("/etc/rc")) {
     vfs_mkdir("/etc");
-
-    /* Create /etc/rc startup script */
     {
         const char* rc_content =
             "echo Loading services...\n"
@@ -501,13 +549,7 @@ void kmain(uint64_t magic, uint64_t mb_info) {
             vfs_close(rc_fd);
         }
     }
-
-    /* Mount tmpfs at /tmp */
-    vfs_fs_t* tmpfs_vfs = NULL;
-    tmpfs_mount(&tmpfs_vfs);
-
-    /* Mount devfs at /dev */
-    devfs_mount();
+    } /* rc not present */
 
     boot_report("Cross-Cutting - EventBus & Watchdog");
     eventbus_init();

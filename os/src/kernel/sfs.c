@@ -1254,7 +1254,19 @@ err_t sfs_format(block_dev_t* bdev) {
     return ERR_OK;
 }
 
-err_t sfs_mount(block_dev_t* bdev) {
+int sfs_probe(block_dev_t* bdev) {
+    sfs_superblock_t sb;
+    err_t e = block_read(bdev, 0, 1, &sb);
+    if (e) return 0;
+    if (sb.magic != SFS_MAGIC) return 0;
+    /* Verify checksum — temporarily zero it to compute */
+    uint32_t stored = sb.checksum;
+    sb.checksum = 0;
+    int ok = (sfs_sb_checksum(&sb) == stored);
+    return ok;
+}
+
+ err_t sfs_mount(block_dev_t* bdev) {
     sfs_fs_t* fs = kmalloc(sizeof(sfs_fs_t));
     if (!fs) return ERR_NOMEM;
     kmemset(fs, 0, sizeof(sfs_fs_t));
