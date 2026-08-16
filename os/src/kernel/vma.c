@@ -104,13 +104,18 @@ static void vma_unmap_range_shared(process_t* proc, uint64_t start, uint64_t end
             spinlock_release(&proc->pt_lock, _ptf);
         }
 
-        /* Write back dirty pages outside the lock (blocking I/O) */
-        if (dirty && node) {
+        /* For get_page-backed objects (shm), pages belong to the object —
+         * skip writeback (writes happen directly to shared pages) and
+         * skip freeing (object owns the page). */
+        int shm_page = (node && node->fs->ops->get_page) ? 1 : 0;
+
+        if (dirty && node && !shm_page) {
             node->fs->ops->write(node, (const void*)PHYS_TO_VIRT(phys),
                                  PAGE_SIZE, file_off);
         }
 
-        pmm_free_page(phys);
+        if (!shm_page)
+            pmm_free_page(phys);
     }
 }
 
@@ -252,20 +257,30 @@ int vma_handle_fault(process_t* proc, uint64_t fault_addr, uint64_t error_code) 
     }
     spinlock_release(&proc->vma_lock, _vf);
 
-    /* Allocate a physical page (no lock held) */
-    uint64_t phys = pmm_alloc_page();
-    if (!phys) {
-        if (node) __sync_fetch_and_sub(&node->refcount, 1);
-        return 0;
+    /* Try direct page mapping for shared memory objects */
+    uint64_t phys = 0;
+    int shm_page = 0;
+    if (node && node->fs->ops->get_page && (flags & 0x01)) {
+        phys = node->fs->ops->get_page(node, file_off);
+        if (phys) shm_page = 1;
     }
-    kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
 
-    /* If file-backed, read the page content from the file (no lock held) */
-    if (node) {
+    /* Allocate a physical page if not a direct-mapped shm page */
+    if (!phys) {
+        phys = pmm_alloc_page();
+        if (!phys) {
+            if (node) __sync_fetch_and_sub(&node->refcount, 1);
+            return 0;
+        }
+        kmemset((void*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+    }
+
+    /* If file-backed (non-shm), read the page content from the file */
+    if (node && !shm_page) {
         node->fs->ops->read(node, (void*)PHYS_TO_VIRT(phys),
                             PAGE_SIZE, file_off);
-        __sync_fetch_and_sub(&node->refcount, 1);
     }
+    if (node) __sync_fetch_and_sub(&node->refcount, 1);
 
     /* Determine mapping flags */
     uint64_t pgflags = PAGE_USER;

@@ -4,6 +4,8 @@
 #include "kmalloc.h"
 #include "sched.h"
 #include "vfs.h"
+#include "net.h"
+#include "fcntl.h"
 
 static int pipe_open(vfs_node_t* node) {
     (void)node;
@@ -92,11 +94,29 @@ static int64_t pipe_write(vfs_node_t* node, const void* buf, uint64_t count, uin
     return (int64_t)done;
 }
 
+static int pipe_poll(vfs_node_t* node, int events, int* revents) {
+    pipe_t* p = (pipe_t*)node->private_data;
+    if (!p) { *revents = POLLNVAL; return -1; }
+    int r = 0;
+    cpu_flags_t _sf;
+    spinlock_acquire(&p->lock, &_sf);
+    if ((events & POLLIN) && p->count > 0)
+        r |= POLLIN;
+    if ((events & POLLOUT) && !p->read_closed)
+        r |= POLLOUT;
+    if (p->write_closed)
+        r |= POLLHUP;
+    spinlock_release(&p->lock, _sf);
+    *revents = r;
+    return 0;
+}
+
 static vfs_file_ops_t pipe_ops = {
     .open  = pipe_open,
     .close = pipe_close,
     .read  = pipe_read,
     .write = pipe_write,
+    .poll  = pipe_poll,
 };
 
 static vfs_fs_t pipe_fs = {
@@ -143,7 +163,7 @@ int pipe_create(int fds[2]) {
         if (!ft[i].used) {
             ft[i].node = rnode;
             ft[i].offset = 0;
-            ft[i].flags = 0;
+            ft[i].flags = O_RDONLY;
             ft[i].used = 1;
             __sync_fetch_and_add(&rnode->refcount, 1);
             fds[0] = i;
@@ -154,7 +174,7 @@ int pipe_create(int fds[2]) {
         if (!ft[i].used) {
             ft[i].node = wnode;
             ft[i].offset = 0;
-            ft[i].flags = 0;
+            ft[i].flags = O_WRONLY;
             ft[i].used = 1;
             __sync_fetch_and_add(&wnode->refcount, 1);
             fds[1] = i;

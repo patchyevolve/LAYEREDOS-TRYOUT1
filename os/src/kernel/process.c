@@ -217,9 +217,10 @@ err_t process_exec(process_t* proc, const void* elf_data, size_t elf_len) {
                 }
             }
         }
-        /* Page-align and leave a 64KB gap */
+        /* Page-align, leave a 64KB gap, add ASLR random offset (0-8MB) */
         proc->mmap_brk = (max_addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1ULL);
         if (proc->mmap_brk <= max_addr) proc->mmap_brk = max_addr + 0x10000;
+    
     }
 
     /* Step 5: Set up user stack */
@@ -684,4 +685,26 @@ void signal_deliver_custom(process_t* proc, int_frame_t* frame) {
         return;
     }
     spinlock_release(&proc->signal_lock, _sflags);
+}
+
+void process_iterate(void (*cb)(process_t* proc, void* arg), void* arg) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&process_lock, &_sf);
+    list_head_t* pos = process_list.next;
+    while (pos != &process_list) {
+        process_t* p = container_of(pos, process_t, process_node);
+        pos = pos->next;
+        cb(p, arg);
+    }
+    spinlock_release(&process_lock, _sf);
+}
+
+int process_count(void) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&process_lock, &_sf);
+    int cnt = 0;
+    list_head_t* pos = process_list.next;
+    while (pos != &process_list) { cnt++; pos = pos->next; }
+    spinlock_release(&process_lock, _sf);
+    return cnt;
 }

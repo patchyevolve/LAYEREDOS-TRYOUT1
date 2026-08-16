@@ -100,6 +100,8 @@ typedef struct vfs_file_ops {
     int     (*symlink)(vfs_node_t* dir, const char* name, const char* target);
     int     (*readlink)(vfs_node_t* node, char* buf, uint64_t size);
     int     (*ioctl)(vfs_node_t* node, uint64_t request, void* argp);
+    int     (*poll)(vfs_node_t* node, int events, int* revents);
+    uint64_t (*get_page)(vfs_node_t* node, uint64_t offset);
 } vfs_file_ops_t;
 
 typedef struct vfs_fs {
@@ -139,6 +141,7 @@ int  vfs_unlock(const char* path);
 int  vfs_symlink(const char* target, const char* linkpath);
 int  vfs_readlink(const char* path, char* buf, uint64_t size);
 int  vfs_ioctl(int fd, uint64_t request, void* argp);
+int  vfs_poll(int fd, int events, int* revents);
 vfs_fd_t* vfs_get_fd_table(void);
 
 #endif

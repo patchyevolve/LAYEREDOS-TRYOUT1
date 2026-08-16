@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "sync.h"
 
 #define UART_LSR 0x3FD
 #define UART_THR 0x3F8
@@ -12,6 +13,7 @@ static char hexdigits[] = "0123456789ABCDEF";
 static volatile uint16_t* const vga_buf = (volatile uint16_t*)(KERNEL_VMA_BASE + VGA_ADDR);
 static int vga_row = 0;
 static int vga_col = 0;
+static spinlock_t kputchar_lock = { .lock = 0, .name = "kputchar", .holder = 0 };
 
 static inline void outb(uint16_t port, uint8_t val) {
     asm volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -42,29 +44,58 @@ static void vga_update_cursor(void) {
 extern void kmsg_putchar(char c) __attribute__((weak));
 
 void kputchar(char c) {
-    unsigned long _kflags;
-    asm volatile("pushfq; popq %0; cli" : "=r"(_kflags));
-    if (c == '\n') {
-        while (!(inb(UART_LSR) & 0x20));
-        outb(UART_THR, '\r');
-    }
-    while (!(inb(UART_LSR) & 0x20));
-    outb(UART_THR, c);
-    if (_kflags & 0x200) asm volatile("sti");
-
-    /* Buffer into kmsg ring if available */
+    /* Buffer into kmsg ring first (no lock needed — ring buffer) */
     if (kmsg_putchar) kmsg_putchar(c);
 
-    if (c == '\n') { vga_col = 0; vga_row++; }
-    else if (c == '\r') { vga_col = 0; }
-    else if (c == '\b' || c == 127) { if (vga_col > 0) vga_col--; }
-    else if (c >= ' ') {
-        vga_buf[vga_row * VGA_COLS + vga_col] = (uint16_t)c | (0x07 << 8);
-        vga_col++;
+    /* Serial output — best-effort via try_acquire to avoid deadlock if
+     * kputchar is re-entered (e.g. page fault during VGA output). */
+    {
+        cpu_flags_t kpflags;
+        if (spinlock_try_acquire(&kputchar_lock, &kpflags)) {
+            if (c == '\n') {
+                while (!(inb(UART_LSR) & 0x20));
+                outb(UART_THR, '\r');
+            }
+            while (!(inb(UART_LSR) & 0x20));
+            outb(UART_THR, c);
+            spinlock_release(&kputchar_lock, kpflags);
+        } else {
+            /* Contended: fallback to raw CLI/STI serial write (no VGA).
+             * This ensures panic/fault output appears even during a
+             * concurrent kprintf from another CPU. */
+            unsigned long _kpflags;
+            asm volatile("pushfq; popq %0; cli" : "=r"(_kpflags));
+            if (c == '\n') {
+                while (!(inb(UART_LSR) & 0x20));
+                outb(UART_THR, '\r');
+            }
+            while (!(inb(UART_LSR) & 0x20));
+            outb(UART_THR, c);
+            if (_kpflags & 0x200) asm volatile("sti");
+        }
     }
-    if (vga_col >= VGA_COLS) { vga_col = 0; vga_row++; }
-    if (vga_row >= VGA_ROWS) vga_scroll();
-    vga_update_cursor();
+
+    /* VGA output — only when the lock is available (no contention).
+     * Contention means another CPU is currently writing to VGA, so
+     * our update would be lost or corrupting anyway.  Skipping VGA
+     * in that case prevents vga_row/vga_col data races that lead to
+     * out-of-bounds VGA buffer writes on SMP. */
+    {
+        cpu_flags_t vflags;
+        if (spinlock_try_acquire(&kputchar_lock, &vflags)) {
+            if (c == '\n') { vga_col = 0; vga_row++; }
+            else if (c == '\r') { vga_col = 0; }
+            else if (c == '\b' || c == 127) { if (vga_col > 0) vga_col--; }
+            else if (c >= ' ') {
+                vga_buf[vga_row * VGA_COLS + vga_col] = (uint16_t)c | (0x07 << 8);
+                vga_col++;
+            }
+            if (vga_col >= VGA_COLS) { vga_col = 0; vga_row++; }
+            if (vga_row >= VGA_ROWS) vga_scroll();
+            vga_update_cursor();
+            spinlock_release(&kputchar_lock, vflags);
+        }
+    }
 }
 
 void kputs(const char* s) {

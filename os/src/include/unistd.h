@@ -186,4 +186,33 @@ struct utsname {
 extern int uname(struct utsname* buf);
 extern void sync(void);
 
+/* ---- futex ---- */
+#define FUTEX_WAIT      0
+#define FUTEX_WAKE      1
+#define FUTEX_REQUEUE   3
+#define FUTEX_PRIVATE_FLAG 128
+extern long futex(int* uaddr, int op, int val,
+                  const struct timespec* timeout,
+                  int* uaddr2, int val3);
+
+/* ---- epoll ---- */
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_MOD 2
+#define EPOLL_CTL_DEL 3
+#define EPOLLIN    0x001
+#define EPOLLOUT   0x004
+#define EPOLLERR   0x008
+#define EPOLLHUP   0x010
+
+struct epoll_event {
+    uint32_t events;
+    uint64_t data;
+};
+
+extern int epoll_create1(int flags);
+extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event);
+extern int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
+extern int shm_open(const char* name, int oflag, mode_t mode);
+extern int shm_unlink(const char* name);
+
 #endif

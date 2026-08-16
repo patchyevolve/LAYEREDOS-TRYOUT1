@@ -6,6 +6,7 @@
 #include "sched.h"
 #include "sync.h"
 #include "kmalloc.h"
+#include "net.h"
 
 /* Kernel fallback fd table (used by kernel threads with no process) */
 static vfs_fd_t kernel_fd_table[VFS_MAX_FDS];
@@ -798,6 +799,24 @@ int vfs_readlink(const char* path, char* buf, uint64_t size) {
     if (node->fs && node->fs->ops && node->fs->ops->readlink)
         return node->fs->ops->readlink(node, buf, size);
     return -1;
+}
+
+int vfs_poll(int fd, int events, int* revents) {
+    cpu_flags_t _sf;
+    spinlock_acquire(&vfs_global_lock, &_sf);
+    if (fd < 0 || fd >= VFS_MAX_FDS || !vfs_get_fd_table()[fd].used) {
+        spinlock_release(&vfs_global_lock, _sf);
+        *revents = POLLNVAL;
+        return -1;
+    }
+    vfs_node_t* node = vfs_get_fd_table()[fd].node;
+    spinlock_release(&vfs_global_lock, _sf);
+    if (node->fs && node->fs->ops && node->fs->ops->poll) {
+        return node->fs->ops->poll(node, events, revents);
+    }
+    /* Default: always writable, never readable */
+    *revents = (events & POLLOUT) ? POLLOUT : 0;
+    return 0;
 }
 
 int vfs_ioctl(int fd, uint64_t request, void* argp) {

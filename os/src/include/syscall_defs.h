@@ -99,7 +99,14 @@
 #define SYS_MOUNT             87
 #define SYS_UMOUNT            88
 #define SYS_SCHED_SETAFFINITY 89
+#define SYS_FUTEX      90
+#define SYS_EPOLL_CREATE1  91
+#define SYS_EPOLL_CTL  92
+#define SYS_EPOLL_WAIT 93
 
-#define SYSCALL_COUNT 90
+#define SYS_SHM_OPEN 94
+#define SYS_SHM_UNLINK 95
+
+#define SYSCALL_COUNT 96
 
 #endif

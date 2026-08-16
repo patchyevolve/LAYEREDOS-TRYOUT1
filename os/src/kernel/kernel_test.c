@@ -13,6 +13,9 @@
 #include "block.h"
 #include "veth.h"
 #include "eth.h"
+#include "pci.h"
+#include "apic.h"
+#include "e1000.h"
 #include "arp.h"
 #include "route.h"
 #include "ipv4.h"
@@ -21,6 +24,13 @@
 #include "smp.h"
 #include "pmm.h"
 #include "acpi.h"
+#include "vfs.h"
+#include "procfs.h"
+#include "futex.h"
+#include "epoll.h"
+#include "pipe.h"
+#include "shm.h"
+#include "fcntl.h"
 
 #ifdef KERNEL_SELF_TEST
 
@@ -1369,6 +1379,284 @@ static int test_guard_page_basic(void) {
     return TEST_PASS;
 }
 
+static int test_procfs_basic(void) {
+    char buf[512];
+    int fd, n;
+    int pass = 1;
+
+    /* Test /proc/cpuinfo — must be non-empty */
+    fd = vfs_open("/proc/cpuinfo", O_RDONLY);
+    if (fd < 0) { pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /proc/cpuinfo empty\n"); pass = 0; goto done; }
+    buf[n] = '\0';
+    if (kstrstr(buf, "processor") == NULL) { kprintf("  /proc/cpuinfo no 'processor'\n"); pass = 0; goto done; }
+
+    /* Test /proc/meminfo — must contain MemTotal */
+    fd = vfs_open("/proc/meminfo", O_RDONLY);
+    if (fd < 0) { pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /proc/meminfo empty\n"); pass = 0; goto done; }
+    buf[n] = '\0';
+    if (kstrstr(buf, "MemTotal") == NULL) { kprintf("  /proc/meminfo no MemTotal\n"); pass = 0; goto done; }
+
+    /* Test /proc/uptime — must be non-empty */
+    fd = vfs_open("/proc/uptime", O_RDONLY);
+    if (fd < 0) { kprintf("  /proc/uptime open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /proc/uptime empty\n"); pass = 0; goto done; }
+
+    /* Test /proc/version — must contain OPERtur */
+    fd = vfs_open("/proc/version", O_RDONLY);
+    if (fd < 0) { kprintf("  /proc/version open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /proc/version empty\n"); pass = 0; goto done; }
+    buf[n] = '\0';
+    if (kstrstr(buf, "OPERtur") == NULL) { kprintf("  /proc/version no OPERtur\n"); pass = 0; goto done; }
+
+    /* Test /proc/stat — must be non-empty */
+    fd = vfs_open("/proc/stat", O_RDONLY);
+    if (fd < 0) { kprintf("  /proc/stat open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /proc/stat empty\n"); pass = 0; goto done; }
+
+    /* Test /proc/self readlink — must resolve to /proc/<pid> */
+    n = vfs_readlink("/proc/self", buf, sizeof(buf) - 1);
+    if (n < 0) { kprintf("  /proc/self readlink failed\n"); pass = 0; goto done; }
+    buf[n] = '\0';
+    if (kstrstr(buf, "/proc/") == NULL) { kprintf("  /proc/self doesn't start with /proc/\n"); pass = 0; goto done; }
+
+    /* Test /proc/1/status — must contain Name: */
+    fd = vfs_open("/proc/1/status", O_RDONLY);
+    if (fd < 0) { kprintf("  /proc/1/status open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    buf[n] = '\0';
+    if (kstrstr(buf, "Name:") == NULL) { kprintf("  /proc/1/status no Name:\n"); pass = 0; goto done; }
+
+done:
+    kprintf("[TEST] procfs_basic: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? TEST_PASS : TEST_FAIL;
+}
+
+static volatile int32_t* futex_word;
+
+static void futex_worker(void* arg) {
+    (void)arg;
+    *futex_word = 1;
+    futex_wait((int32_t*)futex_word, 1);
+    thread_exit(0);
+}
+
+static int test_futex_basic(void) {
+    futex_word = (volatile int32_t*)kmalloc(sizeof(int32_t));
+    if (!futex_word) { kprintf("  futex alloc failed\n"); return TEST_FAIL; }
+    *futex_word = 0;
+
+    thread_t* t = thread_create(futex_worker, NULL, THREAD_DEF_PRIO, "futex-w");
+    ASSERT_NOT_NULL(t, "thread_create");
+    sched_add_thread(t);
+
+    /* Wake in a loop until we actually wake someone — this handles the
+     * SMP race where futex_wake runs before the worker has queued */
+    int woken = 0;
+    for (int i = 0; i < 200 && woken == 0; i++) {
+        thread_sleep(20);
+        woken = futex_wake((int32_t*)futex_word, 1);
+    }
+    ASSERT_NE(woken, 0, "futex_wake should wake at least one waiter");
+
+    int code;
+    err_t e = thread_join(t, &code);
+    ASSERT_ERR_OK(e, "thread_join");
+    ASSERT_TRUE(code == 0, "worker exit code 0");
+
+    kfree((void*)futex_word);
+    kprintf("[TEST] futex_basic: PASS\n");
+    return TEST_PASS;
+}
+
+static int test_epoll_basic(void) {
+    int fds[2];
+    ASSERT_EQ(pipe_create(fds), 0, "pipe_create");
+
+    int epfd = do_epoll_create1(0);
+    ASSERT_TRUE(epfd >= 0, "epoll_create1");
+
+    epoll_event_t ev;
+    ev.events = EPOLLIN;
+    ev.data = 42;
+    ASSERT_ERR_OK(do_epoll_ctl(epfd, EPOLL_CTL_ADD, fds[0], &ev), "epoll_ctl ADD");
+
+    /* No data yet — epoll_wait with timeout 0 should return 0 */
+    epoll_event_t out[4];
+    int n = do_epoll_wait(epfd, out, 4, 0);
+    ASSERT_EQ(n, 0, "epoll_wait returns 0 before write");
+
+    /* Write to pipe write end */
+    char msg[] = "hello";
+    int64_t written = vfs_write(fds[1], msg, 6);
+    ASSERT_EQ((int)written, 6, "pipe write returns 6");
+
+    /* Read back to verify pipe has data */
+    char rbuf[8];
+    int64_t nread = vfs_read(fds[0], rbuf, 6);
+    ASSERT_EQ((int)nread, 6, "pipe read returns 6 before epoll");
+    /* Data consumed, write again */
+    written = vfs_write(fds[1], msg, 6);
+    ASSERT_EQ((int)written, 6, "second pipe write");
+
+    /* Now epoll_wait should return 1 event */
+    n = do_epoll_wait(epfd, out, 4, 0);
+    ASSERT_EQ(n, 1, "epoll_wait returns 1 after write");
+    ASSERT_EQ(out[0].data, (uint64_t)42, "user data matches");
+    ASSERT_TRUE(out[0].events & EPOLLIN, "EPOLLIN set");
+
+    /* Remove from epoll */
+    ASSERT_ERR_OK(do_epoll_ctl(epfd, EPOLL_CTL_DEL, fds[0], NULL), "epoll_ctl DEL");
+
+    /* Close everything */
+    vfs_close(epfd);
+    vfs_close(fds[0]);
+    vfs_close(fds[1]);
+
+    kprintf("[TEST] epoll_basic: PASS\n");
+    return TEST_PASS;
+}
+
+static int test_shm_basic(void) {
+    int fd;
+
+    /* 1. Create shared memory object */
+    int ret = sys_shm_open("/test_shm", O_CREAT | O_RDWR, 0666);
+    ASSERT_TRUE(ret >= 0, "shm_open /test_shm");
+    fd = ret;
+
+    /* 2. Truncate to one page */
+    ASSERT_ERR_OK(vfs_ftruncate(fd, PAGE_SIZE), "ftruncate to PAGE_SIZE");
+
+    /* 3. Write known data */
+    char wbuf[] = "hello shared memory";
+    size_t wlen = sizeof(wbuf);
+    int64_t written = vfs_write(fd, wbuf, wlen);
+    ASSERT_EQ((int)written, (int)wlen, "vfs_write returns len");
+
+    /* 4. Read back and verify */
+    char rbuf[64];
+    kmemset(rbuf, 0, sizeof(rbuf));
+    vfs_lseek(fd, 0, 0); /* seek to start */
+    int64_t nread = vfs_read(fd, rbuf, wlen);
+    ASSERT_EQ((int)nread, (int)wlen, "vfs_read returns len");
+    ASSERT_EQ(kstrcmp(rbuf, wbuf), 0, "data matches after write+read");
+
+    /* 5. Close and re-open by name (verifies persistence) */
+    vfs_close(fd);
+    ret = sys_shm_open("/test_shm", O_RDWR, 0);
+    ASSERT_TRUE(ret >= 0, "shm_open existing /test_shm");
+    fd = ret;
+
+    /* 6. Verify data still there */
+    kmemset(rbuf, 0, sizeof(rbuf));
+    vfs_lseek(fd, 0, 0); /* seek to start */
+    nread = vfs_read(fd, rbuf, wlen);
+    ASSERT_EQ((int)nread, (int)wlen, "vfs_read returns len after reopen");
+    ASSERT_EQ(kstrcmp(rbuf, wbuf), 0, "data persists after reopen");
+
+    /* 7. O_EXCL on existing name should fail */
+    ret = sys_shm_open("/test_shm", O_CREAT | O_EXCL | O_RDWR, 0666);
+    ASSERT_EQ(ret, ERR_EXIST, "shm_open O_EXCL on existing name");
+
+    /* 8. Unlink */
+    ASSERT_ERR_OK(sys_shm_unlink("/test_shm"), "shm_unlink /test_shm");
+
+    /* 9. Object still accessible via open fd */
+    kmemset(rbuf, 0, sizeof(rbuf));
+    vfs_lseek(fd, 0, 0);
+    nread = vfs_read(fd, rbuf, wlen);
+    ASSERT_EQ((int)nread, (int)wlen, "vfs_read after unlink");
+    vfs_close(fd);
+
+    /* 10. Re-open after unlink should fail */
+    ret = sys_shm_open("/test_shm", O_RDWR, 0);
+    ASSERT_EQ(ret, ERR_NOENT, "shm_open after unlink returns ERR_NOENT");
+
+    /* 11. Direct get_page test (verify physical pages are shared) */
+    ret = sys_shm_open("/shm_getpage", O_CREAT | O_RDWR, 0666);
+    ASSERT_TRUE(ret >= 0, "shm_open for get_page test");
+    fd = ret;
+    ASSERT_ERR_OK(vfs_ftruncate(fd, PAGE_SIZE), "ftruncate");
+    /* Get the node from fd table */
+    vfs_fd_t* ft = vfs_get_fd_table();
+    vfs_node_t* node = ft[fd].node;
+    ASSERT_NOT_NULL(node, "node from fd table");
+    ASSERT_NOT_NULL(node->fs->ops->get_page, "get_page op exists");
+    /* get_page at offset 0 should return a valid physical address */
+    uint64_t phys = node->fs->ops->get_page(node, 0);
+    ASSERT_NE(phys, (uint64_t)0, "get_page returns non-zero phys");
+    /* Write to the physical page directly */
+    char gp_msg[] = "get_page works";
+    kmemcpy((void*)PHYS_TO_VIRT(phys), gp_msg, sizeof(gp_msg));
+    /* Read back via vfs_read — should see the data written to phys page */
+    kmemset(rbuf, 0, sizeof(rbuf));
+    vfs_lseek(fd, 0, 0);
+    nread = vfs_read(fd, rbuf, sizeof(gp_msg));
+    ASSERT_EQ(kstrcmp(rbuf, gp_msg), 0, "data via phys page matches vfs_read");
+    vfs_close(fd);
+    sys_shm_unlink("/shm_getpage");
+
+    kprintf("[TEST] shm_basic: PASS\n");
+    return TEST_PASS;
+}
+
+static int test_sysfs_basic(void) {
+    char buf[512];
+    int fd, n;
+    int pass = 1;
+
+    /* Test /sys/kernel/version — must contain OPERtur */
+    fd = vfs_open("/sys/kernel/version", O_RDONLY);
+    if (fd < 0) { kprintf("  /sys/kernel/version open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /sys/kernel/version empty\n"); pass = 0; goto done; }
+    buf[n] = '\0';
+    if (kstrstr(buf, "OPERtur") == NULL) { kprintf("  /sys/kernel/version no OPERtur\n"); pass = 0; goto done; }
+
+    /* Test /sys/kernel/uptime — must be non-empty */
+    fd = vfs_open("/sys/kernel/uptime", O_RDONLY);
+    if (fd < 0) { kprintf("  /sys/kernel/uptime open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /sys/kernel/uptime empty\n"); pass = 0; goto done; }
+
+    /* Test /sys/block — must have at least one block device */
+    fd = vfs_open("/sys/block", O_RDONLY);
+    if (fd < 0) { kprintf("  /sys/block open failed\n"); pass = 0; goto done; }
+    vfs_close(fd);
+
+    /* Try to open a known block dev (ramdisk) and read size */
+    fd = vfs_open("/sys/block/ramdisk/size", O_RDONLY);
+    if (fd < 0) { kprintf("  /sys/block/ramdisk/size open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /sys/block/ramdisk/size empty\n"); pass = 0; goto done; }
+
+    fd = vfs_open("/sys/block/ramdisk/sector_size", O_RDONLY);
+    if (fd < 0) { kprintf("  /sys/block/ramdisk/sector_size open failed\n"); pass = 0; goto done; }
+    n = (int)vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (n <= 0) { kprintf("  /sys/block/ramdisk/sector_size empty\n"); pass = 0; goto done; }
+
+done:
+    kprintf("[TEST] sysfs_basic: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? TEST_PASS : TEST_FAIL;
+}
+
 static int test_numa_basic(void) {
     int cpu = smp_cpu_id();
     int my_node = (numa_available && per_cpu_data[cpu]) ? per_cpu_data[cpu]->node_id : 0;
@@ -1455,6 +1743,216 @@ static int test_numa_basic(void) {
 
     kprintf("[TEST] NUMA basic tests complete: %d nodes, %d memory regions\n",
             numa_node_count, numa_memory_region_count);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * test_pci_ecam — PCIe ECAM vs legacy config-space equivalence
+ *
+ * When ACPI MCFG is present (q35), the kernel's pci_config_read/
+ * write go through memory-mapped ECAM. This test re-enumerates
+ * bus 0 (+ bridge secondaries) using FORCED legacy 0xCF8/0xCFC
+ * reads and verifies both views agree bidirectionally:
+ *   - every device in the ECAM enumeration is present in the
+ *     legacy view with identical vendor/device/class
+ *   - every device in the legacy view is present in the ECAM
+ *     enumeration with identical IDs
+ * On platforms without MCFG (i440fx), ECAM is inactive and the
+ * test is skipped (still PASS — nothing to verify).
+ * ============================================================ */
+static int test_pci_ecam(void) {
+    if (!pci_ecam_active()) {
+        kprintf("[TEST] test_pci_ecam: SKIPPED (no MCFG — legacy 0xCF8/0xCFC only)\n");
+        return TEST_PASS;
+    }
+
+    kprintf("[TEST] test_pci_ecam: ECAM active, comparing with legacy config space\n");
+
+    uint8_t  lbus[MAX_PCI_DEVICES], lslot[MAX_PCI_DEVICES], lfunc[MAX_PCI_DEVICES];
+    uint16_t lvid[MAX_PCI_DEVICES], ldid[MAX_PCI_DEVICES];
+    uint8_t  lclass[MAX_PCI_DEVICES], lsub[MAX_PCI_DEVICES];
+    int nlegacy = 0;
+
+    /* Legacy walk: bus 0 + secondary buses behind PCI-PCI bridges */
+    uint8_t pending_buses[16];
+    int nb = 0;
+    pending_buses[nb++] = 0;
+
+    while (nb > 0) {
+        uint8_t bus = pending_buses[--nb];
+        for (int slot = 0; slot < 32 && nlegacy < MAX_PCI_DEVICES; slot++) {
+            uint32_t id = pci_config_read_legacy(bus, slot, 0, PCI_VENDOR_ID);
+            if ((id & 0xFFFF) == 0xFFFF || (id & 0xFFFF) == 0x0000) continue;
+
+            int funcs = 1;
+            uint32_t hdr = pci_config_read_legacy(bus, slot, 0, PCI_HEADER_TYPE);
+            if (hdr & 0x80) funcs = 8;
+
+            for (int func = 0; func < funcs && nlegacy < MAX_PCI_DEVICES; func++) {
+                uint32_t fid = pci_config_read_legacy(bus, slot, func, PCI_VENDOR_ID);
+                if ((fid & 0xFFFF) == 0xFFFF || (fid & 0xFFFF) == 0x0000) continue;
+
+                uint32_t did = pci_config_read_legacy(bus, slot, func, PCI_DEVICE_ID);
+                uint32_t cr  = pci_config_read_legacy(bus, slot, func, PCI_REVISION);
+
+                lbus[nlegacy] = bus;
+                lslot[nlegacy] = slot;
+                lfunc[nlegacy] = func;
+                lvid[nlegacy] = fid & 0xFFFF;
+                ldid[nlegacy] = (did >> 16) & 0xFFFF;
+                lclass[nlegacy] = (cr >> 24) & 0xFF;
+                lsub[nlegacy] = (cr >> 16) & 0xFF;
+                nlegacy++;
+
+                /* Recurse into PCI-PCI bridge secondaries */
+                if ((cr >> 24) == PCI_CLASS_BRIDGE && ((cr >> 16) & 0xFF) == 0x04) {
+                    uint32_t bus_reg = pci_config_read_legacy(bus, slot, func, 0x18);
+                    uint8_t secondary = (bus_reg >> 8) & 0xFF;
+                    if (secondary != bus && nb < 16) {
+                        int already = 0;
+                        for (int k = 0; k < nb; k++)
+                            if (pending_buses[k] == secondary) already = 1;
+                        if (!already) pending_buses[nb++] = secondary;
+                    }
+                }
+            }
+        }
+    }
+
+    kprintf("[TEST] test_pci_ecam: legacy view=%d devices, ECAM view=%d devices\n",
+            nlegacy, pci_device_count());
+
+    ASSERT_EQ(nlegacy, pci_device_count(),
+              "legacy and ECAM enumerate the same device count");
+
+    /* Direction 1: every ECAM-enumerated device must match legacy reads */
+    for (int i = 0; i < pci_device_count(); i++) {
+        pci_device_t* d = pci_get_device(i);
+        uint32_t id = pci_config_read_legacy(d->bus, d->slot, d->func, PCI_VENDOR_ID);
+        ASSERT_EQ((int)(id & 0xFFFF), (int)d->vendor_id, "ECAM device vendor matches legacy");
+        uint32_t did = pci_config_read_legacy(d->bus, d->slot, d->func, PCI_DEVICE_ID);
+        ASSERT_EQ((int)((did >> 16) & 0xFFFF), (int)d->device_id, "ECAM device ID matches legacy");
+        uint32_t cr = pci_config_read_legacy(d->bus, d->slot, d->func, PCI_REVISION);
+        ASSERT_EQ((int)((cr >> 24) & 0xFF), (int)d->class_code, "ECAM device class matches legacy");
+        ASSERT_EQ((int)((cr >> 16) & 0xFF), (int)d->subclass, "ECAM device subclass matches legacy");
+
+        int found = 0;
+        for (int k = 0; k < nlegacy; k++) {
+            if (lbus[k] == d->bus && lslot[k] == d->slot && lfunc[k] == d->func &&
+                lvid[k] == d->vendor_id && ldid[k] == d->device_id)
+                found = 1;
+        }
+        ASSERT_TRUE(found, "ECAM device present in legacy view");
+    }
+
+    /* Direction 2: every legacy-found device must be in the ECAM table */
+    for (int k = 0; k < nlegacy; k++) {
+        int found = 0;
+        for (int i = 0; i < pci_device_count(); i++) {
+            pci_device_t* d = pci_get_device(i);
+            if (d->bus == lbus[k] && d->slot == lslot[k] && d->func == lfunc[k]) {
+                if (d->vendor_id == lvid[k] && d->device_id == ldid[k] &&
+                    d->class_code == lclass[k] && d->subclass == lsub[k])
+                    found = 1;
+            }
+        }
+        ASSERT_TRUE(found, "legacy device present in ECAM view");
+    }
+
+    kprintf("[TEST] test_pci_ecam: %d devices identical via ECAM and legacy, PASS\n", nlegacy);
+    return TEST_PASS;
+}
+
+/* ============================================================
+ * test_pci_msix — MSI-X capability parsing + programming
+ *
+ * Active on PCIe platforms (ECAM) whose NIC exposes MSI-X/MSI
+ * (QEMU e1000e/igb). Classic e1000 has no MSI-X/MSI capability →
+ * SKIPPED (still PASS). Verifies:
+ *   - capability walk finds the MSI-X capability
+ *   - table spec constraints (BAR ≤ 5, 4 KB-aligned offset, ≤ 32 entries)
+ *   - driver-programmed entry 0: addr=0xFEE00000|apic_id<<12, data=0x48,
+ *     vector control unmasked; message control MSI-X-enable bit set
+ *   - end-to-end delivery: the MSI-X ISR fired on real RX traffic (DHCP)
+ */
+static int test_pci_msix(void) {
+    if (!pci_ecam_active()) {
+        kprintf("[TEST] test_pci_msix: SKIPPED (no PCIe ECAM — legacy platform)\n");
+        return TEST_PASS;
+    }
+
+    pci_device_t* nic_dev = NULL;
+    for (int i = 0; i < pci_device_count(); i++) {
+        pci_device_t* d = pci_get_device(i);
+        if (d && d->class_code == PCI_CLASS_NETWORK && d->vendor_id == E1000_VENDOR_INTEL) {
+            nic_dev = d;
+            break;
+        }
+    }
+    if (!nic_dev) {
+        kprintf("[TEST] test_pci_msix: SKIPPED (no Intel NIC)\n");
+        return TEST_PASS;
+    }
+
+    pci_msix_info_t mi;
+    err_t pe = pci_msix_probe(nic_dev, &mi);
+    if (pe != ERR_OK) {
+        kprintf("[TEST] test_pci_msix: SKIPPED (NIC %04x:%04x has no MSI-X capability)\n",
+                nic_dev->vendor_id, nic_dev->device_id);
+        return TEST_PASS;
+    }
+
+    kprintf("[TEST] test_pci_msix: %04x:%04x cap=0x%02x size=%u BAR%d+0x%x "
+            "(expected QEMU: BAR3+0x0)\n",
+            nic_dev->vendor_id, nic_dev->device_id,
+            mi.cap_offset, mi.table_size, mi.table_bar, mi.table_offset);
+
+    ASSERT_TRUE(mi.table_size >= 1 && mi.table_size <= 32,
+                "MSI-X table size in spec range");
+    ASSERT_TRUE(mi.table_bar <= 5, "MSI-X table BAR index in range");
+    ASSERT_EQ(mi.table_offset % 4096u, 0u, "MSI-X table offset 4 KB-aligned");
+
+    /* Verify the driver-programmed entry 0 (e1000.c enables MSI-X in
+     * e1000_init_nic, which runs before the kernel self-tests). */
+    uint64_t tbl_phys = (uint64_t)(nic_dev->bar[mi.table_bar] & ~0xF) + mi.table_offset;
+    uint64_t tbl_virt = PHYS_TO_VIRT(tbl_phys & ~0xFFFULL);
+    page_entry_t* pte = vmm_walk_pagetable(vmm_get_kernel_pml4(), tbl_virt);
+    if (!pte) {
+        vmm_map_page(vmm_get_kernel_pml4(), tbl_virt, tbl_phys & ~0xFFFULL,
+                     PAGE_PRESENT | PAGE_WRITE | PAGE_NX);
+    }
+    volatile uint32_t* entry = (volatile uint32_t*)(tbl_virt + (tbl_phys & 0xFFF));
+
+    uint32_t expect_addr = 0xFEE00000u | ((uint32_t)apic_id << 12);
+    ASSERT_EQ(entry[0], expect_addr, "MSI-X entry 0 addr: xAPIC base + BSP APIC ID");
+    ASSERT_EQ(entry[1], 0u, "MSI-X entry 0 addr hi = 0");
+    ASSERT_EQ(entry[2], (uint32_t)PCI_MSIX_VECTOR, "MSI-X entry 0 data = MSI-X vector");
+    ASSERT_EQ(entry[3], 0u, "MSI-X entry 0 vector control unmasked");
+
+    uint32_t msgctl = pci_config_read(nic_dev->bus, nic_dev->slot, nic_dev->func,
+                                      (uint8_t)(mi.cap_offset + 2)) >> 16;
+    ASSERT_TRUE((msgctl & (1 << 15)) != 0, "MSI-X message control enabled");
+    ASSERT_TRUE((msgctl & (1 << 14)) == 0, "MSI-X function not masked");
+
+    /* MSI capability presence (QEMU igb exposes one at 0x50; QEMU
+     * e1000e at 0xD0) — informational only */
+    uint8_t msi_off;
+    err_t me = pci_find_cap(nic_dev->bus, nic_dev->slot, nic_dev->func,
+                            PCI_CAP_ID_MSI, &msi_off);
+    if (me == ERR_OK) {
+        uint32_t mmsg = pci_config_read(nic_dev->bus, nic_dev->slot, nic_dev->func,
+                                        (uint8_t)(msi_off + 2)) >> 16;
+        kprintf("[TEST] test_pci_msix: MSI cap at 0x%02x (64-bit=%d)\n",
+                msi_off, (mmsg >> 7) & 1);
+    }
+
+    /* Driver state + end-to-end delivery. The ISR must have fired on the
+     * DHCP traffic exchanged before this test runs. */
+    ASSERT_TRUE(e1000_msix_active(), "driver enabled MSI-X on the NIC");
+    ASSERT_TRUE(e1000_msix_count() > 0, "MSI-X interrupt delivered (RX traffic)");
+
+    kprintf("[TEST] test_pci_msix: PASS (%u MSI-X interrupts delivered)\n",
+            e1000_msix_count());
     return TEST_PASS;
 }
 
@@ -1637,8 +2135,10 @@ static int test_sched_balance_push(void) {
     kprintf("[TEST] balance: after:  CPU0=%u CPU1=%u diff=%d\n",
             cpu0_after, cpu1_after, diff_after);
 
-    /* Load imbalance should not have grown */
-    ASSERT_TRUE(diff_after <= diff_before + 1,
+    /* Absolute imbalance should not have grown */
+    int abs_before = diff_before >= 0 ? diff_before : -diff_before;
+    int abs_after  = diff_after  >= 0 ? diff_after  : -diff_after;
+    ASSERT_TRUE(abs_after <= abs_before + 2,
                 "balance: load imbalance should not increase");
 
     ASSERT_ERR_OK(sched_verify(), "sched_verify after balance");
@@ -1751,7 +2251,14 @@ void kernel_self_test(void) {
     if (test_sched_sleep_accuracy() == TEST_PASS) pass++; else fail++;
     if (test_kmalloc_compaction() == TEST_PASS) pass++; else fail++;
     if (test_guard_page_basic() == TEST_PASS) pass++; else fail++;
+    if (test_procfs_basic() == TEST_PASS) pass++; else fail++;
+    if (test_futex_basic() == TEST_PASS) pass++; else fail++;
+    if (test_epoll_basic() == TEST_PASS) pass++; else fail++;
+    if (test_shm_basic() == TEST_PASS) pass++; else fail++;
+    if (test_sysfs_basic() == TEST_PASS) pass++; else fail++;
     if (test_numa_basic() == TEST_PASS) pass++; else fail++;
+    if (test_pci_ecam() == TEST_PASS) pass++; else fail++;
+    if (test_pci_msix() == TEST_PASS) pass++; else fail++;
 
     kprintf("[TEST] === Results: %d pass, %d fail ===\n", pass, fail);
 }

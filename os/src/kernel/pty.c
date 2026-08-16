@@ -8,6 +8,7 @@
 #include "kmalloc.h"
 #include "tty.h"
 #include "hal.h"
+#include "net.h"
 
 /*
  * Pseudo-terminal (PTY) implementation.
@@ -82,6 +83,8 @@ static int  pty_slave_close(vfs_node_t* node);
 static int64_t pty_slave_read(vfs_node_t* node, void* buf, uint64_t count, uint64_t offset);
 static int64_t pty_slave_write(vfs_node_t* node, const void* buf, uint64_t count, uint64_t offset);
 static int  pty_slave_ioctl(vfs_node_t* node, uint64_t request, void* argp);
+static int  pty_master_poll(vfs_node_t* node, int events, int* revents);
+static int  pty_slave_poll(vfs_node_t* node, int events, int* revents);
 
 /* ── VFS file operations ──────────────────────────────────────────────── */
 
@@ -90,6 +93,7 @@ static vfs_file_ops_t pty_master_ops = {
     .close = pty_master_close,
     .read  = pty_master_read,
     .write = pty_master_write,
+    .poll  = pty_master_poll,
 };
 
 static vfs_file_ops_t pty_slave_ops = {
@@ -98,6 +102,7 @@ static vfs_file_ops_t pty_slave_ops = {
     .read  = pty_slave_read,
     .write = pty_slave_write,
     .ioctl = pty_slave_ioctl,
+    .poll  = pty_slave_poll,
 };
 
 static vfs_fs_t pty_master_fs = {
@@ -486,6 +491,45 @@ static int pty_slave_ioctl(vfs_node_t* node, uint64_t request, void* argp) {
         default:
             return -1;
     }
+}
+
+/* ── PTY poll ──────────────────────────────────────────────────────────── */
+
+static int pty_master_poll(vfs_node_t* node, int events, int* revents) {
+    pty_t* p = (pty_t*)node->private_data;
+    if (!p) { *revents = POLLNVAL; return -1; }
+    int r = 0;
+    if (events & POLLIN) {
+        cpu_flags_t _sf;
+        spinlock_acquire(&p->m_lock, &_sf);
+        if (p->m_head != p->m_tail) r |= POLLIN;
+        spinlock_release(&p->m_lock, _sf);
+    }
+    if (events & POLLOUT)
+        r |= POLLOUT;
+    if (p->slave_closed)
+        r |= POLLHUP;
+    *revents = r;
+    return 0;
+}
+
+static int pty_slave_poll(vfs_node_t* node, int events, int* revents) {
+    pty_t* p = (pty_t*)node->private_data;
+    if (!p) { *revents = POLLNVAL; return -1; }
+    int r = 0;
+    if (events & POLLIN) {
+        cpu_flags_t _sf;
+        spinlock_acquire(&p->s_raw_lock, &_sf);
+        if (p->s_raw_head != p->s_raw_tail) r |= POLLIN;
+        if (p->line_count > 0) r |= POLLIN;
+        spinlock_release(&p->s_raw_lock, _sf);
+    }
+    if (events & POLLOUT)
+        r |= POLLOUT;
+    if (p->master_closed)
+        r |= POLLHUP;
+    *revents = r;
+    return 0;
 }
 
 /* ── PTY pair creation (allocates FDs for master + slave) ──────────────── */

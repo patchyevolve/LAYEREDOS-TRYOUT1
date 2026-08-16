@@ -88,6 +88,8 @@ void signal_send(pid_t pid, int sig);
 void signal_process(process_t* proc);
 void signal_send_pgid(pid_t pgid, int sig);
 void signal_deliver_custom(process_t* proc, struct int_frame* frame);
+void process_iterate(void (*cb)(process_t* proc, void* arg), void* arg);
+int  process_count(void);
 
 /* waitpid options */
 #define WNOHANG   1

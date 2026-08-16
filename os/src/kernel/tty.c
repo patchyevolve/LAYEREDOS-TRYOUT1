@@ -4,18 +4,44 @@
 #include "kmalloc.h"
 #include "hal.h"
 #include "vfs.h"
+#include "net.h"
 
 tty_t tty_console;
 
 static int tty_vfs_ioctl(vfs_node_t* node, uint64_t request, void* argp);
 
 /* TTY VFS filesystem — wraps the line-discipline operations */
+static int tty_vfs_poll(vfs_node_t* node, int events, int* revents) {
+    (void)node;
+    tty_t* t = &tty_console;
+    int r = 0;
+    cpu_flags_t _sf;
+    spinlock_acquire(&t->state_lock, &_sf);
+    uint32_t lflag = t->lflag;
+    spinlock_release(&t->state_lock, _sf);
+
+    if (events & POLLIN) {
+        spinlock_acquire(&t->raw_lock, &_sf);
+        if (lflag & TTY_ICANON) {
+            if (t->line_count > 0) r |= POLLIN;
+        } else {
+            if (t->raw_head != t->raw_tail) r |= POLLIN;
+        }
+        spinlock_release(&t->raw_lock, _sf);
+    }
+    if (events & POLLOUT)
+        r |= POLLOUT;
+    *revents = r;
+    return 0;
+}
+
 static vfs_file_ops_t tty_file_ops = {
     .open  = tty_vfs_open,
     .close = tty_vfs_close,
     .read  = tty_vfs_read,
     .write = tty_vfs_write,
     .ioctl = tty_vfs_ioctl,
+    .poll  = tty_vfs_poll,
 };
 
 static vfs_fs_t tty_fs = {

@@ -25,6 +25,7 @@
 #define CLONE_NEWNET  0x40000000
 #include "unix.h"
 #include "secure_boot.h"
+#include "futex.h"
 #include "net_ns.h"
 #include "veth.h"
 #include "netconfig.h"
@@ -33,6 +34,8 @@
 #include "ndp.h"
 #include "ipv4.h"
 #include "route.h"
+#include "epoll.h"
+#include "shm.h"
 
 #define USER_VIRT_START 0x40000000UL
 #define USER_VIRT_END   0x80000000UL
@@ -453,6 +456,7 @@ static uint64_t sys_fork(int_frame_t* frame) {
     cp->user_stack_top = pp->user_stack_top;
     cp->user_code_start = pp->user_code_start;
     cp->user_code_size = pp->user_code_size;
+    cp->mmap_brk = pp->mmap_brk;
     vma_duplicate(cp);
     uint32_t __sp2 = (THREAD_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t __blk2 = pmm_alloc_pages(__sp2 + 1);
@@ -2068,6 +2072,30 @@ static uint64_t sys_sched_setaffinity(int_frame_t* frame) {
     return ERR_OK;
 }
 
+/* Extern syscall handlers from other modules */
+extern uint64_t sys_futex(int_frame_t* frame);
+extern uint64_t sys_epoll_create1(int_frame_t* frame);
+extern uint64_t sys_epoll_ctl(int_frame_t* frame);
+extern uint64_t sys_epoll_wait(int_frame_t* frame);
+
+static uint64_t sys_shm_open_wrapper(int_frame_t* frame) {
+    const char* uname = (const char*)frame->rdi;
+    int oflag = (int)frame->rsi;
+    int mode  = (int)frame->rdx;
+    char kname[64];
+    if (copy_path_from_user(uname, kname, sizeof(kname)) != 0)
+        return (uint64_t)(int64_t)ERR_FAULT;
+    return (uint64_t)(int64_t)sys_shm_open(kname, oflag, mode);
+}
+
+static uint64_t sys_shm_unlink_wrapper(int_frame_t* frame) {
+    const char* uname = (const char*)frame->rdi;
+    char kname[64];
+    if (copy_path_from_user(uname, kname, sizeof(kname)) != 0)
+        return (uint64_t)(int64_t)ERR_FAULT;
+    return (uint64_t)(int64_t)sys_shm_unlink(kname);
+}
+
 typedef uint64_t (*syscall_fn)(int_frame_t*);
 static syscall_fn syscall_table[] = {
     sys_exit,      /* 0 */
@@ -2160,6 +2188,12 @@ static syscall_fn syscall_table[] = {
     sys_mount,          /* 87 */
     sys_umount,         /* 88 */
     sys_sched_setaffinity, /* 89 */
+    sys_futex,             /* 90 */
+    sys_epoll_create1,     /* 91 */
+    sys_epoll_ctl,         /* 92 */
+    sys_epoll_wait,        /* 93 */
+    sys_shm_open_wrapper,          /* 94 */
+    sys_shm_unlink_wrapper,        /* 95 */
 };
 
 void syscall_init(void) {

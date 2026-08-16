@@ -474,3 +474,43 @@ int secure_boot(int cmd, unsigned long arg) {
     if (ret < 0) { errno = (int)(-ret); return -1; }
     return (int)ret;
 }
+
+/* ---- futex ---- */
+long futex(int* uaddr, int op, int val,
+           const struct timespec* timeout,
+           int* uaddr2, int val3)
+{
+    return __syscall6(SYS_FUTEX, (long)uaddr, op, val,
+                      (long)timeout, (long)uaddr2, val3);
+}
+
+/* ---- epoll ---- */
+int epoll_create1(int flags) {
+    long ret = __syscall1(SYS_EPOLL_CREATE1, flags);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event) {
+    long ret = __syscall5(SYS_EPOLL_CTL, epfd, op, fd, (long)event, 0);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
+    long ret = __syscall5(SYS_EPOLL_WAIT, epfd, (long)events, maxevents, timeout, 0);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int shm_open(const char* name, int oflag, mode_t mode) {
+    long ret = __syscall3(SYS_SHM_OPEN, (long)name, oflag, mode);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
+
+int shm_unlink(const char* name) {
+    long ret = __syscall1(SYS_SHM_UNLINK, (long)name);
+    if (ret < 0) { errno = (int)(-ret); return -1; }
+    return (int)ret;
+}
