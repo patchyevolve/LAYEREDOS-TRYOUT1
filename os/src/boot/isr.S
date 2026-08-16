@@ -94,6 +94,15 @@ ISR_NOERR 69
 ISR_NOERR 70
 ISR_NOERR 71
 
+ISR_NOERR 72
+ISR_NOERR 73
+ISR_NOERR 74
+ISR_NOERR 75
+ISR_NOERR 76
+ISR_NOERR 77
+ISR_NOERR 78
+ISR_NOERR 79
+
 ISR_NOERR 128
 
 .extern interrupt_handler
@@ -164,5 +173,6 @@ isr_vectors:
 .quad isr48, isr49, isr50, isr51, isr52, isr53, isr54, isr55
 .quad isr56, isr57, isr58, isr59, isr60, isr61, isr62, isr63
 .quad isr64, isr65, isr66, isr67, isr68, isr69, isr70, isr71
-.zero 8 * 56
+.quad isr72, isr73, isr74, isr75, isr76, isr77, isr78, isr79
+.zero 8 * 48
 .quad isr128

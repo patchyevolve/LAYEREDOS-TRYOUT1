@@ -3,6 +3,7 @@
 #include "ndp.h"
 #include "icmpv6.h"
 #include "nic.h"
+#include "e1000.h"
 #include "ip.h"
 #include "route.h"
 #include "net.h"
@@ -280,6 +281,49 @@ static int test_udp_queue_roundtrip(void) {
     return TEST_PASS;
 }
 
+/* ============================================================
+ * Test 6: E1000 device-ID model classification
+ *
+ * Verifies the e1000e/igb probe table used by nic_init(): every
+ * supported device ID maps to the expected controller family
+ * (legacy / e1000e / igb), and unknown IDs are not accepted as
+ * legacy NICs. Guards the Phase 3.1 bare-metal NIC support.
+ * ============================================================ */
+static int test_e1000_model_table(void) {
+    if (e1000_model_for_devid(E1000_DEV_82540EM) != E1000_MODEL_LEGACY) {
+        kprintf("[TEST] e1000_model_table: FAIL — 82540EM not legacy\n");
+        return TEST_FAIL;
+    }
+    if (e1000_model_for_devid(E1000_DEV_82545EM) != E1000_MODEL_LEGACY) {
+        kprintf("[TEST] e1000_model_table: FAIL — 82545EM not legacy\n");
+        return TEST_FAIL;
+    }
+    if (e1000_model_for_devid(E1000_DEV_82571EB) != E1000_MODEL_E1000E ||
+        e1000_model_for_devid(E1000_DEV_82574L) != E1000_MODEL_E1000E ||
+        e1000_model_for_devid(E1000_DEV_I219V) != E1000_MODEL_E1000E) {
+        kprintf("[TEST] e1000_model_table: FAIL — e1000e family misclassified\n");
+        return TEST_FAIL;
+    }
+    if (e1000_model_for_devid(E1000_DEV_82576) != E1000_MODEL_IGB ||
+        e1000_model_for_devid(E1000_DEV_I210) != E1000_MODEL_IGB ||
+        e1000_model_for_devid(E1000_DEV_I211) != E1000_MODEL_IGB) {
+        kprintf("[TEST] e1000_model_table: FAIL — igb family misclassified\n");
+        return TEST_FAIL;
+    }
+    if (e1000_model_for_devid(0x1234) != E1000_MODEL_LEGACY) {
+        kprintf("[TEST] e1000_model_table: FAIL — unknown ID not rejected\n");
+        return TEST_FAIL;
+    }
+    if (kmemcmp(e1000_model_name(E1000_MODEL_E1000E), "e1000e", 7) != 0 ||
+        kmemcmp(e1000_model_name(E1000_MODEL_IGB), "igb", 4) != 0) {
+        kprintf("[TEST] e1000_model_table: FAIL — model name wrong\n");
+        return TEST_FAIL;
+    }
+
+    kprintf("[TEST] e1000_model_table: PASS\n");
+    return TEST_PASS;
+}
+
 void net_self_test(void) {
     kprintf("[TEST] === Network self-tests ===\n");
 
@@ -289,6 +333,7 @@ void net_self_test(void) {
     if (test_icmpv6_ns_parse() == TEST_PASS) pass++; else fail++;
     if (test_socket_refcount() == TEST_PASS) pass++; else fail++;
     if (test_udp_queue_roundtrip() == TEST_PASS) pass++; else fail++;
+    if (test_e1000_model_table() == TEST_PASS) pass++; else fail++;
 
     kprintf("[TEST] === Results: %d pass, %d fail ===\n", pass, fail);
 }

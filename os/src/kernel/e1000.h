@@ -5,10 +5,30 @@
 
 /* ── PCI Vendor/Device IDs ──────────────────────────────────────────────── */
 #define E1000_VENDOR_INTEL  0x8086
-#define E1000_DEV_82540EM   0x100E
+#define E1000_DEV_82540EM   0x100E   /* QEMU default 'e1000' */
 #define E1000_DEV_82545EM   0x100F
-#define E1000_DEV_82573L    0x109A
-#define E1000_DEV_82574L    0x10D3
+#define E1000_DEV_82571EB   0x105E   /* e1000e family */
+#define E1000_DEV_82572EI   0x107D   /* e1000e family */
+#define E1000_DEV_82576     0x10C9   /* QEMU 'igb' */
+#define E1000_DEV_82573L    0x109A   /* e1000e family */
+#define E1000_DEV_82574L    0x10D3   /* QEMU 'e1000e' */
+#define E1000_DEV_82579V    0x1503   /* e1000e family */
+#define E1000_DEV_I350      0x1521   /* igb family */
+#define E1000_DEV_I210      0x1533   /* igb family */
+#define E1000_DEV_I211      0x1539   /* igb family */
+#define E1000_DEV_I217V     0x15B8   /* e1000e family */
+#define E1000_DEV_I218V     0x15A1   /* e1000e family */
+#define E1000_DEV_I219V     0x15BC   /* e1000e family (modern consumer) */
+
+/* ── Controller model families ──────────────────────────────────────────── */
+typedef enum {
+    E1000_MODEL_LEGACY = 0,   /* 82540EM/82545EM: 82540-class register set */
+    E1000_MODEL_E1000E,       /* 82571/82572/82573/82574/82579/I217/I218/I219 */
+    E1000_MODEL_IGB,          /* 82576/I350/I210/I211 */
+} e1000_model_t;
+
+const char* e1000_model_name(e1000_model_t m);
+e1000_model_t e1000_model_for_devid(uint16_t devid);
 
 /* ── MMIO Register Offsets ──────────────────────────────────────────────── */
 #define E1000_CTRL      0x0000
@@ -37,6 +57,8 @@
 #define E1000_RAH0      0x5404
 #define E1000_MTA       0x5200
 #define E1000_MANC      0x5820   /* Management Control */
+#define E1000_IVAR      0x1700   /* IVAR (real 82574; entries: valid=0x80) */
+#define E1000_IVAR_QEMU 0x00E4   /* QEMU e1000e IVAR (entries: valid=0x8) */
 /* Statistics registers (from Intel 82540EM / QEMU e1000x_regs.h) */
 #define E1000_GPRC      0x4074   /* Good Packets Received Count - R/clr */
 #define E1000_GPTC      0x4080   /* Good Packets Transmitted Count - R/clr */
@@ -58,6 +80,44 @@
 #define E1000_CTRL_RST      (1 << 26)
 #define E1000_CTRL_VME      (1 << 30)
 #define E1000_CTRL_PHY_RST  (1 << 31)
+
+/* ── CTRL_EXT register (e1000e/igb, offset 0x18) ───────────────────────── */
+#define E1000_CTRL_EXT      0x0018
+#define E1000_CTRL_EXT_EXTDE (1 << 30)  /* Extended descriptors; 0 = legacy */
+
+/* ── TIPG register (e1000e/igb, offset 0x0410) ─────────────────────────── */
+#define E1000_TIPG          0x0410
+/* Linux e1000e: IPGT=8, IPGR1=8, IPGR2=2 for 1 Gb/s links */
+#define E1000_TIPG_1000     0x0A0806
+
+/* ── MDIC register (e1000e/igb, offset 0x20) — PHY access ─────────────── */
+#define E1000_MDIC          0x0020
+#define E1000_MDIC_DATA_MASK 0x0000FFFF
+#define E1000_MDIC_REG_SHIFT 16
+#define E1000_MDIC_REG_MASK  0x001F0000
+#define E1000_MDIC_PHY_SHIFT 21
+#define E1000_MDIC_PHY_MASK  0x03E00000
+#define E1000_MDIC_OP_READ   0x04000000
+#define E1000_MDIC_OP_WRITE  0x08000000
+#define E1000_MDIC_READY     0x10000000
+#define E1000_MDIC_ERROR     0x20000000
+
+/* ── MII PHY BMCR bits (written via MDIC) ─────────────────────────────── */
+#define E1000_BMCR_SPEED1000 0x0040
+#define E1000_BMCR_FD        0x0100
+#define E1000_BMCR_ANRESTART 0x0200
+#define E1000_BMCR_AUTOEN    0x1000
+
+/* ── Advanced (extended) TX descriptor bits (igb family) ──────────────── */
+#define E1000_ADVTXD_DTYP_CTXT 0x00200000
+#define E1000_ADVTXD_DTYP_DATA 0x00300000
+#define E1000_ADVTXD_DCMD_EOP  0x01000000
+#define E1000_ADVTXD_DCMD_IFCS 0x02000000
+#define E1000_ADVTXD_DCMD_RS   0x08000000
+#define E1000_ADVTXD_DCMD_DEXT 0x20000000
+
+/* ── SRRCTL0 (igb): Rx descriptor type, shares offset 0x100 with RCTL ─── */
+#define E1000_SRRCTL_DESCTYPE_ADV_ONEBUF 0x02000000
 
 /* ── STATUS register bits ───────────────────────────────────────────────── */
 #define E1000_STATUS_FD      (1 << 0)
@@ -114,6 +174,7 @@
 #define E1000_ICR_LSC       (1 << 2)
 #define E1000_ICR_RXDMT0    (1 << 4)
 #define E1000_ICR_RXT0      (1 << 7)
+#define E1000_ICR_RXQ0      (1 << 20)   /* e1000e: per-queue RX cause (QEMU/Intel) */
 
 /* ── TX descriptor command bits ─────────────────────────────────────────── */
 #define E1000_TXD_CMD_EOP    (1 << 0)
@@ -162,11 +223,29 @@ typedef struct __attribute__((packed)) {
     uint16_t special;
 } e1000_rx_desc_t;
 
+/* ── Advanced descriptor structures (igb family, 16 bytes each) ────────── */
+typedef struct __attribute__((packed)) {
+    uint64_t buffer_addr;    /* offset 0 */
+    uint32_t cmd_type_len;   /* offset 8: len[15:0] | DEXT | DTYP=DATA | EOP | IFCS | RS */
+    uint32_t olinfo_status;  /* offset 12: DD=bit0 written back by HW (whole desc zeroed) */
+} e1000_adv_tx_desc_t;
+
+typedef struct __attribute__((packed)) {
+    uint64_t pkt_addr;       /* offset 0 */
+    uint32_t status_error;   /* offset 8: DD=bit0, EOP=bit1 (writeback) */
+    uint16_t length;         /* offset 12 (writeback) */
+    uint16_t vlan;           /* offset 14 (writeback) */
+} e1000_adv_rx_desc_t;
+
 /* Public API for debugging */
 uint32_t nic_reg_read(uint32_t off);
 void     nic_reg_write(uint32_t off, uint32_t val);
 void     nic_dump_rx_ring(void);
 void     nic_dump_tx_ring(void);
 void     e1000_mta_set(const uint8_t* mac);
+
+/* MSI-X state (used by kernel self-tests) */
+int      e1000_msix_active(void);
+uint32_t e1000_msix_count(void);
 
 #endif

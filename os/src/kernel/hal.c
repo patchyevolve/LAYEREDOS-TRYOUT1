@@ -102,15 +102,12 @@ int hal_is_qemu_tcg(void) {
     uint32_t eax, ebx, ecx, edx;
     asm volatile("cpuid"
         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(1), "c"(0));
-
-    if (!(ecx & (1U << 31))) { result = 0; return 0; }
-
-    asm volatile("cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
         : "a"(0x40000000), "c"(0));
 
-    result = (ebx == 0x54434754 && ecx == 0x43544743 && edx == 0x47435447);
+    /* "TCGTCGTCG" (QEMU TCG). Note: some QEMU builds omit the CPUID
+     * hypervisor-present bit (leaf 1, ECX bit 31) under TCG, so the
+     * signature is checked directly; real CPUs return 0 for this leaf. */
+    result = (ebx == 0x54474354 && ecx == 0x43544743 && edx == 0x47435447);
     return result;
 }
 
@@ -119,17 +116,12 @@ int hal_is_qemu(void) {
     if (result != -1) return result;
 
     uint32_t eax, ebx, ecx, edx;
-    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
-
-    /* Check hypervisor present bit */
-    if (!(ecx & (1U << 31))) { result = 0; return 0; }
-
     asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x40000000), "c"(0));
 
     /* "KVMKVMKVM" (KVM) */
     if (ebx == 0x4B4D564B && ecx == 0x564B4D56 && edx == 0x4D) { result = 1; return 1; }
-    /* "TCGTCGTCG" (QEMU TCG) */
-    if (ebx == 0x54434754 && ecx == 0x43544743 && edx == 0x47435447) { result = 1; return 1; }
+    /* "TCGTCGTCG" (QEMU TCG) — see hal_is_qemu_tcg() for the bit-31 note */
+    if (ebx == 0x54474354 && ecx == 0x43544743 && edx == 0x47435447) { result = 1; return 1; }
 
     result = 0;
     return 0;

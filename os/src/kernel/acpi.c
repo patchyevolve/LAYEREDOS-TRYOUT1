@@ -555,3 +555,82 @@ void acpi_scan_cpus(void) {
                 (uint32_t)cpu_info[0].apic_id);
     }
 }
+
+/* ---- PCIe ECAM (MCFG) ---- */
+
+uint64_t mcfg_base_addr = 0;
+int mcfg_segment = 0;
+int mcfg_start_bus = 0;
+int mcfg_end_bus = -1;
+
+int acpi_parse_mcfg(void) {
+    if (!acpi_available) return -1;
+
+    rsdp_t* rsdp = acpi_find_rsdp();
+    if (!rsdp) return -1;
+
+    uint32_t entry_count;
+    sdt_header_t* root_table;
+    int use_xsdt = 0;
+
+    if (rsdp->revision >= 2 && rsdp->xsdt_addr) {
+        root_table = acpi_map_table(rsdp->xsdt_addr);
+        if (!root_table) return -1;
+        entry_count = (root_table->length - sizeof(sdt_header_t)) / 8;
+        use_xsdt = 1;
+    } else if (rsdp->rsdt_addr) {
+        root_table = acpi_map_table(rsdp->rsdt_addr);
+        if (!root_table) return -1;
+        entry_count = (root_table->length - sizeof(sdt_header_t)) / 4;
+    } else {
+        return -1;
+    }
+
+    if (acpi_checksum(root_table, root_table->length) != 0)
+        return -1;
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint64_t entry_phys;
+        if (use_xsdt) {
+            uint64_t* entries = (uint64_t*)((uintptr_t)root_table + sizeof(sdt_header_t));
+            entry_phys = entries[i];
+        } else {
+            uint32_t* entries = (uint32_t*)((uintptr_t)root_table + sizeof(sdt_header_t));
+            entry_phys = entries[i];
+        }
+
+        sdt_header_t* tbl = acpi_map_table(entry_phys);
+        if (!tbl) continue;
+
+        if (tbl->signature[0] == 'M' && tbl->signature[1] == 'C' &&
+            tbl->signature[2] == 'F' && tbl->signature[3] == 'G') {
+            if (acpi_checksum(tbl, tbl->length) != 0) {
+                kprintf("[ACPI] MCFG checksum failed\n");
+                continue;
+            }
+
+            kprintf("[ACPI] MCFG found: length=%u, revision=%u\n",
+                    tbl->length, (uint32_t)tbl->revision);
+
+            uint8_t* entry_ptr = (uint8_t*)tbl + sizeof(mcfg_header_t);
+            uint8_t* end = (uint8_t*)tbl + tbl->length;
+
+            while (entry_ptr + sizeof(mcfg_alloc_t) <= end) {
+                mcfg_alloc_t* alloc = (mcfg_alloc_t*)entry_ptr;
+                if (mcfg_base_addr == 0) {
+                    mcfg_base_addr = alloc->base_addr;
+                    mcfg_segment = alloc->pci_segment;
+                    mcfg_start_bus = alloc->start_bus;
+                    mcfg_end_bus = alloc->end_bus;
+                }
+                entry_ptr += sizeof(mcfg_alloc_t);
+            }
+
+            kprintf("[ACPI] ECAM: base=0x%llx seg=%d bus=%d-%d\n",
+                    (unsigned long long)mcfg_base_addr, mcfg_segment,
+                    mcfg_start_bus, mcfg_end_bus);
+            return 0;
+        }
+    }
+    return -1;
+}

@@ -84,7 +84,7 @@ typedef struct {
 extern int acpi_available;
 extern int cpu_count;
 extern cpu_info_t cpu_info[MAX_CPUS];
-extern int nr_cpus;
+extern volatile int nr_cpus;
 
 err_t acpi_init(uint64_t mb_info_phys);
 int   acpi_parse_madt(void);
@@ -175,5 +175,90 @@ int acpi_node_distance(int from, int to);
 /* Check if a physical page at page_idx belongs to the given NUMA node.
  * Returns 1 if yes, 0 if no or if NUMA is not available. */
 int acpi_is_page_in_node(uint64_t page_idx, int node);
+
+/* Generic ACPI address structure */
+typedef struct __attribute__((packed)) {
+    uint8_t  address_space_id;  /* 0=system memory, 1=system I/O */
+    uint8_t  register_bit_width;
+    uint8_t  register_bit_offset;
+    uint8_t  access_size;
+    uint64_t address;
+} acpi_gas_t;
+
+/* FADT (Fixed ACPI Description Table) — only fields we need */
+typedef struct __attribute__((packed)) {
+    sdt_header_t header;
+    uint32_t     firmware_ctrl;
+    uint32_t     dsdt;
+    uint8_t      _reserved1;
+    uint8_t      preferred_pm_profile;
+    uint16_t     sci_int;
+    uint32_t     smi_cmd;
+    uint8_t      acpi_enable;
+    uint8_t      acpi_disable;
+    uint8_t      s4bios_req;
+    uint8_t      pstate_cnt;
+    uint32_t     pm1a_evt_blk;
+    uint32_t     pm1b_evt_blk;
+    uint32_t     pm1a_cnt_blk;
+    uint32_t     pm1b_cnt_blk;
+    uint32_t     pm2_cnt_blk;
+    uint32_t     pm_tmr_blk;
+    uint32_t     gpe0_blk;
+    uint32_t     gpe1_blk;
+    uint8_t      pm1_evt_len;
+    uint8_t      pm1_cnt_len;
+    uint8_t      pm2_cnt_len;
+    uint8_t      pm_tmr_len;
+    uint8_t      gpe0_len;
+    uint8_t      gpe1_len;
+    uint8_t      gpe1_base;
+    uint8_t      _cst_cnt;
+    uint16_t     plvl2_lat;
+    uint16_t     plvl3_lat;
+    uint16_t     flush_size;
+    uint16_t     flush_stride;
+    uint8_t      duty_offset;
+    uint8_t      duty_width;
+    uint8_t      day_alrm;
+    uint8_t      mon_alrm;
+    uint8_t      century;
+    uint16_t     iapc_boot_arch;
+    uint8_t      _reserved2;
+    uint32_t     flags;
+    acpi_gas_t   reset_reg;
+    uint8_t      reset_value;
+    uint16_t     arm_boot_arch;
+    uint8_t      minor_revision;
+} __attribute__((packed)) fadt_t;
+
+/* Use ACPI FADT reset register to reboot. Returns 0 on success, -1 on failure. */
+int acpi_fadt_reset(void);
+
+/* ---- PCIe ECAM (MCFG) ---- */
+
+/* MCFG (PCI Express Memory-Mapped Configuration Space) */
+typedef struct {
+    sdt_header_t header;
+    uint64_t     reserved;
+} __attribute__((packed)) mcfg_header_t;
+
+/* MCFG allocation entry */
+typedef struct {
+    uint64_t base_addr;      /* physical ECAM base */
+    uint16_t pci_segment;
+    uint8_t  start_bus;
+    uint8_t  end_bus;
+    uint32_t reserved;
+} __attribute__((packed)) mcfg_alloc_t;
+
+/* Parsed MCFG — filled by acpi_parse_mcfg(); 0/empty when absent */
+extern uint64_t mcfg_base_addr;
+extern int      mcfg_segment;
+extern int      mcfg_start_bus;
+extern int      mcfg_end_bus;
+
+/* Parse MCFG from RSDT/XSDT. Returns 0 on success (mcfg_* filled), -1 if absent. */
+int acpi_parse_mcfg(void);
 
 #endif /* ACPI_H */
