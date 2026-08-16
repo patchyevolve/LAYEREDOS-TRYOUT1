@@ -3,11 +3,12 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "string.h"
+#include "hal.h"
 
 int acpi_available = 0;
 int cpu_count = 0;
 cpu_info_t cpu_info[MAX_CPUS];
-int nr_cpus = 0;
+volatile int nr_cpus = 0;
 
 int io_apic_count = 0;
 io_apic_info_t io_apics[MAX_IO_APICS];
@@ -531,6 +532,82 @@ int acpi_is_page_in_node(uint64_t page_idx, int node) {
         }
     }
     return 0;
+}
+
+int acpi_fadt_reset(void) {
+    if (!acpi_available) return -1;
+
+    rsdp_t* rsdp = acpi_find_rsdp();
+    if (!rsdp) return -1;
+
+    uint32_t entry_count;
+    sdt_header_t* root_table;
+    int use_xsdt = 0;
+
+    if (rsdp->revision >= 2 && rsdp->xsdt_addr) {
+        root_table = acpi_map_table(rsdp->xsdt_addr);
+        if (!root_table) return -1;
+        entry_count = (root_table->length - sizeof(sdt_header_t)) / 8;
+        use_xsdt = 1;
+    } else if (rsdp->rsdt_addr) {
+        root_table = acpi_map_table(rsdp->rsdt_addr);
+        if (!root_table) return -1;
+        entry_count = (root_table->length - sizeof(sdt_header_t)) / 4;
+    } else {
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint64_t entry_phys;
+        if (use_xsdt) {
+            uint64_t* entries = (uint64_t*)((uintptr_t)root_table + sizeof(sdt_header_t));
+            entry_phys = entries[i];
+        } else {
+            uint32_t* entries = (uint32_t*)((uintptr_t)root_table + sizeof(sdt_header_t));
+            entry_phys = entries[i];
+        }
+
+        sdt_header_t* tbl = acpi_map_table(entry_phys);
+        if (!tbl) continue;
+
+        /* Check for FADT signature "FACP" */
+        if (tbl->signature[0] == 'F' && tbl->signature[1] == 'A' &&
+            tbl->signature[2] == 'C' && tbl->signature[3] == 'P') {
+            if (acpi_checksum(tbl, tbl->length) != 0)
+                continue;
+
+            if (tbl->length < 129) continue; /* need at least reset_reg + reset_value */
+
+            fadt_t* fadt = (fadt_t*)tbl;
+
+            uint8_t  space_id = fadt->reset_reg.address_space_id;
+            uint8_t  access_sz = fadt->reset_reg.access_size;
+            uint64_t addr = fadt->reset_reg.address;
+            uint8_t  val = fadt->reset_value;
+
+            /* If the FADT has no reset register, skip */
+            if (addr == 0) continue;
+
+            if (space_id == 1) {
+                /* System I/O */
+                if (access_sz == 1 || access_sz == 0) {
+                    outb((uint16_t)addr, val);
+                } else if (access_sz == 2) {
+                    outw((uint16_t)addr, val);
+                } else {
+                    outb((uint16_t)addr, val);
+                }
+            } else if (space_id == 0) {
+                /* System memory — write through identity mapping */
+                volatile uint8_t* p = (volatile uint8_t*)(uintptr_t)addr;
+                *p = val;
+            } else {
+                return -1;
+            }
+            return 0;
+        }
+    }
+    return -1;
 }
 
 void acpi_scan_cpus(void) {

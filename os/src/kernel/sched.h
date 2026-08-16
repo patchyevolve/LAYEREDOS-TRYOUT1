@@ -45,6 +45,7 @@ typedef struct thread {
     uint64_t            total_ticks;
     uint64_t            age_ticks;
     uint64_t            wakeup_tick;
+    uint64_t            wakeup_rdtsc;
     thread_t*           rq_next;
     thread_t*           rq_prev;
     thread_t*           wq_next;
@@ -94,7 +95,7 @@ extern volatile int sched_running;
 extern thread_t* current_thread_global;
 static inline thread_t** __current_thread_ptr(void) {
     int __cpu = smp_cpu_id();
-    if (per_cpu_data[__cpu])
+    if (__cpu >= 0 && __cpu < MAX_CPUS && per_cpu_data[__cpu])
         return (thread_t**)&per_cpu_data[__cpu]->cpu_thread;
     return &current_thread_global;
 }

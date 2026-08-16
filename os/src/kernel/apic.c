@@ -101,16 +101,6 @@ err_t apic_init(void) {
 
     kprintf("[APIC] Base MSR=%llx, phys=%llx\n", apic_base_msr, apic_base_phys);
 
-    /* Check for x2APIC support. We keep x2APIC detection and MSR infrastructure
-     * for future use, but for now use xAPIC MMIO everywhere — KVM properly
-     * handles APIC MMIO via VMCS controls and TCG is excluded below. */
-
-    /* Fall back to xAPIC MMIO */
-    if (hal_is_qemu_tcg()) {
-        kprintf("[APIC] QEMU TCG detected — skipping MMIO mapping (softmmu cache workaround), using legacy PIC\n");
-        return ERR_NOENT;
-    }
-
 #define APIC_VADDR 0xFFFFFFFFFFFFE000ULL
 
     err_t err = vmm_map_page(vmm_get_kernel_pml4(), APIC_VADDR, apic_base_phys,

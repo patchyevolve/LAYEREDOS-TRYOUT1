@@ -37,12 +37,26 @@ int smp_cpu_id(void) {
         asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"((uint32_t)0x802));
         apic_id_phys = lo;
     } else {
-        /* xAPIC mode: ID from APIC ID register (offset 0x20, bits 31:24) */
-        apic_id_phys = (apic_read(APIC_REG_ID) >> 24) & 0xFF;
+        /* xAPIC mode: ID from CPUID leaf 1 EBX[31:24] (Initial APIC ID).
+         * Using CPUID instead of apic_read(APIC_REG_ID) because APIC MMIO
+         * reads are non-deterministic on QEMU TCG with 4+ vCPUs — the MMIO
+         * can return stale/wrong values under concurrent access from
+         * multiple vCPUs.  CPUID is deterministic per vCPU on both TCG
+         * and KVM, and is available on all x86-64 processors. */
+        uint32_t _a, ebx, _c, _d;
+        asm volatile("cpuid" : "=a"(_a), "=b"(ebx), "=c"(_c), "=d"(_d) : "a"(1));
+        apic_id_phys = (ebx >> 24) & 0xFF;
     }
 
-    /* Map APIC ID to dense CPU index */
-    for (int i = 0; i < nr_cpus; i++) {
+
+
+    /* Map APIC ID to dense CPU index — search the full cpu_info array,
+     * not just 0..nr_cpus-1, because nr_cpus may have been reduced when
+     * AP bring-up failed for higher-numbered CPUs, but their cpu_info
+     * entries still exist.  Without this, a running CPU whose APIC ID
+     * falls past the reduced nr_cpus gets smp_cpu_id()=0, trashing CPU
+     * 0's per-CPU data. */
+    for (int i = 0; i < MAX_CPUS; i++) {
         if (cpu_info[i].apic_id == apic_id_phys)
             return i;
     }
@@ -144,6 +158,17 @@ static uint8_t ap_stacks[MAX_CPUS][AP_STACK_SIZE] __attribute__((aligned(4096)))
 void ap_entry(per_cpu_data_t* pcp) {
     int cpu = pcp->cpu_id;
 
+    /* Late-boot guard: if nr_cpus was reduced because other higher-numbered
+     * CPUs failed to come online, this CPU is not expected — self-halt. */
+    if (cpu >= nr_cpus) {
+        kprintf("[AP] CPU %d: late boot after nr_cpus reduced to %d, halting\n",
+                cpu, nr_cpus);
+        for (;;) asm volatile("hlt");
+    }
+
+    /* Force fresh read of nr_cpus for subsequent checks */
+    mb();
+
     kprintf("[AP] CPU %d started (APIC ID %d)\n", cpu, cpu_info[cpu].apic_id);
 
     /* Initialize per-CPU data */
@@ -171,6 +196,16 @@ void ap_entry(per_cpu_data_t* pcp) {
     /* Mark this CPU online (hotplug-aware) */
     cpu_state[cpu] = CPU_STATE_ONLINE;
     mb();  /* Ensure write is visible to other CPUs */
+
+    /* Late-boot guard (phase 2): recheck nr_cpus before entering the
+     * scheduler.  The BSP may have reduced nr_cpus since our first
+     * check — if so, self-halt rather than creating scheduler state
+     * that the system doesn't expect. */
+    if (cpu >= nr_cpus) {
+        kprintf("[AP] CPU %d: late boot (phase 2) after nr_cpus reduced, halting\n",
+                cpu);
+        for (;;) asm volatile("hlt");
+    }
 
     /* Initialize per-CPU scheduler (creates idle thread for this CPU) */
     err_t err = sched_init_ap();
@@ -289,10 +324,11 @@ void smp_test_cross_cpu_ipi(void) {
     }
 
     uint64_t elapsed_us = (hpet_ns() - start_ns) / 1000;
-    if (received)
+    if (received) {
         kprintf("[IPI-TEST] cross-CPU IPI to CPU1: RECEIVED (counter=%d) after %llu us\n",
                 ap_ipi_test_counter, elapsed_us);
-    else
+        /* smp_ipi_works = 1; — temporarily disabled for IPI isolation test */
+    } else
         kprintf("[IPI-TEST] cross-CPU IPI to CPU1: NOT RECEIVED after %llu us\n",
                 elapsed_us);
 }
@@ -332,7 +368,10 @@ void smp_init_aps(void) {
         volatile uint64_t* tp_stack = (volatile uint64_t*)PHYS_TO_VIRT(0x4200);
         volatile uint64_t* tp_percpu = (volatile uint64_t*)PHYS_TO_VIRT(0x4208);
         volatile uint64_t* tp_cr3 = (volatile uint64_t*)PHYS_TO_VIRT(0x4210);
+        volatile uint64_t* tp_abort = (volatile uint64_t*)PHYS_TO_VIRT(0x4218);
 
+        /* Clear abort flag — if this AP fails, we set it to catch late boots */
+        *tp_abort = 0;
         *tp_stack = ap_stack;
         *tp_percpu = (uint64_t)per_cpu_data[cpu];
         *tp_cr3 = kernel_cr3_val;
@@ -357,11 +396,29 @@ void smp_init_aps(void) {
                     cpu, ap_ready_count);
             /* Retry SIPI once */
             apic_send_sipi_ipi(apic_id, 0x04);
+
+            /* Set abort flag BEFORE the 200ms wait — closes the race where
+             * the AP boots from this SIPI after we've given up.  On TCG,
+             * the AP doesn't start until the BSP sleeps, so writing the
+             * abort flag now ensures the AP sees it before entering
+             * ap_entry. */
+            *tp_abort = 1;
+            mb();
             thread_sleep(200);
+
             if (ap_ready_count >= cpu) {
                 kprintf("[SMP] AP %d responded after retry\n", cpu);
+                /* Clear abort — the AP booted successfully */
+                *tp_abort = 0;
+                mb();
             } else {
                 kprintf("[SMP] FAILED to bring up AP %d\n", cpu);
+                /* Reduce nr_cpus so code never accesses this CPU's
+                 * per-CPU data (which lacks idle thread, GDT/TSS, etc.)
+                 * or tries to pin threads to a non-existent CPU. */
+                nr_cpus = cpu;
+                mb();
+                kprintf("[SMP] Reduced nr_cpus to %d\n", nr_cpus);
             }
         }
     }

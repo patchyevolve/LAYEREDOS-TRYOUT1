@@ -11,6 +11,7 @@
 #include "smp.h"
 #include "apic.h"
 #include "rcu.h"
+#include "kernel_invariant.h"
 
 uint64_t next_thread_id = 1;
 static uint64_t kernel_cr3 = 0;
@@ -95,42 +96,60 @@ uint32_t sched_thread_count(void) {
 }
 
 void sched_reap_zombies(void) {
+    /* Collect reap candidates under all_threads_lock, then process
+     * outside the lock.  This avoids an ABBA deadlock: the guard-page
+     * remap calls vmm_flush_tlb_page() which may send a cross-CPU IPI
+     * and spin-wait for an ack.  If another CPU holds all_threads_lock
+     * with IRQs off (spinlock_acquire disables interrupts), it can
+     * never service the IPI → deadlock. */
+#define MAX_REAP_BATCH 64
+    thread_t* to_reap[MAX_REAP_BATCH];
+    int n_reap = 0;
+
     cpu_flags_t flags;
     spinlock_acquire(&all_threads_lock, &flags);
     thread_t* t = all_threads_head;
-    while (t) {
+    while (t && n_reap < MAX_REAP_BATCH) {
         thread_t* next = t->all_next;
-        int do_reap = 0;
         cpu_flags_t jflags;
-        if (t->state == THREAD_TERMINATED && t != idle_thr && t != current_thread) {
+        if (t->state == THREAD_TERMINATED && t != idle_thr) {
             spinlock_acquire(&t->join_queue.lock, &jflags);
-            if (t->join_queue.count == 0) do_reap = 1;
-            else spinlock_release(&t->join_queue.lock, jflags);
-        }
-        if (do_reap) {
-            all_threads_remove(t);
-            if (t->proc)
-                list_del(&t->threads_node);
-            spinlock_release(&t->join_queue.lock, jflags);
-            if (t->kernel_stack) {
-                /* Re-map guard page so pmm can use it.
-                 * Must use vmm_peek_pte (not vmm_walk_pagetable) because
-                 * thread_create cleared the leaf PTE (PAGE_PRESENT=0),
-                 * so vmm_walk_pagetable would return NULL. */
-                uint64_t __guard_phys = t->block_phys + PAGE_SIZE;
-                uint64_t __gv = (uint64_t)PHYS_TO_VIRT(__guard_phys);
-                page_entry_t* __gpte = vmm_peek_pte(vmm_get_kernel_pml4(), __gv);
-                if (__gpte) {
-                    *__gpte = __guard_phys | PAGE_PRESENT | PAGE_WRITE;
-                    asm volatile("invlpg (%0)" : : "r"(__gv) : "memory");
-                }
-                uint32_t __np = (t->kernel_stack_size + PAGE_SIZE - 1) / PAGE_SIZE + 2;
-                pmm_free_pages(t->block_phys, __np);
+            if (t->join_queue.count == 0) {
+                all_threads_remove(t);
+                if (t->proc)
+                    list_del(&t->threads_node);
+                to_reap[n_reap++] = t;
             }
+            spinlock_release(&t->join_queue.lock, jflags);
         }
         t = next;
     }
     spinlock_release(&all_threads_lock, flags);
+
+    /* Process outside the lock — guard-page remap may send TLB IPIs */
+    for (int i = 0; i < n_reap; i++) {
+        thread_t* rt = to_reap[i];
+        /* Safety net: ensure the thread is not on any run queue before
+         * freeing its TCB and kernel stack.  If thread_exit() missed the
+         * removal (e.g., the thread was stolen by sched_balance_push()),
+         * we must dequeue it now — otherwise another CPU's pick_next()
+         * will later return the freed TCB → switch_context loads corrupt
+         * rsp from the reallocated memory → UAF crash. */
+        if (rt->rq_next || rt->rq_prev)
+            sched_remove_thread(rt);
+        if (rt->kernel_stack) {
+            uint64_t __guard_phys = rt->block_phys + PAGE_SIZE;
+            uint64_t __gv = (uint64_t)PHYS_TO_VIRT(__guard_phys);
+            page_entry_t* __gpte = vmm_peek_pte(vmm_get_kernel_pml4(), __gv);
+            if (__gpte) {
+                *__gpte = __guard_phys | PAGE_PRESENT | PAGE_WRITE;
+                vmm_flush_tlb_page(__gv);
+            }
+            uint32_t __np = (rt->kernel_stack_size + PAGE_SIZE - 1) / PAGE_SIZE + 2;
+            pmm_free_pages(rt->block_phys, __np);
+        }
+    }
+#undef MAX_REAP_BATCH
 }
 
 static void sched_add_thread_to_cpu_locked(thread_t* t, int cpu) {
@@ -162,10 +181,10 @@ static void sched_add_thread_to_cpu(thread_t* t, int cpu) {
     cpu_flags_t flags;
     spinlock_acquire(&sched_queue_lock, &flags);
     sched_add_thread_to_cpu_locked(t, cpu);
-    /* If the target CPU is idle (HLT), it won't notice the new thread
-     * without a reschedule IPI.  This is critical when the BSP's APIC
-     * timer is broken by QEMU's SMP+PCI quirk — without the IPI the
-     * BSP stays in HLT forever even with READY threads on its queue. */
+
+    /* If the target CPU is different from the current one and idle,
+     * send a reschedule IPI so it picks up the new thread immediately.
+     * This handles the normal cross-CPU placement path. */
     if (cpu != smp_cpu_id() && per_cpu_data[cpu]) {
         per_cpu_data_t* tgt = per_cpu_data[cpu];
         if ((thread_t*)tgt->cpu_thread == (thread_t*)tgt->idle_thread) {
@@ -174,6 +193,7 @@ static void sched_add_thread_to_cpu(thread_t* t, int cpu) {
             return;
         }
     }
+
     spinlock_release(&sched_queue_lock, flags);
 }
 
@@ -262,9 +282,10 @@ static int bitmap_find_highest(per_cpu_data_t* pcp) {
 
 /* Try to steal a thread from another CPU's run queue.
  * Called when the local run queue is empty. Returns the stolen thread
- * (already dequeued from the source CPU) or NULL. */
-static thread_t* sched_steal_thread(void) {
-    int this_cpu = smp_cpu_id();
+ * (already dequeued from the source CPU) or NULL.
+ * NOTE: `this_cpu` must be the CACHED CPU ID from schedule() — never call
+ * smp_cpu_id() here because on TCG 4-CPU it can return inconsistent values. */
+static thread_t* sched_steal_thread(int this_cpu) {
     int ncpus = smp_enabled ? nr_cpus : 1;
     if (ncpus < 2) return NULL;
 
@@ -327,13 +348,11 @@ static thread_t* sched_steal_thread(void) {
 
 /* Push one thread from this CPU's queue to an underloaded sibling.
  * Called from sched_timer_tick when this CPU is overloaded.
- * Uses try_acquire so it is safe in ISR context — skips if contended. */
-static void sched_balance_push(void) {
-    int this_cpu = smp_cpu_id();
+ * Uses try_acquire so it is safe in ISR context — skips if contended.
+ * NOTE: `this_cpu` and `pcp` must come from the CACHED schedule() values. */
+static void sched_balance_push(int this_cpu, per_cpu_data_t* pcp) {
     int ncpus = smp_enabled ? nr_cpus : 1;
     if (ncpus < 2) return;
-
-    per_cpu_data_t* pcp = sched_pcp();
     if (pcp->rq_total <= 1) return;
 
     /* Compute average load */
@@ -392,13 +411,16 @@ static void sched_balance_push(void) {
         return;
     }
 
-    /* Dequeue from local queue */
-    if (t->rq_next) {
-        pcp->rq_heads[low_prio] = (void*)t->rq_next;
-        t->rq_next->rq_prev = NULL;
+    /* Dequeue from local queue — handles both head and middle removal */
+    if (t->rq_prev) {
+        t->rq_prev->rq_next = t->rq_next;
     } else {
-        pcp->rq_heads[low_prio] = NULL;
-        pcp->rq_tails[low_prio] = NULL;
+        pcp->rq_heads[low_prio] = (void*)t->rq_next;
+    }
+    if (t->rq_next) {
+        t->rq_next->rq_prev = t->rq_prev;
+    } else {
+        pcp->rq_tails[low_prio] = (void*)t->rq_prev;
     }
     pcp->rq_counts[low_prio]--;
     pcp->rq_total--;
@@ -432,12 +454,12 @@ static void sched_balance_push(void) {
         smp_send_reschedule(target);
 }
 
-static thread_t* pick_next(void) {
-    per_cpu_data_t* pcp = sched_pcp();
+static thread_t* pick_next(per_cpu_data_t* pcp) {
+    int this_cpu = pcp->cpu_id;
     int prio = bitmap_find_highest(pcp);
     if (prio < 0) {
         /* Local queue is empty — try to steal from another CPU */
-        thread_t* stolen = sched_steal_thread();
+        thread_t* stolen = sched_steal_thread(this_cpu);
         if (stolen) return stolen;
         return (thread_t*)pcp->idle_thread;
     }
@@ -445,7 +467,7 @@ static thread_t* pick_next(void) {
     /* Proactive stealing: if the best local thread is low-priority,
      * try to steal a higher-priority thread from a loaded sibling. */
     if (prio > 150 && smp_enabled && nr_cpus > 1) {
-        thread_t* stolen = sched_steal_thread();
+        thread_t* stolen = sched_steal_thread(this_cpu);
         if (stolen) {
             if (stolen->priority < prio)
                 return stolen;
@@ -458,7 +480,7 @@ static thread_t* pick_next(void) {
     cpu_flags_t qflags;
     if (!spinlock_try_acquire(&sched_queue_lock, &qflags)) {
         /* Contended — skip this round; called from ISR context. */
-        thread_t* stolen = sched_steal_thread();
+        thread_t* stolen = sched_steal_thread(this_cpu);
         if (stolen) return stolen;
         return (thread_t*)pcp->idle_thread;
     }
@@ -467,7 +489,7 @@ static thread_t* pick_next(void) {
         spinlock_release(&sched_queue_lock, qflags);
         /* Race: thread was dequeued between bitmap check and lock.
          * Try stealing instead of returning idle immediately. */
-        thread_t* stolen = sched_steal_thread();
+        thread_t* stolen = sched_steal_thread(this_cpu);
         if (stolen) return stolen;
         return (thread_t*)pcp->idle_thread;
     }
@@ -532,7 +554,42 @@ static inline void sched_check_stack(thread_t* t) {
 }
 
 void schedule(void) {
-    if (!sched_running || !current_thread) return;
+    /* Cache CPU ID once — ALL subsequent accesses to per-CPU data use this
+     * value.  On TCG, smp_cpu_id() can return different values across
+     * successive calls within the same schedule() invocation because
+     * apic_read(APIC_REG_ID) may be non-deterministic with 4 TCG vCPUs. */
+    int sched_cpu = smp_cpu_id();
+    /* Diagnostics: validate current_thread's kernel stack.
+     * Only runs on first invocation per context switch (before invariant checks). */
+    {   uint64_t _rs;
+        asm volatile("mov %%rsp, %0" : "=r"(_rs));
+        thread_t* _ct = current_thread;
+        if (_ct && _ct->kernel_stack &&
+            (uint64_t)_ct > 0xFFFF800000000000ULL &&
+            (_rs < (uint64_t)_ct->kernel_stack || _rs > (uint64_t)_ct->kernel_stack + _ct->kernel_stack_size)) {
+            kprintf("\n[SCHED STACK] rsp=%p cur='%s' id=0x%llx state=%d "
+                    "stack=[%p-%p) rq_prev=%p rq_next=%p\n",
+                    (void*)_rs, _ct->name, _ct->id, _ct->state,
+                    (void*)_ct->kernel_stack,
+                    (void*)((uint64_t)_ct->kernel_stack + _ct->kernel_stack_size),
+                    _ct->rq_prev, _ct->rq_next);
+        }
+    }
+    if (sched_cpu < 0 || sched_cpu >= MAX_CPUS) {
+        static const char _msg[] = "\n[SCHED FATAL] smp_cpu_id=";
+        for (const char* _p = _msg; *_p; _p++) kputchar(*_p);
+        kputchar('0' + (sched_cpu > 9 ? 0 : (sched_cpu < 0 ? '-' : sched_cpu % 10)));
+        kputchar('\n');
+        asm volatile("cli; 1: hlt; jmp 1b");
+    }
+    per_cpu_data_t* pcp = per_cpu_data[sched_cpu];
+    if (!pcp || pcp->cpu_id != sched_cpu) {
+        kprintf("\n[SCHED FATAL] per_cpu_data[%d]=%p cpu_id=%d\n",
+                sched_cpu, (void*)pcp, pcp ? pcp->cpu_id : -1);
+        asm volatile("cli; 1: hlt; jmp 1b");
+    }
+
+    if (!sched_running || !pcp->cpu_thread) return;
 
     /* Report RCU quiescent state — every context switch is a QS */
     rcu_quiescent_state();
@@ -542,37 +599,90 @@ void schedule(void) {
      * boot (before the idle thread was recognized). */
     watchdog_clear_stuck();
 
-    per_cpu_data_t* pcp = sched_pcp();
+    kernel_validate_invariants();
+
+    /* Check for expired sleepers every ~10ms via RDTSC — on KVM SMP,
+     * APIC/PIT timer interrupts can stop after AP bring-up, freezing
+     * hal_timer_get_ticks().  RDTSC always advances.
+     * Uses per-CPU last_check_rdtsc (not a shared static) to avoid
+     * races between vCPUs on TCG. */
+    {
+        uint64_t now = rdtsc();
+        uint64_t interval = tsc_khz * 10;
+        if (now - pcp->last_check_rdtsc >= interval || pcp->last_check_rdtsc == 0) {
+            pcp->last_check_rdtsc = now;
+            (void)check_sleepers();
+        }
+    }
+
+    /* Periodic load balancing (~100ms) via RDTSC */
+    {
+        uint64_t now = rdtsc();
+        if (now - pcp->last_balance_rdtsc > (uint64_t)tsc_khz * 100) {
+            pcp->last_balance_rdtsc = now;
+            sched_balance_push(sched_cpu, pcp);
+        }
+    }
     pcp->need_reschedule = 0;
     cpu_flags_t flags = hal_save_irq();
 
-    sched_check_stack(current_thread);
+    /* Use pcp->cpu_thread directly to avoid redundant smp_cpu_id() calls
+     * from the current_thread macro — on TCG with reduced nr_cpus,
+     * smp_cpu_id() can return 0 for a CPU whose APIC ID is not in the
+     * cpu_info array, causing reads/writes to the wrong per-CPU slot. */
+    thread_t* cur = (thread_t*)pcp->cpu_thread;
 
-    thread_t* next = pick_next();
+    sched_check_stack(cur);
 
-    if (next == current_thread) {
-        if (current_thread->state == THREAD_RUNNING &&
-            current_thread != (thread_t*)pcp->idle_thread)
+    thread_t* next = pick_next(pcp);
+
+    if (next == cur) {
+        if (cur->state == THREAD_RUNNING &&
+            cur != (thread_t*)pcp->idle_thread)
             sched_add_thread(next);
         hal_restore_irq(flags);
         return;
     }
 
-    if (current_thread->state == THREAD_RUNNING &&
-        current_thread != (thread_t*)pcp->idle_thread) {
-        current_thread->state = THREAD_READY;
-        current_thread->priority = current_thread->base_priority;
-        current_thread->age_ticks = 0;
-        sched_add_thread(current_thread);
+    if (cur->state == THREAD_RUNNING &&
+        cur != (thread_t*)pcp->idle_thread) {
+        cur->state = THREAD_READY;
+        cur->priority = cur->base_priority;
+        cur->age_ticks = 0;
+        sched_add_thread(cur);
     }
 
+    /* Validate next pointer — catch UAF / non-canonical before GP */
+    if ((uint64_t)next < 0xFFFF800000000000ULL || (uint64_t)next >= 0xFFFFFFFFFFFFF000ULL) {
+        kprintf("[SCHED] FATAL: next=%p (non-canonical or NULL) cpu=%d\n", (void*)next, sched_cpu);
+        kprintf("[SCHED] cur=%p idle=%p\n", (void*)cur, (void*)pcp->idle_thread);
+        kprintf("[SCHED] pcp->rq_heads[0..3]=%p %p %p %p\n",
+                (void*)pcp->rq_heads[0], (void*)pcp->rq_heads[1],
+                (void*)pcp->rq_heads[2], (void*)pcp->rq_heads[3]);
+        kpanic("pick_next returned invalid thread pointer");
+    }
+
+    /* Validate next->rsp is within its own kernel stack — catch TCB
+     * field corruption (from UAF or stack overflow) before switch_context
+     * loads garbage RSP and jumps to a random address. */
+    if (next->kernel_stack) {
+        uint64_t ns_base = (uint64_t)next->kernel_stack;
+        uint64_t ns_top  = ns_base + next->kernel_stack_size;
+        if (next->rsp < ns_base || next->rsp >= ns_top) {
+            kprintf("[SCHED] FATAL: next='%s' rsp=%p outside stack=[%p-%p) cpu=%d\n",
+                    next->name, (void*)next->rsp, (void*)ns_base, (void*)ns_top, sched_cpu);
+            kprintf("[SCHED] cur='%s' state=%d idle=%p next->state=%d\n",
+                    cur->name, cur->state, (void*)pcp->idle_thread, next->state);
+            kpanic("next->rsp corrupted before switch_context");
+        }
+    }
     uint64_t target_cr3 = next->cr3 ? next->cr3 : kernel_cr3;
     if (target_cr3) {
         asm volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
     }
 
-    thread_t* old = current_thread;
-    sched_sync_current(old, next);
+    thread_t* old = cur;
+    pcp->cpu_thread = next;
     next->state = THREAD_RUNNING;
     next->time_slice_remaining = THREAD_TIME_SLICE;
     sched_switch_count++;
@@ -580,7 +690,7 @@ void schedule(void) {
     uint64_t kstack_top = (uint64_t)next->kernel_stack + next->kernel_stack_size;
     hal_set_kernel_stack(kstack_top);
 
-    switch_context(&old, &current_thread);
+    switch_context(&old, (thread_t**)&pcp->cpu_thread);
 
     /* Finalize any thread retired on this CPU — the previous thread's
      * stack is now fully vacated.  This is reached when a preempted or
@@ -606,8 +716,6 @@ thread_t* thread_create(void (*func)(void*), void* arg,
     uint32_t total_pages = stack_pages + 2;
 
     uint64_t block_phys = pmm_alloc_node_pages(total_pages, pmm_current_node());
-    kprintf("[DBG] thread_create \"%s\": block_phys=0x%lx guard=0x%lx stack=0x%lx\n",
-            name ? name : "?", block_phys, block_phys + PAGE_SIZE, block_phys + 2*PAGE_SIZE);
     if (!block_phys) return NULL;
 
     /* TCB in the LOW page */
@@ -623,7 +731,7 @@ thread_t* thread_create(void (*func)(void*), void* arg,
     if (gpte) {
         uint64_t saved = *gpte;
         *gpte = 0;
-        asm volatile("invlpg (%0)" : : "r"(guard_virt) : "memory");
+        vmm_flush_tlb_page(guard_virt);
         (void)saved;
     }
 
@@ -670,26 +778,30 @@ void thread_exit(int exit_code) {
      * called from schedule(), the idle loop, or the next thread_exit. */
     sched_finalize_retiring();
 
+    /* Remove from any run queue before setting ZOMBIE — the thread might
+     * have been stolen by sched_balance_push() while READY on another CPU.
+     * If it stays in a foreign run queue, that CPU's pick_next() will later
+     * return a freed TCB → UAF → crash (wrong RSP restored on context switch). */
     cpu_flags_t flags = hal_save_irq();
+    sched_remove_thread(current_thread);
     current_thread->exit_code = exit_code;
     current_thread->state = THREAD_ZOMBIE;
     /* IRQs stay disabled through sched_wake (spinlock save/restore preserves) */
     sched_wake(&current_thread->join_queue);
 
-    thread_t* next = pick_next();
+    per_cpu_data_t* pcp_exit = sched_pcp();
+    thread_t* next = pick_next(pcp_exit);
     if (!next) {
         kpanic("No thread to schedule after thread exit!");
     }
-
-    thread_t* old = current_thread;
+    thread_t* old = (thread_t*)pcp_exit->cpu_thread;
 
     /* Publish the retiring thread before switch_context — the reaper
      * on another CPU won't free the stack until finalize sets TERMINATED
      * (after the context switch has fully vacated the old stack). */
-    per_cpu_data_t* pcp = sched_pcp();
-    pcp->retiring_thread = (uint64_t)(uintptr_t)old;
+    pcp_exit->retiring_thread = (uint64_t)(uintptr_t)old;
 
-    set_current_thread(next);
+    pcp_exit->cpu_thread = next;
     next->state = THREAD_RUNNING;
     next->time_slice_remaining = THREAD_TIME_SLICE;
 
@@ -708,15 +820,20 @@ void thread_exit(int exit_code) {
      * thread_trampoline for brand-new threads).  The ZOMBIE→TERMINATED
      * transition happens from sched_finalize_retiring() in schedule(),
      * idle_thread(), or the next thread_exit() on this CPU. */
-    switch_context(&old, &current_thread);
+    switch_context(&old, (thread_t**)&pcp_exit->cpu_thread);
     hal_restore_irq(flags);
 }
 
 void thread_sleep(uint64_t ms) {
     if (!current_thread) return;
-    uint64_t wake_tick = hal_timer_get_ticks() + (ms * hal_timer_get_hz() / 1000);
+    /* Use RDTSC for the wakeup deadline — this is critical on KVM SMP
+     * where the PIT/APIC timer stops delivering interrupts after AP
+     * bring-up, causing hal_timer_get_ticks() to freeze.  RDTSC always
+     * advances regardless of timer hardware state. */
+    uint64_t wake_rdtsc = rdtsc() + ms * tsc_khz;
     cpu_flags_t flags = hal_save_irq();
-    current_thread->wakeup_tick = wake_tick;
+    current_thread->wakeup_rdtsc = wake_rdtsc;
+    current_thread->wakeup_tick = 0;
     current_thread->state = THREAD_SLEEPING;
     current_thread->time_slice_remaining = 0;
     schedule();
@@ -823,7 +940,15 @@ int check_sleepers(void) {
     thread_t* t = all_threads_head;
     while (t) {
         thread_t* next = t->all_next;
-        if (t->state == THREAD_SLEEPING && t->wakeup_tick <= now) {
+        /* Wake on RDTSC deadline (primary) or tick deadline (fallback).
+         * RDTSC-based wakeup is essential on KVM SMP where PIT/APIC
+         * timer interrupts stop after AP bring-up, freezing timer_ticks. */
+        int expired = 0;
+        if (t->state == THREAD_SLEEPING && t->wakeup_rdtsc > 0 && rdtsc() >= t->wakeup_rdtsc)
+            expired = 1;
+        if (t->state == THREAD_SLEEPING && t->wakeup_rdtsc == 0 && t->wakeup_tick > 0 && t->wakeup_tick <= now)
+            expired = 1;
+        if (expired) {
             /* Wake on the CPU where the thread was last running */
             int target_cpu = t->cpu_queue;
             int this_cpu = smp_cpu_id();
@@ -920,7 +1045,8 @@ uint64_t sched_get_switch_count(void) { return sched_switch_count; }
 uint64_t sched_get_yield_count(void) { return sched_yield_count; }
 
 void set_current_thread(thread_t* t) {
-    current_thread = t;  /* macro: writes to per-CPU slot when CONFIG_SMP */
+    per_cpu_data_t* pcp_st = sched_pcp();
+    pcp_st->cpu_thread = t;
 }
 
 void sched_timer_tick(void) {
@@ -961,7 +1087,7 @@ void sched_timer_tick(void) {
         per_cpu_data_t* _pcp = sched_pcp();
         if (++_pcp->balance_counter >= 100) {
             _pcp->balance_counter = 0;
-            sched_balance_push();
+            sched_balance_push(_pcp->cpu_id, _pcp);
         }
     }
 
@@ -993,8 +1119,13 @@ void sched_timer_tick(void) {
             }
         }
 
-        /* NMI watchdog: BSP periodically broadcasts NMI IPIs for lockup detection */
-        watchdog_send_nmis_tick();
+        /* NMI watchdog: BSP periodically broadcasts NMI IPIs for lockup detection.
+         * Skipped on QEMU (both TCG and KVM) because the APIC ICR broadcast causes
+         * stack corruption on TCG (the NMI delivery to APs running on ap_stacks[]
+         * during early boot can overflow the trampoline stack, or the ICR write
+         * itself triggers a QEMU internal race). */
+        if (!hal_is_qemu())
+            watchdog_send_nmis_tick();
     }
 }
 

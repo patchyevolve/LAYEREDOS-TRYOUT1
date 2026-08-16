@@ -10,7 +10,7 @@
  *   0x000   16-bit real-mode entry
  *   0x100   GDT (4 descriptors + gdt_desc = 38 bytes)
  *   0x130   32-bit protected-mode transition code
- *   0x200   BSP-filled fields: stack_ptr, percpu_ptr, kernel_cr3
+ *   0x200   BSP-filled fields: stack_ptr, percpu_ptr, kernel_cr3, abort_flag
  *   0x300   64-bit entry code
  *   0x400   End
  */
@@ -118,6 +118,9 @@ percpu_ptr:
 .org 0x210
 kernel_cr3:
     .quad 0
+.org 0x218
+trampoline_abort:
+    .quad 0
 
 /* ===== offset 0x300: 64-bit entry code ===== */
 .org 0x300
@@ -133,6 +136,12 @@ lm_entry:
 
     /* Zero frame pointer */
     xorq    %rbp, %rbp
+
+    /* Check abort flag at phys 0x4218 — BSP sets this if boot timed out */
+    movq    $0x4218, %rcx
+    movq    (%rcx), %rcx
+    testq   %rcx, %rcx
+    jnz     1f       /* abort flag set → go to HLT loop */
 
     /* Call ap_entry(percpu_ptr) */
     movabsq $ap_entry, %rax

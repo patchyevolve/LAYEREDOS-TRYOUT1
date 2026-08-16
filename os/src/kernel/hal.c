@@ -12,6 +12,7 @@
 #include "tty.h"
 #include "smp.h"
 #include "watchdog.h"
+#include "acpi.h"
 
 
 #define UART_BASE 0x3F8
@@ -610,19 +611,74 @@ void interrupt_handler(int_frame_t* frame) {
             int crash_cpu = smp_cpu_id();
             uint64_t current_rsp;
             asm volatile("mov %%rsp, %0" : "=r"(current_rsp));
-            kprintf("PAGE FAULT at %lx, rip=%lx, rsp=%lx, cur_rsp=%lx, error=%lu (KERNEL) cpu=%d\n",
-                    cr2, fault_rip, frame->rsp, current_rsp, err, crash_cpu);
-            /* Dump actual TSS IST values for diagnostic */
-            for (int cpu = 0; cpu < nr_cpus; cpu++) {
-                kprintf("  CPU%d per-CPU tss.ist[1]=%lx\n",
-                    cpu, smp_get_tss_ist(cpu, 1));
+
+            /* Raw serial diagnostic — avoids kprintf recursion risk
+             * (PF handler runs on IST2, kprintf may reference
+             * current_thread and re-enter PF). */
+#define PF_UART 0x3F8
+#define PF_LSR  (0x3F8 + 5)
+            {
+                /* Write a byte to COM1, polling Tx */
+                unsigned long _pf_if;
+                asm volatile("pushfq; popq %0; cli" : "=r"(_pf_if));
+                for (int _ri = 0; _ri < 2; _ri++) {
+                    while ((inb(PF_LSR) & 0x20) == 0) {}
+                    outb(PF_UART, _ri == 0 ? '\n' : '>');
+                }
+                /* Hex dump: CR2, RIP, ERR, CPU per_cpu_data[0..n] */
+                uint64_t _pf_vals[] = { cr2, fault_rip, err, (uint64_t)crash_cpu };
+                for (int _vi = 0; _vi < 4; _vi++) {
+                    uint64_t _v = _pf_vals[_vi];
+                    for (int _ni = 60; _ni >= 0; _ni -= 4) {
+                        int _d = (_v >> _ni) & 0xF;
+                        while ((inb(PF_LSR) & 0x20) == 0) {}
+                        outb(PF_UART, _d < 10 ? '0' + _d : 'a' + _d - 10);
+                    }
+                    while ((inb(PF_LSR) & 0x20) == 0) {}
+                    outb(PF_UART, ' ');
+                }
+                while ((inb(PF_LSR) & 0x20) == 0) {}
+                outb(PF_UART, '\n');
+                for (int _pi = 0; _pi < nr_cpus; _pi++) {
+                    while ((inb(PF_LSR) & 0x20) == 0) {}
+                    outb(PF_UART, 'p');
+                    /* hex digit for index */
+                    int _pd = _pi;
+                    while ((inb(PF_LSR) & 0x20) == 0) {}
+                    outb(PF_UART, _pd < 10 ? '0' + _pd : 'a' + _pd - 10);
+                    while ((inb(PF_LSR) & 0x20) == 0) {}
+                    outb(PF_UART, '=');
+                    uint64_t _pv = (uint64_t)per_cpu_data[_pi];
+                    for (int _ni = 60; _ni >= 0; _ni -= 4) {
+                        int _d = (_pv >> _ni) & 0xF;
+                        while ((inb(PF_LSR) & 0x20) == 0) {}
+                        outb(PF_UART, _d < 10 ? '0' + _d : 'a' + _d - 10);
+                    }
+                    while ((inb(PF_LSR) & 0x20) == 0) {}
+                    outb(PF_UART, '\n');
+                }
+                if (_pf_if & 0x200) asm volatile("sti");
+            }
+            if (current_thread) {
+                kprintf("  thread=%s stack=[%lx-%lx] rsp=%lx\n",
+                        current_thread->name,
+                        (uint64_t)current_thread->kernel_stack,
+                        (uint64_t)current_thread->kernel_stack + current_thread->kernel_stack_size,
+                        current_rsp);
             }
             kpanic("Page fault (kernel mode)");
         }
     }
 
     if (vec == 13) {
-        kprintf("GP FAULT rip=%lx error=%lu\n", frame->rip, frame->error_code);
+        kprintf("GP FAULT rip=%lx error=%lu cpu=%d\n", frame->rip, frame->error_code, smp_cpu_id());
+        if (current_thread) {
+            kprintf("  thread=%s stack=[%lx-%lx] rsp=%lx\n",
+                    current_thread->name,
+                    (uint64_t)current_thread->kernel_stack,
+                    (uint64_t)current_thread->kernel_stack + current_thread->kernel_stack_size,
+                    frame->rsp);
+        }
         kpanic("General protection fault");
     }
 
@@ -631,7 +687,14 @@ void interrupt_handler(int_frame_t* frame) {
         for (;;) { asm volatile("cli; hlt"); }
     }
 
-    kprintf("UNHANDLED INTERRUPT vec=%lu rip=%lx\n", (uint64_t)vec, frame->rip);
+    kprintf("UNHANDLED INTERRUPT vec=%lu rip=%lx cpu=%d\n", (uint64_t)vec, frame->rip, smp_cpu_id());
+    if (current_thread) {
+        kprintf("  thread=%s stack=[%lx-%lx] rsp=%lx\n",
+                current_thread->name,
+                (uint64_t)current_thread->kernel_stack,
+                (uint64_t)current_thread->kernel_stack + current_thread->kernel_stack_size,
+                frame->rsp);
+    }
     kpanic("Unhandled interrupt");
 }
 
@@ -647,17 +710,22 @@ void hal_poweroff(void) {
 void hal_reboot(void) {
     kputs("System reboot.\n");
 
-    /* Method 1: PS/2 keyboard controller reset (legacy, most hardware) */
+    /* Method 1: ACPI FADT reset (most reliable on modern hardware) */
+    if (acpi_fadt_reset() == 0) {
+        for (volatile int w = 0; w < 100000000; w++) asm("pause");
+    }
+
+    /* Method 2: PS/2 keyboard controller reset (legacy, most hardware) */
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) asm("pause");
     outb(0x64, 0xFE);
     for (volatile int w = 0; w < 100000; w++) asm("pause");
 
-    /* Method 2: RESET register (cold reset) — southbridge, works on QEMU.
+    /* Method 3: RESET register (cold reset) — southbridge, works on QEMU.
      * 0x0E = CPU reset | System reset | Full reset (clears all state). */
     outb(0xCF9, 0x0E);
     for (volatile int w = 0; w < 1000000; w++) asm("pause");
 
-    /* Method 3: Triple fault — load null IDT and trigger an interrupt.
+    /* Method 4: Triple fault — load null IDT and trigger an interrupt.
      * Vector 6 (invalid opcode) avoids int3 breakpoint semantics on some
      * hypervisors; the null IDT turns any interrupt into triple fault. */
     {
@@ -726,4 +794,16 @@ err_t hal_init(uint64_t mb_info_phys) {
 
     kputs("[HAL] Layer 1 initialized: GDT, IDT, PIC, UART, Timer\n");
     return ERR_OK;
+}
+
+__attribute__((naked)) void hal_switch_stack(uint64_t new_rsp) {
+    /* Pop return address, switch to new stack, push return address, return.
+     * new_rsp is in RDI per x86_64 calling convention. */
+    asm volatile(
+        "popq %%rax\n"
+        "movq %%rdi, %%rsp\n"
+        "pushq %%rax\n"
+        "ret\n"
+        : : : "rax", "memory"
+    );
 }
